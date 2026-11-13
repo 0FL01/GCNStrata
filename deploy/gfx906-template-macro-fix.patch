@@ -1,0 +1,33 @@
+diff --git a/include/strata/platform/hip_compat/strata_hip.h b/include/strata/platform/hip_compat/strata_hip.h
+index b0de6c4..cc033c6 100644
+--- a/include/strata/platform/hip_compat/strata_hip.h
++++ b/include/strata/platform/hip_compat/strata_hip.h
+@@ -151,6 +151,7 @@ template <typename T> inline hipError_t strata_host_alloc(T** p, size_t bytes, u
+ #define cudaKernelNodeParams hipKernelNodeParams
+ #define cudaGraphKernelNodeGetParams hipGraphKernelNodeGetParams
+ inline hipError_t cudaFuncGetName(const char** name, const void*) { *name = nullptr; return hipErrorNotSupported; }
++#define cudaFuncAttributePreferredSharedMemoryCarveout hipFuncAttributePreferredSharedMemoryCarveout
+ #define cudaFuncSetAttribute(fn, attr, val) hipFuncSetAttribute(reinterpret_cast<const void*>(fn), attr, val)
+ #define cudaMemcpyToSymbol(sym, src, ...) hipMemcpyToSymbol(HIP_SYMBOL(sym), src, __VA_ARGS__)
+ 
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index 71012ff..5f95334 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -1086,11 +1086,11 @@ void fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+             const int need1 = (int) (kFusedGrMaxT * N * sizeof(float)), need6 = (int) (6 * N * sizeof(float)), need2 = need1 / 2;
+             int split = -1;
+             if (need1 <= limit &&
+-                cudaFuncSetAttribute(gr_down_v3_kernel<1, kFusedGrMaxT, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, need1) == cudaSuccess &&
+-                cudaFuncSetAttribute(gr_down_v3_kernel<1, 6, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, need6) == cudaSuccess) {
+-                cudaFuncSetAttribute(gr_down_v3_kernel<1, 4, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+-                cudaFuncSetAttribute(gr_down_v3_kernel<1, 4, false>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+-                cudaFuncSetAttribute(gr_down_v3_kernel<1, 2, true>, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
++                cudaFuncSetAttribute((gr_down_v3_kernel<1, kFusedGrMaxT, false>), cudaFuncAttributeMaxDynamicSharedMemorySize, need1) == cudaSuccess &&
++                cudaFuncSetAttribute((gr_down_v3_kernel<1, 6, true>), cudaFuncAttributeMaxDynamicSharedMemorySize, need6) == cudaSuccess) {
++                cudaFuncSetAttribute((gr_down_v3_kernel<1, 4, true>), cudaFuncAttributePreferredSharedMemoryCarveout, 100);
++                cudaFuncSetAttribute((gr_down_v3_kernel<1, 4, false>), cudaFuncAttributePreferredSharedMemoryCarveout, 100);
++                cudaFuncSetAttribute((gr_down_v3_kernel<1, 2, true>), cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+                 split = 1;
+             } else if (need2 <= limit)
+                 // #375 (kenh0u): the S = 2 split (a 64 KB opt-in card: Turing) disagrees with itself in gr_parity

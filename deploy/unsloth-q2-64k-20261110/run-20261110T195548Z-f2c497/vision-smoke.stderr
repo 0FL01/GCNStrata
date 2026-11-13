@@ -1,0 +1,7 @@
+strata generate: memory guard: limit 121.4 GiB (source: meminfo), current 4.1 GiB, reclaimable cache credited 0.0 GiB; available 117.3 GiB (MemAvailable 117.3 GiB), floor 8192 MiB
+strata generate: layer split across 2 GPUs: CUDA0, then CUDA1 (split 27)
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata generate: native pack: /sata/qwen38-flash-next-ud-q2_0/pack experts (largest blob 1.97 MB), token embedding IQ4_XS in mapped host memory (322 MiB, 0.9 s)
+strata generate: layer split: CUDA0 loads the dense weights of layers 0-26 only
+strata generate: 856 MiB of weights loaded from /sata/qwen38-flash-next-ud-q2_0/pack in 1.5 s (638 canonical tensors skipped: served natively)
+strata generate: native dense projections: native dense: additional shard must match the architecture-validated first shard's split metadata

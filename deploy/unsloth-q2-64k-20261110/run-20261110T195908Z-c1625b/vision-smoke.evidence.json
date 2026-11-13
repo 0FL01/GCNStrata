@@ -1,0 +1,5 @@
+{
+  "input_json": "/home/radneon/strata/deploy/unsloth-q2-vision-20261110/smoke.json",
+  "input_sha256": "f4d12f348e933ca206fbe3c88cc0e32ff75d7fb093f2462c07d26de83f536b3e",
+  "embeddings_sha256": "e6309c4a628a9be4a141e7ffcb5e1501b8b9ab994b40e44c398b448b83bb1fad"
+}

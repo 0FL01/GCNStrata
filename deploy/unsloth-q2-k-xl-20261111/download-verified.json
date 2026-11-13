@@ -1,0 +1,23 @@
+{
+  "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+  "revision": "084c631ac221016019d6e0a863afe92d90edd3b0",
+  "downloaded": [
+    {
+      "file": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00004.gguf",
+      "size": 10946618,
+      "sha256": "297e174dc185f2bf3ab1856461059cb8a05aa741bc27edf42461cde87e5420af"
+    },
+    {
+      "file": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00004.gguf",
+      "size": 49732486272,
+      "sha256": "a4782511810bb61bd6b3236607a0aad05b1bfa04b90356defd202bb17e7db16d"
+    },
+    {
+      "file": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00004.gguf",
+      "size": 1037181344,
+      "sha256": "4dffc4a1cea7ad484f2d5c711b747840e459b040b636cc8ddaa524d01e60662e"
+    }
+  ],
+  "engram_symlink": "/home/radneon/models-nvme/shared-engram/qwen38-engram-iq4_nl-4of4.gguf",
+  "engram_hash_evidence": "/home/radneon/strata/deploy/unsloth-q2-k-xl-20261111/engram-hashes.json"
+}

@@ -1,0 +1,15 @@
+{
+  "observer_package": "/home/opencode/ai/c183-hc-cost-observer-20261009",
+  "observer_manifest_sha256": "4f24c356d2c92b7a7ad696eee77d8be5c224a0d0c06fef3340a9b81e171be525",
+  "copied_files": {
+    "observer.patch": "d466cc423a68f8137e158291e5ab95f9c111b35ce2579aa7d77031047639fa78",
+    "source-proof.json": "6bfa7af01e60f46a7d40a62c688efbfcf7a1b4c6fc033a6e5e269f5cef100fa1",
+    "parse_cost.py": "c6fd210519cfaef5be3aa999fdb2eda01f6486f890c5f4f1e3129950b75d14c3",
+    "parse_counts.py": "52fa60ed25144a42bb5dcdf588653ceb4518243baa7bad3bafcb634bbf800e2e",
+    "hc_counts_observer.hpp": "2f545bdcda97cc9511ee71c0996b63855c1394d0f3c0e84525665f6f3c00f1d0",
+    "test_observer.cpp": "9b061da6f046c1f2485ca579706606b6041166950b87e706a8efff00e261d779"
+  },
+  "status": "PREPARED_NOT_BUILT_OR_RUN",
+  "independent_source_review_path": "/home/opencode/ai/c183-hc-cost-independent-review-20261009T2320/source-review.json",
+  "independent_source_review_sha256": "eb12a9ce62843b2d301701e748024668c0993555b34ffc8b5f7befa636739098"
+}

@@ -1,0 +1,175 @@
+strata generate: memory guard: limit 121.4 GiB (source: meminfo), current 6.1 GiB, reclaimable cache credited 0.0 GiB; available 115.3 GiB (MemAvailable 115.3 GiB), floor 8192 MiB
+strata generate: layer split across 4 GPUs: CUDA0, then CUDA1,2,3 (split auto)
+strata generate: this CPU has no AVX-512: the expert kernels run on AVX-2 (multi-token for the i-quant gate/up rows)
+strata generate: native pack: /models/qwen38-flash-next-ud-q2_k_xl/pack experts (largest blob 2.18 MB), token embedding IQ4_XS in mapped host memory (322 MiB, 0.4 s)
+strata generate: 1466 MiB of weights loaded from /models/qwen38-flash-next-ud-q2_k_xl/pack in 1.8 s (302 canonical tensors skipped: served natively)
+strata generate: 300 native projection matrices, 2679.61 MiB of weights, in 3.7 s
+strata generate: PLE table locked in RAM (--ple-io ram) in 1.7 s
+strata generate: profile /src/data/expert-profile.bin: 24576 ranked pairs, built for 24576 slots
+strata generate: layer split auto: CUDA0 60 SMs at 1.70 GHz -> 0.71 ms per layer, 10.66 GiB free before its session carve
+strata generate: layer split auto: CUDA1 60 SMs at 1.70 GHz -> 0.71 ms per layer, 14.61 GiB free before its session carve
+strata generate: layer split auto: CUDA2 60 SMs at 1.70 GHz -> 0.71 ms per layer, 14.61 GiB free before its session carve
+strata generate: layer split auto: CUDA3 60 SMs at 1.70 GHz -> 0.71 ms per layer, 13.64 GiB free before its session carve
+strata generate: layer split auto: CUDA0 link 7.0 GB/s -> miss cost x1.00
+strata generate: layer split auto: CUDA1 link 7.0 GB/s -> miss cost x1.00
+strata generate: layer split auto: CUDA2 link 7.0 GB/s -> miss cost x1.00
+strata generate: layer split auto: CUDA3 link 7.0 GB/s -> miss cost x1.00
+strata generate: layer split auto: K=12,24,36 - predicted 34.1 ms per decode window; the caches hold 24576 of 24576 profiled pairs (~100.0% of the routed mass), best of 15180 placements
+strata generate: layer split: CUDA1 loads the dense weights of layers 12-23 only
+strata generate: layer split, CUDA1: WARNING the split search priced this stage's weights at 1149 MiB, it took 1150 MiB
+strata generate: layer split: CUDA1 holds its weights; 14.69 GiB free (its session follows)
+strata generate: layer split: CUDA2 loads the dense weights of layers 24-35 only
+strata generate: layer split, CUDA2: WARNING the split search priced this stage's weights at 1149 MiB, it took 1150 MiB
+strata generate: layer split: CUDA2 holds its weights; 14.69 GiB free (its session follows)
+strata generate: layer split: CUDA3 loads the dense weights of layers 36-47 only
+strata generate: layer split, CUDA3: WARNING the split search priced this stage's weights at 1149 MiB, it took 1150 MiB
+strata generate: layer split: CUDA3 holds its weights; 14.69 GiB free (its session follows)
+strata generate: KV streaming: 32768 of 262144 cells per QSA layer in VRAM, the K/V in 0.77 GiB of pinned RAM
+strata generate: PLE on, table 320001536 rows of /sata/shefowl-qwen38-hybrid/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-Q2_0-00002-of-00002.gguf
+strata generate: layer split: CUDA1 holds its weights, session [12, 24); 14.40 GiB free
+strata generate: layer split: CUDA2 holds its weights, session [24, 36); 14.39 GiB free
+strata generate: layer split: CUDA3 holds its weights, session [36, 48) and the head; 13.91 GiB free
+strata mtp: draft layer loaded, 812 MiB of VRAM (experts 675, dense 111), files read in 2.91 s (270 MiB/s)
+strata generate: GPU 0: AMD Radeon Pro VII, compute capability 9.0
+strata generate: expert arena read through the file cache (buffered (not Windows))
+strata generate: STRATA_ARENA_MMAP: could NOT write /models/qwen38-flash-next-ud-q2_k_xl/pack/experts.bin (the next start maps it)
+strata generate: expert arena: cudaHostRegister PORTABLE ok; MAP_HUGETLB unavailable (needed 21952 2 MiB pages, vm.nr_hugepages=0); transparent huge pages requested (MADV_HUGEPAGE)
+strata generate: loaded 42.87 GiB at 0.86 GiB/s
+strata generate: GPU host-callback thread started before host-core pinning
+strata generate: CPU pool tasks/phase: 48 (automatic), participating threads: 16
+strata generate: 15 pool workers on logical processors 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15, the host thread on 0 (draining too) (--host-core first)
+strata aux cpus: threads that are neither pool workers nor the host go to CPUs 16 (off at start; a request's aux_cpus=1 turns it on)
+strata generate: WARNING: layer split: --expert-cache 9900 leaves no room for the prompt path's buffers (0 MiB) and the 909 MiB reserve on CUDA0: 5115 slots instead (a smaller --vram-reserve-mib leaves more of them)
+strata generate: expert cache 6144 slots, 10.01 GiB of VRAM; policy is
+strata generate: the GPU computes the experts in the cache; it rounds differently from the CPU,
+                 so a reply can differ slightly from a run without the cache (same quality:
+                 bench/results/2026-09-27-cache-parity).
+                 PROFILE, ranked by routing frequency, no eviction.
+strata generate: pre-filled 6144 of 6144 slots from the profile in 1.6 s (6665 MB/s); slot 0 verified
+strata generate: layer split, CUDA1: 14.40 GiB free of 15.98, room for experts 13.19 GiB
+strata generate: layer split: CUDA1 runs layers 12-23, expert cache 6144 slots (10.89 GiB), 6144 of its 6144 profiled pairs; slot 0 verified
+strata generate: layer split, CUDA2: 14.39 GiB free of 15.98, room for experts 13.19 GiB
+strata generate: layer split: CUDA2 runs layers 24-35, expert cache 6144 slots (11.30 GiB), 6144 of its 6144 profiled pairs; slot 0 verified
+strata generate: layer split, CUDA3: 13.11 GiB free of 15.98, room for experts 11.91 GiB
+strata generate: layer split: CUDA3 runs layers 36-47, expert cache 6144 slots (10.67 GiB), 6144 of its 6144 profiled pairs; slot 0 verified
+strata generate: layer split: CUDA0 runs layers 0-11
+strata generate: layer split auto: L2 probe: the split is startable on the live free figures
+strata generate: R4 hit path ON - resident experts are computed on the GPU
+strata generate: 15 expert-pool workers + the host thread
+strata generate: session is up (engine 0.1.45)
+strata generate: token graph hit path: 24576 resident experts, decided on the device
+strata serve: layer split: 100% of the experts resident, the prompt path's streamed ring 96 slots
+strata serve: the prompt path borrows 1451 CUDA0 cache slots (2.35 GiB)
+strata serve:   CUDA1 prompt path borrows 1317 of its 6144 slots (2.35 GiB)
+strata serve:   CUDA2 prompt path borrows 1277 of its 6144 slots (2.35 GiB)
+strata serve:   CUDA3 prompt path borrows 1367 of its 6144 slots (2.35 GiB)
+STRATA_HC_BF16_CLONE_INIT_V1 device=1 enabled=1 arch=gfx906:sramecc+:xnack-
+STRATA_HC_BF16_CLONE_INIT_V1 device=2 enabled=1 arch=gfx906:sramecc+:xnack-
+STRATA_HC_BF16_CLONE_INIT_V1 device=3 enabled=1 arch=gfx906:sramecc+:xnack-
+STRATA_HC_BF16_CLONE_INIT_V1 device=0 enabled=1 arch=gfx906:sramecc+:xnack-
+strata hc: CUDA1: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 6 tokens, 68.4 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata hc: CUDA2: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 6 tokens, 68.4 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata hc: CUDA3: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 6 tokens, 68.4 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata serve: layer split: layers 0-11 (CUDA0), 12-23 (CUDA1), 24-35 (CUDA2), 36-47 (CUDA3), one hand-off per window
+strata hc: CUDA0: the hyper-connection read runs as staged (the norm per token and stream, the down projection's activations staged ahead by cp.async); checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 for the earlier ones)
+strata verify: window up to 6 tokens, 68.4 MiB of device buffers (100% VRAM resident: zero-doorbell graph)
+strata mtp: draft head over 58963 tokens (118.1 MiB)
+strata serve: adaptive overlap: off: not on a layer split
+HC_N4_ALLOC owner=0 requested=196608 budget=2097152 floor=268435456 free_before=1220542464 free_after=1220542464
+HC_N4_ALLOC owner=1 requested=196608 budget=2097152 floor=268435456 free_before=3655335936 free_after=3655335936
+HC_N4_ALLOC owner=2 requested=196608 budget=2097152 floor=268435456 free_before=3200253952 free_after=3200253952
+HC_N4_ALLOC owner=3 requested=196608 budget=2097152 floor=268435456 free_before=2378170368 free_after=2378170368
+HC_F16_EXACT_ALLOC owner=0 bytes=90440448 charge=100663296 floor=268435456 before=1220542464 after=1128267776
+HC_F16_EXACT_ALLOC owner=1 bytes=90440448 charge=100663296 floor=268435456 before=3655335936 after=3563061248
+HC_F16_EXACT_ALLOC owner=2 bytes=90440448 charge=100663296 floor=268435456 before=3200253952 after=3107979264
+HC_F16_EXACT_ALLOC owner=3 bytes=90440448 charge=100663296 floor=268435456 before=2378170368 after=2285895680
+strata serve: 1076 MiB of VRAM free with everything loaded
+strata serve: CUDA1: 3398 MiB of VRAM free with everything loaded
+strata serve: CUDA2: 2964 MiB of VRAM free with everything loaded
+strata serve: CUDA3: 2180 MiB of VRAM free with everything loaded
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=0 down=9 up=17
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=0 down=5 up=19
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=4096 down=10 up=17
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=0 down=7 up=19
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=4096 down=9 up=16
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=8192 down=10 up=17
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=4096 down=8 up=18
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=8192 down=15 up=19
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=12288 down=15 up=17
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=8192 down=7 up=19
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=12288 down=12 up=16
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=16384 down=15 up=17
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=12288 down=6 up=18
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=16384 down=10 up=17
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=20480 down=9 up=17
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=16384 down=7 up=18
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=20480 down=12 up=16
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=24576 down=7 up=16
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=20480 down=7 up=19
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=24576 down=11 up=16
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=28672 down=6 up=17
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=24576 down=7 up=20
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=28672 down=10 up=16
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=32768 down=10 up=17
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=28672 down=6 up=18
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=32768 down=16 up=16
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=36864 down=10 up=17
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=32768 down=12 up=18
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=36864 down=13 up=15
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=40960 down=13 up=17
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=36864 down=8 up=19
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=40960 down=15 up=18
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=45056 down=5 up=17
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=40960 down=11 up=19
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=45056 down=9 up=16
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=49152 down=9 up=16
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=45056 down=13 up=18
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=49152 down=11 up=16
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=53248 down=11 up=17
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=49152 down=10 up=18
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=53248 down=12 up=15
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4096 pos0=57344 down=9 up=16
+STRATA_HC_BF16_CLONE_V1 stage_lb=0 stage_le=12 device=0 run_n=65535 pos0=0 down=165 up=328
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=53248 down=8 up=18
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4096 pos0=57344 down=11 up=16
+STRATA_HC_BF16_CLONE_V1 stage_lb=12 stage_le=24 device=1 run_n=4095 pos0=61440 down=0 up=0
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4096 pos0=57344 down=9 up=18
+STRATA_HC_BF16_CLONE_V1 stage_lb=24 stage_le=36 device=2 run_n=4095 pos0=61440 down=0 up=0
+STRATA_HC_BF16_CLONE_V1 stage_lb=36 stage_le=48 device=3 run_n=4095 pos0=61440 down=0 up=0
+strata verify: capturing the 1-token window (983 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (3313 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (2879 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 1-token window (2075 MiB of VRAM free)
+strata verify: captured the 1-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (951 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (3265 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (2831 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata verify: capturing the 2-token window (2033 MiB of VRAM free)
+strata verify: captured the 2-token window (upload no error, sync no error)
+strata serve: prompt 65536 tokens = 0 reused + 65536 read in 55455 ms (1181.8 tok/s), 512 generated in 9837 ms (52.0 tok/s), drafts accepted 241 of 260, 0 checkpoints
+strata serve: KV streaming: 95.71% of 819555 block reads hit VRAM, 141.5 MiB read from RAM
+HC_N4_STATE owner=0 enabled=1 shadow_mode=0 reason=active
+HC_N4 owner=0 T=4096 calls=360 takes=360 fallback=0 shadow=0 words=0
+HC_N4 owner=0 T=4095 calls=24 takes=24 fallback=0 shadow=0 words=0
+HC_F16_EXACT_STATE owner=0 enabled=1 shadow=0 reference_only=0 reason=active calls=1568 takes=242 guard_fallback=526 other_fallback=800
+HC_N4_STATE owner=1 enabled=1 shadow_mode=0 reason=active
+HC_N4 owner=1 T=4096 calls=360 takes=360 fallback=0 shadow=0 words=0
+HC_N4 owner=1 T=4095 calls=24 takes=24 fallback=0 shadow=0 words=0
+HC_F16_EXACT_STATE owner=1 enabled=1 shadow=0 reference_only=0 reason=active calls=1536 takes=342 guard_fallback=426 other_fallback=768
+HC_N4_STATE owner=2 enabled=1 shadow_mode=0 reason=active
+HC_N4 owner=2 T=4096 calls=360 takes=360 fallback=0 shadow=0 words=0
+HC_N4 owner=2 T=4095 calls=24 takes=24 fallback=0 shadow=0 words=0
+HC_F16_EXACT_STATE owner=2 enabled=1 shadow=0 reference_only=0 reason=active calls=1536 takes=321 guard_fallback=447 other_fallback=768
+HC_N4_STATE owner=3 enabled=1 shadow_mode=0 reason=active
+HC_N4 owner=3 T=4096 calls=360 takes=360 fallback=0 shadow=0 words=0
+HC_N4 owner=3 T=4095 calls=24 takes=24 fallback=0 shadow=0 words=0
+HC_F16_EXACT_STATE owner=3 enabled=1 shadow=0 reference_only=0 reason=active calls=1536 takes=340 guard_fallback=428 other_fallback=768

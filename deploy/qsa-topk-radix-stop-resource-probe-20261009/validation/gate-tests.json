@@ -1,0 +1,7 @@
+{
+  "passed": true,
+  "test_methods": 14,
+  "cli_fixture_checks": 136,
+  "gpu_executed": false,
+  "actual_compiled_images_tested": false
+}

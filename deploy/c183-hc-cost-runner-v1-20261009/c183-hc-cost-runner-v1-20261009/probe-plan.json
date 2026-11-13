@@ -1,0 +1,173 @@
+{
+  "status": "PREPARED_NOT_BUILT_OR_RUN",
+  "baseline_binary_sha256": "c18316d678a669c309cb95e2f5de9af03fa5573256fd0e093aafc4b41000d049",
+  "frozen_parent_prompt_sha256": "63ce3d4042027a00b2193feab143f1d9443b5c31a863a962ec9543ccb54d9695",
+  "prefix_sha256": "83728e3e3379af3e87a5e10ce39464149f1d3dfe0fbfcb4d894c4059a8d5e5ed",
+  "prompt_tokens": 12288,
+  "prefill_tokens": 12287,
+  "generated_tokens": 1,
+  "expected_chunks": [
+    4096,
+    4096,
+    4095
+  ],
+  "expected_chunk_positions": [
+    0,
+    4096,
+    8192
+  ],
+  "repeated_tail": false,
+  "requests": 1,
+  "fresh_process": true,
+  "resume_required": 0,
+  "stop_after": "One valid host-clock cost probe or any failure. No automatic retries.",
+  "environment": {
+    "STRATA_Q2_AVX2_SPREAD": "1",
+    "STRATA_GDN_NOY": "1",
+    "STRATA_GDN_CONVL2": "1",
+    "STRATA_GR_UP_EXACT": "0",
+    "STRATA_TSUM": "0",
+    "STRATA_HIP_SWIGLU_FUSED": "1",
+    "STRATA_GDN_PP": "2",
+    "STRATA_ARENA_MMAP": "1",
+    "STRATA_GDN_HEAD": "1",
+    "STRATA_GFX906_TOPK_REG": "2",
+    "STRATA_MMVF_ROWS": "1",
+    "STRATA_MMVF_RPB": "4",
+    "STRATA_EXP_MODE": "16",
+    "STRATA_STAGE_TRIM": "1",
+    "STRATA_GFX906_HC_F16": "1",
+    "STRATA_HC_F16_SCALE_PROBE": "1",
+    "STRATA_HC_F16_EXACT_INPUT": "1",
+    "STRATA_HC_F16_AUDIT": "0",
+    "STRATA_HC_F16_TRACE": "1",
+    "STRATA_GFX906_MMQ_OPT_CAP": "32",
+    "STRATA_GFX906_ATTN_QUERY_SWIZZLE": "1",
+    "STRATA_ATTN_LANECELL": "0",
+    "STRATA_GFX906_ATTN_QUERY_SWIZZLE_TRACE": "1",
+    "STRATA_VERIFY_SKIP_EMPTY_PCIE": "1",
+    "STRATA_PRIMARY_COMMIT_OVERLAP": "1",
+    "STRATA_GFX906_ATTN_REDUCE12": "1",
+    "HIP_VISIBLE_DEVICES": "0,1",
+    "DO_NOT_TRACK": "1",
+    "HF_HUB_DISABLE_TELEMETRY": "1",
+    "STRATA_GFX906_TOPK_FIT17": "1",
+    "STRATA_HC_COUNTS_ONLY_OBSERVER": "1"
+  },
+  "native_args": [
+    "--pack",
+    "/src/runtime/shefowl-hybrid",
+    "--native",
+    "/sata/shefowl-qwen38-hybrid/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-Q2_0-00001-of-00002.gguf",
+    "--ple-gguf",
+    "/sata/shefowl-qwen38-hybrid/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-Q2_0-00002-of-00002.gguf",
+    "--expert-profile",
+    "/src/data/expert-profile.bin",
+    "--expert-cache",
+    "9900",
+    "--prefill",
+    "4096",
+    "--spec",
+    "4",
+    "--spec-min-p",
+    "0.5",
+    "--mtp",
+    "/src/runtime/mtp",
+    "--max-context",
+    "204800",
+    "--kv",
+    "int8",
+    "--kv-resident",
+    "32768",
+    "--vram-reserve-mib",
+    "600",
+    "--pcie-frac",
+    "0",
+    "--ple-io",
+    "ram",
+    "--conversation-cache-mib",
+    "4096",
+    "--conversation-cache-slots",
+    "4",
+    "--conversation-cache-min-free-mib",
+    "8192",
+    "--mtp-window",
+    "16384",
+    "--vram-reserve-later-mib",
+    "623",
+    "--adapt-every",
+    "0",
+    "--layer-split",
+    "27",
+    "--prompt-cache",
+    "0",
+    "--prompt-cache-every",
+    "0",
+    "--eos-ids",
+    "2147483647"
+  ],
+  "expected_stages": [
+    {
+      "device": 0,
+      "layers": [
+        0,
+        27
+      ],
+      "tensor_ordinals": [
+        1,
+        108
+      ],
+      "declared_weight_rows": 108,
+      "maximum_attempts": 324
+    },
+    {
+      "device": 1,
+      "layers": [
+        27,
+        48
+      ],
+      "tensor_ordinals": [
+        109,
+        192
+      ],
+      "declared_weight_rows": 84,
+      "maximum_attempts": 252
+    }
+  ],
+  "new_kernel_launches": 0,
+  "new_copies": 0,
+  "new_synchronizations": 0,
+  "new_device_queries": 0,
+  "new_timing_events": 0,
+  "observer_bounds": {
+    "total_context_lifetimes": 8,
+    "weight_rows_per_context": 256,
+    "chunks_per_context": 8,
+    "maximum_json_rows": 2073
+  },
+  "admission": [
+    "Independent source/CPU review",
+    "Exact source hash match in separate diagnostic build tree",
+    "Frozen c183 remains unchanged",
+    "Root compares every extracted device ELF/module body and metadata against frozen binary; no new/removed device entrypoints",
+    "No model execution until root approves admission"
+  ],
+  "runtime_requirements": [
+    "Exact original environment apart from observer flag",
+    "No unsupported ambient route/geometry-changing flags",
+    "One fresh process; no restored conversation, checkpoints, batch peers or cache reuse",
+    "Original --prompt-cache0 and --prompt-cache-every0 retained",
+    "Verify runtime stage/device/layer maps and actual chunk geometry from observer",
+    "One generated token then QUIT; collect destructor aggregates after timed workload",
+    "Use existing safety/lock/cooldown/power/thermal/API-off wrapper; root executes actual two-GPU split only"
+  ],
+  "coverage_limit": "Whole guard host wall includes queued predecessor work; conditional stage-sum screen is not a model bound or gain estimate.",
+  "host_clock_reads_per_eligible_guard": 2,
+  "cost_screen": {
+    "threshold_ns": 1003739604,
+    "per_stage": "14 * measured full-repeat sum + measured tail-repeat sum",
+    "first_hits_excluded": true,
+    "below": "PARK_WITHOUT_CACHE_PATCH_OR_MODEL_QUALIFICATION",
+    "at_or_above": "ATTRIBUTION_AND_LIFETIME_INVESTIGATION_ONLY"
+  }
+}

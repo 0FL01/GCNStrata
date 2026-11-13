@@ -1,0 +1,8 @@
+{"completed": true, "promoted": false, "screen_passed": true}
+{"event": "start", "tag": "success"}
+{"event": "start", "tag": "err"}
+{"event": "start", "tag": "eof"}
+{"event": "start", "tag": "malformed"}
+{"event": "start", "tag": "timeout"}
+{"event": "start", "tag": "cancel"}
+{"event": "start", "tag": "cleanup"}

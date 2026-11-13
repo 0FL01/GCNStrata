@@ -1,0 +1,37 @@
+{
+  "id": "chatcmpl-3e69496540f046f69b2e8bfc",
+  "object": "chat.completion",
+  "created": 1794380297,
+  "model": "Qwen3.8-Flash-Next-Unsloth-UD-Q2_K_XL-Q8-PLE",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "FIFO (First In, First Out) — это принцип, согласно которому первым обрабатывается или выходит тот элемент, который был добавлен в очередь раньше всех. Этот метод имитирует естественный порядок обслуживания, например, как в очереди в магазине, где первым обслуживается тот, кто пришел первым."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 24,
+    "completion_tokens": 64,
+    "total_tokens": 88,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 24,
+    "prompt_ms": 837.2,
+    "prompt_per_token_ms": 34.883,
+    "prompt_per_second": 28.7,
+    "predicted_n": 64,
+    "predicted_ms": 1533.4,
+    "predicted_per_token_ms": 23.959,
+    "predicted_per_second": 41.7,
+    "draft_n": 32,
+    "draft_n_accepted": 26
+  }
+}

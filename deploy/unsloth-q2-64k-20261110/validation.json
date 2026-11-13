@@ -1,0 +1,11 @@
+{
+  "validated_utc": "2026-11-10T19:51:20.882321+00:00",
+  "check": "py_compile only; controller not executed",
+  "passed": true,
+  "controller_sha256": "2d3089449af26dc6ce7094c6028c79fca0707e0aec6fb3900ad52d3418ccb6e4",
+  "fixture_unchanged": true,
+  "production_config_unchanged": true,
+  "run_directories_created": 0,
+  "vision_smoke_prepared": true,
+  "shared_q8_mtp_limitation": "Existing fixed Q2_0 experts / Q8_0 projections at /src/runtime/mtp retained identically; requested shared-Q8 cannot load directly."
+}

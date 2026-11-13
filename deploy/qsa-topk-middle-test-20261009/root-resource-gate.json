@@ -1,0 +1,12 @@
+{
+  "passed": true,
+  "source_sha256": "6bc449d9a436330e56569e91044bb9c87edf2cd4cb7cc1f9a94eef514f0681ce",
+  "patch_sha256": "ed4e7bb2024f5c340e24ffb8517381706f9a6d071f5cb2d0e8f55f6cf5ac76b2",
+  "qsa_topk_middle_probe_sha256": "1b7b186d95ebf2d3a52d9d0561374b100bea9fc47a8b34c257b1c21c6dc8cadb",
+  "qsa_reg33_transition_sha256": "6648c48e4bbe49d31426c14e7cda70495e1c2787cdba95aefc43d7a66255f357",
+  "approval_source": "Root message 2026-10-09 13:36 UTC: Reviewer pre-GPU PASS now confirmed actual guards/base identity.",
+  "hot_middle_scratch_bytes_per_lane": 400,
+  "wide_scratch_bytes_per_lane": 1048,
+  "occupancy_waves_per_SIMD": 4,
+  "LDS_bytes": 32908
+}

@@ -1,0 +1,21 @@
+{
+  "boot_id": "665d3e8a-04c1-4d55-9c71-f93e7daf6d81",
+  "previous_boot_id": "b7ae795a-28b7-4205-933a-9a5cc1f99eb3",
+  "boot_utc": "2026-11-13 12:40:45 UTC",
+  "production_stopped": true,
+  "temporary_restart_policy": "no",
+  "stock_sha256": [
+    "3d341947c3b5613e296d768ad35b654a46b485f77576099c5a1c7d9920d9ffe6",
+    "3d341947c3b5613e296d768ad35b654a46b485f77576099c5a1c7d9920d9ffe6",
+    "3d341947c3b5613e296d768ad35b654a46b485f77576099c5a1c7d9920d9ffe6",
+    "3d341947c3b5613e296d768ad35b654a46b485f77576099c5a1c7d9920d9ffe6"
+  ],
+  "uids": [
+    "c30e5961732c7312",
+    "16a64881732c7310",
+    "16a66121732c7310",
+    "168a70c1732c7310"
+  ],
+  "ras_zero": true,
+  "kernel_faults": 0
+}

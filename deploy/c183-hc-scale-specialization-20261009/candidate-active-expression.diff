@@ -1,0 +1,7 @@
+--- actual-runtime-scale-active-expressions
++++ fixed-scale-active-expressions
+@@ -1,3 +1,4 @@
++constexpr float scale = SCALE_SHIFT == 12 ? 4096.0f : 512.0f;
+ const float f = __uint_as_float((uint32_t)in[i] << 16);
+ const float converted = f * scale;
+ const __half h = __float2half_rn(converted);

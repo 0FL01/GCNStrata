@@ -1,0 +1,66 @@
+--- vetted/qsa_reg17_transition.cpp
++++ isolated/qsa_wide51_transition.cpp
+@@ -1,5 +1,6 @@
+-// Independent correctness-only graph transition driver; no timing and no new selector.
+-// Usage: qsa_reg17_transition QSTRAN01_FILE [DEVICE=0]
++// Isolated WIDE51 correctness-only graph transition driver; no timing and no new selector.
++// Route labels are source-derived expectations, not observed device-arm evidence.
++// Usage: qsa_wide51_transition QSTRAN01_FILE [DEVICE=0]
+ #include "strata/kernels/qsa.hpp"
+ #include "strata/kernels/qsa_select.hpp"
+ #include <cuda_runtime.h>
+@@ -35,7 +36,7 @@
+         const uint32_t endian=0x01020304;
+         require(*reinterpret_cast<const unsigned char*>(&endian)==4,"little-endian host required");
+         require(std::memcmp(magic,"QSTRAN01",8)==0 && h[0]==1 && h[1]==endian,"unsupported fixture");
+-        require((h[2]==1 || h[2]==4 || h[2]==6 || h[2]==8 || h[2]==9) && h[3]==65537 && h[4]==2080 && h[5]==4 &&
++        require((h[2]==1 || h[2]==4 || h[2]==6 || h[2]==8 || h[2]==9) && (h[3]==52223 || h[3]==52224 || h[3]==52225) && h[4]==2080 && h[5]==4 &&
+                 h[6]>0 && h[6]<=100 && h[7]==16,"unsupported fixture dimensions");
+         Fixture a{h[2],h[3],h[4],h[7],{}};
+         const auto s=k::qsa_real_shapes();
+@@ -50,7 +51,7 @@
+             std::fill(c.expected.end()-a.guards,c.expected.end(),GUARD);
+             for(uint32_t t=0;t<a.nq;++t) {
+                 const int32_t* st=c.steps.data()+t*k::kStepCount;uint32_t lens[2];read(lens,8);
+-                require(st[k::kStepNKv]>=1 && st[k::kStepNKv]<=262144 &&
++                require(st[k::kStepNKv]>=1 && st[k::kStepNKv]<=262144 && st[k::kStepNBid]+1<=int32_t(a.score_cap) &&
+                         st[k::kStepPos]==st[k::kStepNKv]-1 && st[k::kStepNBid]==st[k::kStepNKv]/4 &&
+                         st[k::kStepWidth]==k::qsa_selection_width(st[k::kStepNKv],s),"invalid step row");
+                 require(lens[0]==uint32_t(st[k::kStepNBid]+1) && lens[0]<=a.score_cap &&
+@@ -79,13 +80,15 @@
+ }
+ int main(int argc,char** argv) {
+     try {
+-        require(argc==2 || argc==3,"usage: qsa_reg17_transition FIXTURE [DEVICE=0]");
++        require(argc==2 || argc==3,"usage: qsa_wide51_transition FIXTURE [DEVICE=0]");
+         const auto a=read_fixture(argv[1]);const int device=argc==3?std::stoi(argv[2]):0;
+         const char* reg=std::getenv("STRATA_GFX906_TOPK_REG");const char* trace=std::getenv("STRATA_TOPK_TRACE");
+         const char* mid=std::getenv("STRATA_GFX906_TOPK_FIT17");
++        const char* wide=std::getenv("STRATA_GFX906_TOPK_WIDE51");
++        const bool fit17_on=mid && std::strcmp(mid,"1")==0;
++        const bool wide51_on=wide && std::strcmp(wide,"1")==0;
+         require(reg && std::strcmp(reg,"2")==0,"require TOPK_REG=2");
+-        require(trace && std::strcmp(trace,"1")==0,"require TOPK_TRACE=1");
+-        require(mid && (std::strcmp(mid,"0")==0 || std::strcmp(mid,"1")==0 || std::strcmp(mid,"2")==0),"require explicit TOPK_FIT17=0, 1, or 2");
++        require(!trace && !std::getenv("STRATA_GFX906_TOPK_FIT17_TRACE"),"all selector traces must be absent; old topology text is not WIDE51 evidence");
+         require(!std::getenv("STRATA_TOPK_OLD"),"STRATA_TOPK_OLD must be absent");
+         ck(cudaSetDevice(device),"set device");cudaDeviceProp prop{};ck(cudaGetDeviceProperties(&prop,device),"properties");
+         require(std::strncmp(prop.gcnArchName,"gfx906",6)==0 &&
+@@ -135,11 +138,14 @@
+             require(scores==c.scores && steps==c.steps,"reference modified input bytes/guards");
+             int32_t max_blocks=0;for(uint32_t t=0;t<a.nq;++t) max_blocks=std::max(max_blocks,c.steps[t*k::kStepCount+k::kStepNBid]+1);
+             const int32_t last_nkv=c.steps[(a.nq-1)*k::kStepCount+k::kStepNKv];
+-            const char* intended=a.nq>8?"unchanged_fallback":last_nkv<=24576?"reference":(max_blocks<=17408?"middle17":"wide66");
+-            std::printf("CASE_PASS nq=%u case=%s last_nkv=%d max_active_blocks=%d candidate_intended_route=%s IDs=graph=reference=CPU padding=end_canaries=inputs_unchanged=PASS\n",
++            const char* intended=a.nq>8?"fallback_ref":last_nkv<=24576?"guarded_ref":
++                !fit17_on?"guarded_reg66_legacy":max_blocks<=17408?"guarded_reg17":
++                (wide51_on && a.score_cap<=52224)?"guarded_reg51":"guarded_reg66";
++            std::printf("CASE_PASS nq=%u case=%s last_nkv=%d max_active_blocks=%d source_expected_route=%s route_observed=0 IDs=graph=reference=CPU padding=end_canaries=inputs_unchanged=PASS\n",
+                         a.nq,c.name.c_str(),last_nkv,max_blocks,intended);std::fflush(stdout);
+         }
+-        std::printf("TRANSITION_PASS nq=%u cases=%zu graph_instantiations=1 constant_addresses=1 constant_capacities=1 fit17=%s timing_claim=0\n",a.nq,a.cases.size(),mid);
++        std::printf("TRANSITION_PASS nq=%u capacity=%u cases=%zu graph_instantiations=1 constant_addresses=1 constant_capacities=1 fit17=%s wide51=%s route_observed=0 timing_claim=0\n",
++                    a.nq,a.score_cap,a.cases.size(),mid?mid:"<unset>",wide?wide:"<unset>");
+         return 0;
+     } catch(const std::exception& e) {std::fprintf(stderr,"FAIL: %s\n",e.what());return 1;}
+ }

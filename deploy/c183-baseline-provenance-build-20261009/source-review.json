@@ -1,0 +1,34 @@
+{
+  "status": "PASS_BASELINE_PROVENANCE_BUILD_SCRIPT_REVIEW",
+  "created_utc": "2026-10-09T21:56:42.328078+00:00",
+  "package": "/home/opencode/ai/c183-baseline-provenance-build-20261009",
+  "reviewed_hashes": {
+    "build_inside.py": "b7a3c54e3369edf69aaecd8cc2e2ef74acd074e191e0b97d3ed918da906fe403",
+    "run_reproduce.py": "89bb326fa132a6caf7668784ff45ecdbcf949805da2665f929b19492d7e9beeb",
+    "test_reproduce.py": "c1a943ca33dcbed5f4667fa3345cc425a14146da100239ac912f4c2bd4e0d793",
+    "exported-build-metadata.txt": "9c85cc9536647f81b632311fb8354e74dd2ab399ce9e5c300dced3641876e167",
+    "README.md": "7d3ccbf2594a6a0496c969998e3d0a3d3573b0f2f71082c5b140410cba2b3177"
+  },
+  "tests": {
+    "independently_rerun": 7,
+    "passed": true,
+    "stderr_sha256": "23fd561e59e685951c3ff88a107d52e620f78045be016fc87cff923b23cd476e"
+  },
+  "checks": {
+    "inputs": "Pinned original gemm.cu, prefill.cpp and gemm.hpp; pinned standalone object hashes; exported flags, recipes and link command verified exactly before compilation. Archive members must be unique and match standalone objects.",
+    "compile": "Exact HIP/CXX defines/includes/optimization/architecture/language flags and /src/build-906 working directory. Only object/dependency output destinations change; original -MT dependency target preserved. Both rebuilt objects must match exact hashes before relink.",
+    "link": "Fresh relink uses unchanged original generate object, original archives and original dynamic/static library arguments in exact order. Only executable output destination changes. Result must equal c18316d678a669c309cb95e2f5de9af03fa5573256fd0e093aafc4b41000d049. All link input hashes captured before/after.",
+    "isolation": "Pinned locally available image with pull disabled, no network or exposed GPU devices, read-only root filesystem and source/package mounts, only fresh /out and tmpfs writable, dropped capabilities and no-new-privileges. No resulting executable or observer code is run.",
+    "bounds": "Each compiler max300 seconds, link180, bounded tool probes; child process groups killed on timeout. Outer container timeout1000 seconds, owned-container-only cleanup20 seconds and launcher wait10 seconds. CPU4, memory12GiB, pids512, tmpfs2GiB.",
+    "fail_closed": "Any source/object/recipe/flag/archive/rebuilt-object/relinked-binary mismatch stops. Does not relax equality or continue to observer build. stdout/stderr/returncodes/commands/output hashes retained for steps; initial host receipt exists before source validation. Cleanup errors force FAILED status and passed=false.",
+    "integrity": "Original metadata/inputs checked after run; source/build remains read-only inside container. Output path freshness and exclusion from source/package checked before creation."
+  },
+  "scope": "Review and seven CPU unit tests only; no actual ROCm build, link, container, MI50 or GPU work by reviewer.",
+  "blockers": [],
+  "interpretation": "Successful execution would bind these rebuilt original gemm/prefill objects to their original archive members and reproduce the frozen c183 binary from original link inputs. It does not itself establish observer device-code parity or authorize model execution.",
+  "remaining_gates": [
+    "Root executes this exact reviewed script and independently checks terminal receipts.",
+    "On mismatch preserve artifacts and analyze; do not normalize away differences.",
+    "Only after PASS proceed to separately reviewed observer build/device parity and authorized counts-only run."
+  ]
+}

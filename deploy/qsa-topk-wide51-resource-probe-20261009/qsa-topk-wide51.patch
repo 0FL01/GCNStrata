@@ -1,0 +1,28 @@
+--- a/src/kernels/cuda/qsa_select.cu
++++ b/src/kernels/cuda/qsa_select.cu
+@@ -614,7 +614,7 @@
+     }
+     if constexpr (WINDOW_GUARD != 0) {
+         static_assert(LONG_ONLY && (WINDOW_GUARD == 1 || WINDOW_GUARD == 2), "fit17/wide need LONG_ONLY");
+-        static_assert((WINDOW_GUARD == 1 && PER == 17) || (WINDOW_GUARD == 2 && PER == TK_PER_MAX), "guard/PER mismatch");
++        static_assert((WINDOW_GUARD == 1 && PER == 17) || (WINDOW_GUARD == 2 && (PER == TK_PER_MAX || PER == 51)), "guard/PER mismatch");
+         // Exact actual-capacity specialization: max(n_bid)+1 <= 1024*17.
+         // Device rows may be unsorted. This CTA-uniform guard precedes barriers.
+         int32_t max_bid = 0;
+@@ -1403,7 +1403,15 @@
+                              (long long) nq, (long long) max_blocks, (long long) cap);
+             }
+             block_topk_reg_kernel<17, true, 1><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+-            block_topk_reg_kernel<TK_PER_MAX, true, 2><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
++            // Allocation capacity is immutable across graph replay; every valid row has n_bid + 1 <= reach.
++            static const bool wide51 = [] {
++                const char* v = std::getenv("STRATA_GFX906_TOPK_WIDE51");
++                return v && std::strcmp(v, "1") == 0;
++            }();
++            if (wide51 && reach <= (int64_t) TK_T * 51)
++                block_topk_reg_kernel<51, true, 2><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
++            else
++                block_topk_reg_kernel<TK_PER_MAX, true, 2><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+         } else {
+             block_topk_reg_kernel<TK_PER_MAX, true><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+         }

@@ -1,0 +1,19 @@
+test_crosscheck_disagreement (__main__.ResourceGateTests.test_crosscheck_disagreement) ... ok
+test_each_layout_and_occupancy_regression (__main__.ResourceGateTests.test_each_layout_and_occupancy_regression) ... ok
+test_each_missing_required_metadata_or_remark (__main__.ResourceGateTests.test_each_missing_required_metadata_or_remark) ... ok
+test_each_resource_regression (__main__.ResourceGateTests.test_each_resource_regression) ... ok
+test_every_old_machine_body (__main__.ResourceGateTests.test_every_old_machine_body) ... ok
+test_kernel_sets (__main__.ResourceGateTests.test_kernel_sets) ... ok
+test_malformed_metadata_and_remarks (__main__.ResourceGateTests.test_malformed_metadata_and_remarks) ... ok
+test_missing_inputs (__main__.ResourceGateTests.test_missing_inputs) ... ok
+test_no_barrier_or_endpgm (__main__.ResourceGateTests.test_no_barrier_or_endpgm) ... ok
+test_old_metadata_arguments_and_other_fields (__main__.ResourceGateTests.test_old_metadata_arguments_and_other_fields) ... ok
+test_old_remarks (__main__.ResourceGateTests.test_old_remarks) ... ok
+test_qualified_pinned_parser (__main__.ResourceGateTests.test_qualified_pinned_parser) ... ok
+test_truncated_and_invalid_elf (__main__.ResourceGateTests.test_truncated_and_invalid_elf) ... ok
+test_valid_equal_and_improved (__main__.ResourceGateTests.test_valid_equal_and_improved) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 5.045s
+
+OK

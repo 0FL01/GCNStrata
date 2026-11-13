@@ -1,0 +1,94 @@
+{
+  "status": "PASS_TIMING_SCREEN_SOURCE_AND_CPU_TESTS_ONLY",
+  "created_utc": "2026-10-09T21:17:27.999889+00:00",
+  "package": "/home/opencode/ai/c183-hc-timing-screen-20261009",
+  "reviewed_hashes": {
+    "screen.cpp": "2946fe219195844ea2a41333d29c46437bd2aead35977b726750b0f088f96ed9",
+    "screen_core.hpp": "0a08efbe1ef2b25ec01f5299f24bbd587cd3a22bf46ef22eae750d94ca63488d",
+    "analyze.py": "33ea8115079bc67741ab8a07304b577dc4c72c078f7150a6e030c91ef6c3c1e3",
+    "run_screen.py": "14db9bb10f30d123205e463c921607ce2a95efd29f90a6578e71208258acc399",
+    "watchdog.hpp": "e828ab87c860f657646334ebe494851151f2d6cd2ac0861d6019ed0358fb2d49",
+    "hip_log.hpp": "73a621bc17b0781b73b9690f1261494b47c5420bccca3e146823928141a7c7b8",
+    "baseline.elf": "5abe1289b549a9fa4ad7da00398fd81179a6d3b414bd2b3c44b749d5e315f377",
+    "candidate.elf": "3f0c5ecb285232b1e338bf0aa51ebe729eefaa547388c14ebbd488167105ecf9",
+    "resource-gate.json": "b4da67f44d01b0a9af96358ba897640d5e6906afff3658838010c03829e52659",
+    "exhaustive-audit.json": "a12bd1f1953115c1c9a9252f35f75bfadc6c6db5e3e20298a0debf389afc04a7",
+    "native_support.py": "850a18e95a5a2e13013f778ecb7b807809def5e62154fe9ff91acfe63b8f05bf",
+    "qsa_probe_safety.py": "749392111a9646aa7b7c03ae0cea8c30253922c23d9e9330ad7415222e929e45",
+    "test_core.cpp": "05705e3fca283d8b84652056650322adc6e4601f6ed0176214f5090a56c5caf4",
+    "test_screen.py": "acacf3059a42bdb91cf1e3d558d606336fc319a0fded89de23117b237e952564"
+  },
+  "cpu_tests": {
+    "independently_rerun": 7,
+    "all_passed": true,
+    "stderr_sha256": "b3bd5a1f46e416b253b6edd33e9b015e38fb8fc1d74e0c334d1f1cf53b841ac5",
+    "additional_independent_estimator_test": "0fe428788f07801bd8d1c3e68b07ade7e12e035a6eaa8ef920a53b4a4b5ecd7b"
+  },
+  "scope": {
+    "descriptors": [
+      {
+        "n": 3276800,
+        "scale": 4096,
+        "stats_offset": 0,
+        "calls": 1728
+      },
+      {
+        "n": 41943040,
+        "scale": 512,
+        "stats_offset": 5,
+        "calls": 810
+      },
+      {
+        "n": 41932800,
+        "scale": 512,
+        "stats_offset": 5,
+        "calls": 54
+      },
+      {
+        "n": 1310720,
+        "scale": 512,
+        "stats_offset": 5,
+        "calls": 810
+      },
+      {
+        "n": 1310400,
+        "scale": 512,
+        "stats_offset": 5,
+        "calls": 54
+      }
+    ],
+    "patterns": [
+      "accepted",
+      "sparse reject every4096",
+      "dense reject"
+    ],
+    "regimes": [
+      "same-arm warm predecessor",
+      "disjoint baseline scrub-conditioned; not guaranteed cold"
+    ],
+    "quartets_per_cell": 3,
+    "preflight_pairs": 16,
+    "preflight_launches": 32,
+    "predecessor_launches": 360,
+    "timed_launches": 360,
+    "total_launches": 752,
+    "preflight_binary_bytes": 2288792064
+  },
+  "checks": {
+    "ABI_and_memory": "Five baseline and four fixed-candidate pointer-to-argument entries; int64 n; stats offset0/5 within23 guarded words. Maximum descriptor allocation41943040 safely covers all five; disjoint scrub16777216. Prepared argument storage remains live across start/launch/stop submission.",
+    "preflight": "All15 descriptor/pattern pairs plus scrub pair run before any event timing. Full input unchanged, output exact two-arm equality, exterior canaries and expected all16stats independently CPU checked. Per-sample stats recorded; post-cell full-array equality/input/canary checks.",
+    "bracket": "Only start event, budget increment/guard and kernel launch, stop event inside normal bracket. Allocation, argument setup, copies, reset, synchronization and success logging outside. Event launch gaps can contribute to single-kernel timings; no whole-model claim.",
+    "event_preservation": "Exact float duration bits/index/elapsed rc logged before finite-duration or stats validation. Analyzer checks every successful sample against original bits. Final scrub mismatch now saves both raw readbacks before failure.",
+    "statistics": "Per-descriptor median of three within-ABBA mean differences; raw360 samples, paired means/ratios and ranges retained. Each of six pattern/regime scenarios computes signed callcount-weighted deltas and separately sum of positive-clipped deltas. No descriptor selection across scenarios; independently tested.",
+    "gate": "Maximum whole-scenario optimistic sum >1003.739604ms => INVESTIGATION_ONLY; otherwise PARK_WITHOUT_MODEL_QUALIFICATION. Never a model bound/gain.",
+    "safety": "Reviewed exact resource/exhaustive prerequisite pins; native300second SIGALRM plus outer watchdog/deadline; GPU0 physical PCI; cooldown/high190W/thermal checks; shared lock; fresh outputs; no API/settings changes; no retries; preserved failures and cleanup."
+  },
+  "blockers": [],
+  "limitations": [
+    "Source and host tests only: driver compile and GPU timing unrun by reviewer.",
+    "Three quartets per synthetic cell are screening evidence, not confidence-qualified production performance.",
+    "Warm/scrub-conditioned labels do not establish cold-cache behavior.",
+    "SIGALRM is a process watchdog, not guaranteed instantaneous hardware cancellation.",
+    "Preflight output files require about2.29GB disk before compression."
+  ]
+}

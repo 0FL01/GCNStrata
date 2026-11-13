@@ -1,0 +1,45 @@
+test_bad_hashes_and_noop_patch_rejected (test_build_capture.BuildSpecTests.test_bad_hashes_and_noop_patch_rejected) ... ok
+test_command_pinned_gpu_free_network_free_and_shared_locks (test_build_capture.BuildSpecTests.test_command_pinned_gpu_free_network_free_and_shared_locks) ... ok
+test_default_main_validates_only (test_build_capture.BuildSpecTests.test_default_main_validates_only) ... ok
+test_exact_seven_sources (test_build_capture.BuildSpecTests.test_exact_seven_sources) ... ok
+test_incomplete_receipts_fail_closed (test_build_capture.BuildSpecTests.test_incomplete_receipts_fail_closed) ... ok
+test_kernel_actions_recorded_without_false_link_positive (test_build_capture.BuildSpecTests.test_kernel_actions_recorded_without_false_link_positive) ... ok
+test_noop_binary_source_drift_and_errors_rejected (test_build_capture.BuildSpecTests.test_noop_binary_source_drift_and_errors_rejected) ... ok
+test_patch_is_only_one_text_source (test_build_capture.BuildSpecTests.test_patch_is_only_one_text_source) ... ok
+test_receipt_success_and_binary_package_binding (test_build_capture.BuildSpecTests.test_receipt_success_and_binary_package_binding) ... ok
+test_recompile_is_allowed_only_with_identical_used_bytes (test_build_capture.BuildSpecTests.test_recompile_is_allowed_only_with_identical_used_bytes) ... ok
+test_spec_is_pure_and_pins_identity (test_build_capture.BuildSpecTests.test_spec_is_pure_and_pins_identity) ... ok
+test_one_file_no_abi (test_capture_source.SourceTests.test_one_file_no_abi) ... ok
+test_original_consumer_parser_bytes (test_capture_source.SourceTests.test_original_consumer_parser_bytes) ... ok
+test_private_creation_owned_cleanup_and_format (test_capture_source.SourceTests.test_private_creation_owned_cleanup_and_format) ... ok
+test_safe_location_and_bounded_diagnostic (test_capture_source.SourceTests.test_safe_location_and_bounded_diagnostic) ... ok
+test_control_quality_failure_stops_before_capture (test_paired_runner.RunnerTests.test_control_quality_failure_stops_before_capture) ... {"event": "start", "tag": "control"}
+ok
+test_counter_divergence_pauses_without_retry (test_paired_runner.RunnerTests.test_counter_divergence_pauses_without_retry) ... {"event": "start", "tag": "control"}
+{"event": "start", "tag": "diagnostic"}
+ok
+test_default_cli_is_strictly_offline (test_paired_runner.RunnerTests.test_default_cli_is_strictly_offline) ... ok
+test_exact_configuration_and_one_plus_one_schedule (test_paired_runner.RunnerTests.test_exact_configuration_and_one_plus_one_schedule) ... ok
+test_exact_dependencies_and_minimal_arm_copy (test_paired_runner.RunnerTests.test_exact_dependencies_and_minimal_arm_copy) ... ok
+test_execute_cli_propagates_pause_failure_without_retry (test_paired_runner.RunnerTests.test_execute_cli_propagates_pause_failure_without_retry) ... ok
+test_image_toolchain_env_allowed_runtime_flags_fail_closed (test_paired_runner.RunnerTests.test_image_toolchain_env_allowed_runtime_flags_fail_closed) ... ok
+test_imported_validator_rejects_old_64k (test_paired_runner.RunnerTests.test_imported_validator_rejects_old_64k) ... ok
+test_malformed_done_retains_raw_ids_and_done_no_retry (test_paired_runner.RunnerTests.test_malformed_done_retains_raw_ids_and_done_no_retry) ... {"event": "start", "tag": "control"}
+ok
+test_mocked_native_two_processes_one_request_each (test_paired_runner.RunnerTests.test_mocked_native_two_processes_one_request_each) ... {"event": "start", "tag": "control"}
+{"event": "start", "tag": "diagnostic"}
+ok
+test_preexisting_capture_stops_before_diagnostic (test_paired_runner.RunnerTests.test_preexisting_capture_stops_before_diagnostic) ... {"event": "start", "tag": "control"}
+ok
+test_private_file_mode_gate_and_nonempty_capture (test_paired_runner.RunnerTests.test_private_file_mode_gate_and_nonempty_capture) ... ok
+test_actual_rows_and_window (test_validate_200k.ValidateTests.test_actual_rows_and_window) ... ok
+test_fake_200k_header_rejects_old_steps (test_validate_200k.ValidateTests.test_fake_200k_header_rejects_old_steps) ... ok
+test_id_exactness_not_just_shape (test_validate_200k.ValidateTests.test_id_exactness_not_just_shape) ... ok
+test_paired_metadata_and_duplicate_rejection (test_validate_200k.ValidateTests.test_paired_metadata_and_duplicate_rejection) ... ok
+test_reject_malformed_header_and_payload (test_validate_200k.ValidateTests.test_reject_malformed_header_and_payload) ... ok
+test_reject_old64k_and_limits (test_validate_200k.ValidateTests.test_reject_old64k_and_limits) ... ok
+
+----------------------------------------------------------------------
+Ran 33 tests in 1.778s
+
+OK

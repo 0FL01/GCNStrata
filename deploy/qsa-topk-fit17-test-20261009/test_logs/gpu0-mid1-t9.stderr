@@ -1,0 +1,1 @@
+strata topk probe: device=0 kernel=reference256 nq=9 capacity_blocks=65537 active_blocks=-1 cap=2080

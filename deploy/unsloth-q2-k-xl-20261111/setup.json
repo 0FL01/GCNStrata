@@ -1,0 +1,127 @@
+{
+  "prepared_utc": "2026-11-11T06:32:47.771184+00:00",
+  "executed": false,
+  "fixture": {
+    "source": "/home/radneon/strata/deploy/unsloth-q2-64k-20261110/prompt-65536.ids.json",
+    "copied_file": "/home/radneon/strata/deploy/unsloth-q2-k-xl-20261111/prompt-65536.ids.json",
+    "sha256": "63ce3d4042027a00b2193feab143f1d9443b5c31a863a962ec9543ccb54d9695",
+    "count": 65536,
+    "min": 8,
+    "max": 248046,
+    "vocab_size": 248320
+  },
+  "config_path": "/home/radneon/strata/configs/unsloth-q2-20261110.json",
+  "config_sha256": "f84a0f450c1f7b9875b74682a9889e9b5764f4925fd116802b22262d2cd7d86d",
+  "image": "sha256:bccb7ee7e7a78274519db9a43ba63c34ddd2e74bb60f8764a8f50aaee1f2c646",
+  "production_container_id": "4576f5b1fbb1ec67e5685a6fcc1f31e1eeaa317acdf287bca699ba9edb7127f2",
+  "binary_path": "/home/radneon/strata/releases/gfx906-bounds-main-53e6c6a5/strata",
+  "binary_sha256": "67877d40ee363a4f33e7d9cd35da73e1d7c6ac284f5c9ee26870315552a52234",
+  "server_protocol_path": "/home/radneon/strata/serve/server.py",
+  "server_protocol_sha256": "ae689a6c1f9f9d7cb9b70075514fcbb3c80794c0036157a57b7a3dc4a2fd6715",
+  "mounts": [
+    {
+      "Type": "bind",
+      "Source": "/home/radneon/strata/releases/gfx906-bounds-main-53e6c6a5/strata",
+      "Destination": "/qualified-strata",
+      "Mode": "ro",
+      "RW": false,
+      "Propagation": "rprivate"
+    },
+    {
+      "Type": "bind",
+      "Source": "/home/radneon/models-nvme",
+      "Destination": "/models",
+      "Mode": "ro",
+      "RW": false,
+      "Propagation": "rprivate"
+    },
+    {
+      "Type": "bind",
+      "Source": "/home/radneon/models",
+      "Destination": "/sata",
+      "Mode": "ro",
+      "RW": false,
+      "Propagation": "rprivate"
+    },
+    {
+      "Type": "bind",
+      "Source": "/home/radneon/models-nvme/shared-engram",
+      "Destination": "/home/radneon/models-nvme/shared-engram",
+      "Mode": "ro",
+      "RW": false,
+      "Propagation": "rprivate"
+    },
+    {
+      "Type": "bind",
+      "Source": "/home/radneon/strata",
+      "Destination": "/src",
+      "Mode": "rw",
+      "RW": true,
+      "Propagation": "rprivate"
+    }
+  ],
+  "host_config": {
+    "Devices": [
+      {
+        "PathOnHost": "/dev/kfd",
+        "PathInContainer": "/dev/kfd",
+        "CgroupPermissions": "rwm"
+      },
+      {
+        "PathOnHost": "/dev/dri",
+        "PathInContainer": "/dev/dri",
+        "CgroupPermissions": "rwm"
+      }
+    ],
+    "GroupAdd": [
+      "video"
+    ],
+    "IpcMode": "host",
+    "Ulimits": [
+      {
+        "Name": "memlock",
+        "Hard": -1,
+        "Soft": -1
+      }
+    ],
+    "SecurityOpt": [
+      "label=disable"
+    ],
+    "CapAdd": null,
+    "Privileged": false,
+    "ShmSize": 67108864,
+    "Runtime": "runc",
+    "DeviceRequests": null
+  },
+  "methodology": {
+    "order": [
+      "prod-q2_0-1",
+      "q2_k_xl-1",
+      "q2_k_xl-2",
+      "prod-q2_0-2"
+    ],
+    "fresh_engine_each_run": true,
+    "prompt_tokens": 65536,
+    "generated_tokens": 512,
+    "sampling": {
+      "temperature": 1,
+      "top_p": 0.95,
+      "top_k": 20,
+      "seed": 12345
+    },
+    "context": 262144,
+    "vision": false,
+    "cache_changes": {
+      "--prompt-cache": "0",
+      "--prompt-cache-every": "0",
+      "--conversation-cache-mib": "0",
+      "--conversation-cache-slots": "0"
+    },
+    "eos_ids": "2147483647",
+    "mtp": "/src/runtime/mtp",
+    "scope": "Native full-prompt PP and decode TG, not quality/equal-output or cold filesystem-cache comparison. API auth key is omitted from native engine environment.",
+    "baseline": "production Unsloth UD-Q2_0",
+    "candidate": "Unsloth UD-Q2_K_XL",
+    "storage_note": "baseline main GGUF on SATA; candidate on NVMe; shared IQ4_NL header views on NVMe, actual runtime Q8_0 PLE identical on SATA; fresh engines not cold OS cache"
+  }
+}

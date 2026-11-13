@@ -1,0 +1,100 @@
+{
+  "status": "PASS_CONDITIONAL_PRIMARY_WNEG_V2_SOURCE_AND_CPU_REVIEW",
+  "passed": true,
+  "source_and_cpu_review_passed": true,
+  "build_provenance_and_device_gate_passed": false,
+  "model_qualification_passed": false,
+  "created_utc": "2026-10-09T23:51:08.498540+00:00",
+  "package": "/home/opencode/ai/hc-primary-negative-cache-v2-20261009",
+  "package_archive_sha256": "f9841342c4f84c33b8e4a3052269b4b413e1152c4d499b3f78ba92676152b54b",
+  "patch_sha256": "652da8573cd570f996857ebcb5fc61c5c004f57c1873d9868b42662dd7a22b50",
+  "source_pins": {
+    "baseline_sha256": {
+      "src/prefill/gemm.cu": "6f73546e4b654a9cc81f4b333a09530c7425e13f6ce33ac16ecb88a05b07fabd",
+      "src/prefill/prefill.cpp": "1a8855dd4e1d6116f10060f2be2110014ecc2afb9e80c9164fc0689c8f175b42",
+      "include/strata/prefill/gemm.hpp": "a46c76cad934f4c4114a0f984aee2a7145c8549fc7b1efee16b09d62aab2cfaf"
+    },
+    "candidate_sha256": {
+      "include/strata/prefill/gemm.hpp": "a46c76cad934f4c4114a0f984aee2a7145c8549fc7b1efee16b09d62aab2cfaf",
+      "include/strata/prefill/hc_negative_cache.hpp": "973aa1dd196c578d52bb2107e2826f2aae271400a036abefda3c8ca3135e59a2",
+      "src/prefill/gemm.cu": "34d9eebdb4a43691bec0af73512dd1104c62be2a3586a435f007bba2dc18d774",
+      "src/prefill/prefill.cpp": "6993ea906198364e8bca514bcb8df42bfe8fe3f7531fff96522903e00197b6cb"
+    },
+    "context_tar_sha256": "bba374c2479ae51d28b832dead10165e0ba6d5d9e063b086315220f18d5a3869",
+    "patch_sha256": "652da8573cd570f996857ebcb5fc61c5c004f57c1873d9868b42662dd7a22b50"
+  },
+  "reviewed_artifact_hashes": {
+    "README.md": "c9a49f7cef7dc3877c09e35a6adb1f9f72610a5bf542d950afea0d67b379373b",
+    "LIFETIME-EVIDENCE.md": "9822cd42367b92bcdb91239f20b281897cb1e541a83b17e6a76be74575217014",
+    "test_cache.cpp": "4bf64706d3ffaa221162f9984d7b37d212c650929c7be63d00b7b16fe3badaad",
+    "test_source.py": "faf774f02ad9d3b82f6f435e3a611aa88d83b7d79558a5b877bbcdd4bd538d89",
+    "run_cpu_tests.sh": "42dbc245b502c50138227c65ff52b70073982c87a4b536f84f10cb71835015e8",
+    "source-pins.json": "dcca17dc87fba770b415a5ca75f24313ed561f56cc49bfc02ef9315aca365c9b"
+  },
+  "tests": {
+    "O0_strict_warnings": true,
+    "O1_ASan_UBSan": true,
+    "O2_fixture": true,
+    "qualification_fixture": true,
+    "primary_3chunk": {
+      "candidates": 324,
+      "learns": 11,
+      "hits": 22,
+      "guards": 302
+    },
+    "conditional_16chunk": {
+      "candidates": 1728,
+      "learns": 11,
+      "hits": 165,
+      "guards": 1563
+    },
+    "final_stdout_sha256": "14ef72586ddd7dd16ee78ed1e2ebae254fd028e6201aacc7e850b2cdb99dd1f0",
+    "final_stderr_sha256": "e93d4df0c54c26b5073d9ff1ccc0c734f09751ff2b4d5140f62abb7fa2005d00",
+    "qualification_runtime_same_binary_on_off": true,
+    "qualification_read_once_at_admission_proved": true,
+    "qualification_invalid_01_disabled": true,
+    "qualification_off_stderr_empty": true
+  },
+  "checks": {
+    "gemm.cu_gpu_api_count": 70,
+    "prefill.cpp_gpu_api_count": 239,
+    "all_gpu_api_occurrences_equal": true,
+    "exact_generic_fallback_bytes_unchanged": true,
+    "host_cross_translation_unit_tls_test_passed": true,
+    "patch_clean_apply_reproduces_candidate": true,
+    "atomic_and_nested_rejection": true,
+    "primary_tls_not_accessible_to_peer_threads": true,
+    "normal_drain_then_clear": true,
+    "exception_scope_clears_without_pipeline_changes": true,
+    "all_eligibility_scratch_overlap_gates_before_hit": true,
+    "W_only_learning_after_original_sync": true,
+    "two_explicit_HC_down_up_sites_only": true,
+    "defaultoff_exact_optin": true,
+    "qualification_no_compile_define": true,
+    "qualification_no_percall_env_or_clock": true,
+    "qualification_end_only_output": true,
+    "counters_identical_in_both_modes": true,
+    "gemm_and_prefill_sources_identical_to_v1": true
+  },
+  "lifetime": {
+    "loader_archive_sha256": "3147546f0d8941b7c3b34354b7b130d76fd921319d92b8a441de5efd366b9645",
+    "caller_archive_sha256": "bba374c2479ae51d28b832dead10165e0ba6d5d9e063b086315220f18d5a3869",
+    "five_loader_manifest_entries_verified": true,
+    "independently_inspected": "Resident BF16 arena allocate/upload/publish/load-sync before Prefill setup; separate NativeDense fields; reviewed generate draft/progress/checkpoint callbacks without HC W writes/reload; primary free after work.",
+    "admission": "Existing reviewed generate flow only; one nonconcurrent public run, no arbitrary mutating callbacks, reset/delete/reload/init/rebind races. Fixed request context and resident W contents required. Peers remain baseline.",
+    "compiled_loader_source_attestation": false
+  },
+  "warnings": [
+    "GCC O2 -Wdangling-pointer for rejected concurrent fixture retained. Rejected scope never installs TLS, admitted scope clears before destruction; independent cross-TU and ASan/UBSan tests pass. Not promoted to an unrestricted generic API safety claim."
+  ],
+  "remaining_gates": [
+    "Separate actual host build with exact original compile argv/path/CUID and complete55 GPU payload equality.",
+    "Verify linked host TLS symbol identity and actual model qualification under same compiled binary, STRATA_HC_WNEG_QUALIFY=1; confirm primary-only ordinal learning/hits and unchanged output, peers baseline.",
+    "Paired timing uses that same binary with qualification output disabled; count overhead included. No claimed benefit until actual paired model evidence.",
+    "Keep reviewed generate-flow/admission/lifetime restrictions explicit in runtime runner; no broadening to peers or across requests."
+  ],
+  "performance_claim": false,
+  "no_MI50_or_HIP_build_or_model_run_by_reviewer": true,
+  "blockers_to_conditional_source_review": [],
+  "prior_v1_review_sha256": "247b86ccd2d8ea47bdb5976192806e09407952624a68225b4a31b13e2c429c84"
+}

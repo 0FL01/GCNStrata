@@ -1,0 +1,65 @@
+{
+  "status": "PASS_ACTUAL_COST_BUILD_AND_COMPLETE_DEVICE_EQUALITY",
+  "passed": true,
+  "source_and_cpu_review_passed": true,
+  "build_provenance_and_device_gate_passed": true,
+  "bindings": {
+    "binary_sha256": "4975ce25e13b8d15b61a8fad5afa6add7e460f8a2cff7e8ddfe9cd54b0a128e2",
+    "build_receipt_sha256": "df637404dcf8d6e3770a35c107f879f985d95e9fc87ff6d151c87d121f4aa453",
+    "inner_receipt_sha256": "71319b86e9d2f8c6461d3d94b8ca555b72d77faf65cc6c36af60ee2755c0da33",
+    "device_gate_sha256": "ac3d5f059f1d4e1973cb4a418128989bc7565c933fe90b890e09bd468aef8eab",
+    "runner_sha256": "3493e2e615e4b08a2238b3edb874c8b47237256ddef074b95596663263f8d9e7",
+    "input_pins_sha256": "3e1514d20f20cff674ccd199e1961f9512a22093481f62b96c1f94132e3207cd"
+  },
+  "source_review_sha256": "eb12a9ce62843b2d301701e748024668c0993555b34ffc8b5f7befa636739098",
+  "build_runner_review_sha256": "37ab161c6a715e342ea8f5fa1d9b961f25e67c44dbc557f83ee8382221284ae5",
+  "transfer_archive_sha256": "adddf41ea8571edff5bd9f48be0de080dae3a7b625bf58e395fdabc77cae3df8",
+  "verified_available_artifact_entries": 67,
+  "omitted_artifacts": [
+    "host:header-overlay/hc_counts_observer.hpp",
+    "host:header-overlay/kernels.hpp",
+    "host:header-overlay/moe_fused.hpp",
+    "host:header-overlay/gemm.hpp",
+    "host:header-overlay/prefill.hpp",
+    "host:header-overlay/moe_mmq.hpp",
+    "host:header-overlay/moe_fused_iq.hpp",
+    "host:scratch-build/libstrata_core.a",
+    "host:scratch-build/libstrata_kernels_cpu.a",
+    "host:scratch-build/libstrata_engine.a",
+    "host:scratch-build/libstrata_kernels.a",
+    "host:scratch-build/libstrata_mmq.a",
+    "host:scratch-build/libstrata_spec.a",
+    "host:scratch-build/CMakeFiles/strata.dir/link.txt",
+    "host:scratch-build/CMakeFiles/strata_prefill.dir/flags.make",
+    "host:scratch-build/CMakeFiles/strata_prefill.dir/build.make",
+    "host:scratch-build/CMakeFiles/strata_prefill.dir/src/prefill/prefill.cpp.o.d",
+    "host:scratch-build/CMakeFiles/strata_prefill.dir/src/prefill/prefill.cpp.o",
+    "host:scratch-build/CMakeFiles/strata_prefill.dir/src/prefill/gemm.cu.o",
+    "host:scratch-build/CMakeFiles/strata.dir/src/program/generate.cpp.o",
+    "host:scratch-build/ggml/src/libggml-cpu.a",
+    "host:scratch-build/ggml/src/libggml-base.a"
+  ],
+  "all_step_returncodes_zero": true,
+  "cleanup_passed": true,
+  "v4_link_inputs_exact": true,
+  "only_changed_link_input": [
+    "/src/build-906/libstrata_prefill.a"
+  ],
+  "prefill_members": [
+    {
+      "name": "gemm.cu.o",
+      "sha256": "3441fcf184db1a10c46d317fe4e9c5daaa2c088e7c4ace4b3efd1f5f75131295"
+    },
+    {
+      "name": "kernels.cu.o",
+      "sha256": "044a94744940abaa1178ceb913461fa297a776e1466d4f6d8b4777b2bb16e475"
+    },
+    {
+      "name": "prefill.cpp.o",
+      "sha256": "7d000a5f3c1a5bb2f94ba117d61dc93cb0da21989f972a6afaafcc2c4a366782"
+    }
+  ],
+  "device_equality_recomputed_exactly": true,
+  "module_count": 55,
+  "scope": "Actual build provenance/device equality review only; no model run. One-shot root authorization and runner safety gates still required."
+}

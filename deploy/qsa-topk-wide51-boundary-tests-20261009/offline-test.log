@@ -1,0 +1,40 @@
+test_all_fixture_rows_are_in_contract (__main__.ModelTests.test_all_fixture_rows_are_in_contract) ... ok
+test_capacity_is_immutable_host_bound (__main__.ModelTests.test_capacity_is_immutable_host_bound) ... ok
+test_exact_environment_switches (__main__.ModelTests.test_exact_environment_switches) ... ok
+test_ieee_exception_and_tie_semantics (__main__.ModelTests.test_ieee_exception_and_tie_semantics) ... ok
+test_nonmonotonic_rows_use_all_rows_for_fit17 (__main__.ModelTests.test_nonmonotonic_rows_use_all_rows_for_fit17) ... ok
+test_pinned_source_dispatch_and_guard_contract (__main__.ModelTests.test_pinned_source_dispatch_and_guard_contract) ... ok
+test_short_middle_wide_growth_and_restoration (__main__.ModelTests.test_short_middle_wide_growth_and_restoration) ... ok
+test_vetted_gpu_check_logic_preserved (__main__.ModelTests.test_vetted_gpu_check_logic_preserved) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.210s
+
+OK
+CPU_FIXTURE_PASS fixtures/wide51-cap52223-nq1.bin cases=22 rows=22
+CPU_FIXTURE_PASS fixtures/wide51-cap52223-nq4.bin cases=30 rows=120
+CPU_FIXTURE_PASS fixtures/wide51-cap52223-nq6.bin cases=30 rows=180
+CPU_FIXTURE_PASS fixtures/wide51-cap52223-nq8.bin cases=30 rows=240
+CPU_FIXTURE_PASS fixtures/wide51-cap52223-nq9.bin cases=30 rows=270
+CPU_FIXTURE_PASS fixtures/wide51-cap52224-nq1.bin cases=22 rows=22
+CPU_FIXTURE_PASS fixtures/wide51-cap52224-nq4.bin cases=30 rows=120
+CPU_FIXTURE_PASS fixtures/wide51-cap52224-nq6.bin cases=30 rows=180
+CPU_FIXTURE_PASS fixtures/wide51-cap52224-nq8.bin cases=30 rows=240
+CPU_FIXTURE_PASS fixtures/wide51-cap52224-nq9.bin cases=30 rows=270
+CPU_FIXTURE_PASS fixtures/wide51-cap52225-nq1.bin cases=22 rows=22
+CPU_FIXTURE_PASS fixtures/wide51-cap52225-nq4.bin cases=30 rows=120
+CPU_FIXTURE_PASS fixtures/wide51-cap52225-nq6.bin cases=30 rows=180
+CPU_FIXTURE_PASS fixtures/wide51-cap52225-nq8.bin cases=30 rows=240
+CPU_FIXTURE_PASS fixtures/wide51-cap52225-nq9.bin cases=30 rows=270
+{
+  "cpu_tests_passed": 8,
+  "gpu_executed": false,
+  "gpu_binary_built": false,
+  "timing_claim": false,
+  "verification": "CPU/source/fixture validation only; adapted HIP driver compile and GPU checks are NOT_RUN",
+  "fixture_count": 15,
+  "cases_checked": 426,
+  "rows_checked": 2496,
+  "unique_rows_weighted_radix_checked": 231,
+  "future_process_count": 21
+}

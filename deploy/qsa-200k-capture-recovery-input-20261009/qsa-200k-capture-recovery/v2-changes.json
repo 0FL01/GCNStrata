@@ -1,0 +1,13 @@
+{
+  "v1_preserved": true,
+  "v1_package_sha256": "64f24d289103f990ef94a5f1e7e88a77aa2acc764bf5167e13e3748ceccd6980",
+  "build_wrapper_unchanged": true,
+  "capture_patch_unchanged": true,
+  "capture_source_unchanged": true,
+  "native_arm_helper_unchanged": true,
+  "runtime_changes": [
+    "access_preflight.py added",
+    "run_paired_200k.py runs preflight before output/native requests"
+  ],
+  "gpu_executed": false
+}

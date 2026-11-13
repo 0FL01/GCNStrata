@@ -1,0 +1,19 @@
+{
+  "experiment": "single guarded PER51 CPU-only resource probe",
+  "baseline": "current qualified FIT17",
+  "baseline_sha256": "5fc5d78c6155fa0987dee751a875ab714516c88209b0938db17699061cc7de1a",
+  "candidate_sha256": "98f30cd9fb2fd80619a8caf70c6c1d74bb5c7c14d50ca312b36158cd9518ae08",
+  "patch_sha256": "5e76afb859a5612bb0e99ac7646707a516906a998196b133c1681cf48533d28a",
+  "image": "sha256:bccb7ee7e7a78274519db9a43ba63c34ddd2e74bb60f8764a8f50aaee1f2c646",
+  "arch": "gfx906",
+  "wavefront_size": 64,
+  "wide51_capacity_limit": 52224,
+  "our200k_allocation_blocks": 51202,
+  "new_option": "STRATA_GFX906_TOPK_WIDE51",
+  "enabled_value": "1",
+  "default_off": true,
+  "gpu_work_included": false,
+  "performance_claim": false,
+  "real200k_input_captured": false,
+  "resource_build_status": "not run; root to execute after inspection"
+}

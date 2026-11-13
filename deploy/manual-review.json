@@ -1,0 +1,175 @@
+{
+  "schema_version": 1,
+  "reviewed_at_utc": "2026-10-09T17:28:16.234770+00:00",
+  "decision": "PASS",
+  "scope": "pre-GPU only",
+  "review_type": "independent source, intact ELF, resource and manual ISA guard review",
+  "gpu_correctness_passed": false,
+  "gpu_graph_replay_passed": false,
+  "gpu_performance_qualified": false,
+  "gpu_executed_by_reviewer": false,
+  "performance_claim": false,
+  "candidate_source": {
+    "path": "/home/opencode/ai/qsa-topk-wide51-resource-probe-20261009/qsa_select.wide51.cu",
+    "sha256": "98f30cd9fb2fd80619a8caf70c6c1d74bb5c7c14d50ca312b36158cd9518ae08"
+  },
+  "baseline_source_sha256": "5fc5d78c6155fa0987dee751a875ab714516c88209b0938db17699061cc7de1a",
+  "bound_artifact_sha256": {
+    "build.receipt.json": "eb75d9e714d2f73d901f8e3af5303450a1444cb4ae0b4b1c11e1b469f307c80d",
+    "resource-gate.json": "e25b59127276328bcfdc768fd1051db758f11507aacb4e651001c3cbdad1c13f",
+    "OUTPUTS.sha256": "339543c7ee589b646b8ebbf4fac2aeeb48f200c89e9e9f26a1c403aad5a5146a",
+    "INPUTS.sha256": "120b71d15262edd339701a3eeeda2f38b6a2b3ac84e0390c1a13c04b3463f496",
+    "qsa_select.fit17-hip-amdgcn-amd-amdhsa-gfx906.out": "4663e26e6aa03cb6908dcee136ead3281bdf3c9aa08fc7bdf7a365e1f64f506e",
+    "qsa_select.wide51-hip-amdgcn-amd-amdhsa-gfx906.out": "75edbe3050b7d5a892e3c71fe806677ce58e215366e65eadc15876c4144bac22",
+    "wide51.guard2.isa.txt": "52547fab838c3e9df9737d4dc425b8bfca92ae2a46d668b89b362c84ef1347d9"
+  },
+  "exported_manifest_files_verified": [
+    "build.exit_code",
+    "build.receipt.json",
+    "compiler-flags.txt",
+    "compiler.txt",
+    "experiment.json",
+    "fit17.device.disasm",
+    "fit17.device.notes",
+    "fit17.resources.log",
+    "INPUTS.sha256",
+    "preprocessor-proof.json",
+    "qsa_select.fit17-hip-amdgcn-amd-amdhsa-gfx906.out",
+    "qsa_select.fit17-hip-amdgcn-amd-amdhsa-gfx906.s",
+    "qsa_select.wide51-hip-amdgcn-amd-amdhsa-gfx906.out",
+    "qsa_select.wide51-hip-amdgcn-amd-amdhsa-gfx906.s",
+    "resource-gate.json",
+    "source-check/source-proof.json",
+    "wide51.device.disasm",
+    "wide51.device.notes",
+    "wide51.guard2.isa.txt",
+    "wide51.resources.log"
+  ],
+  "elf_review": {
+    "elf64_little_endian_amdgpu": true,
+    "section_tables_and_function_ranges_within_file": true,
+    "unchanged_kernel_count": 13,
+    "all_existing_function_bytes_identical": true,
+    "all_existing_resource_metadata_and_remarks_identical": true,
+    "exactly_one_new_kernel": "_ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi51ELb1ELi2EEEvPKfPKillPi",
+    "candidate_function_bytes": 70816,
+    "candidate_function_sha256": "9bc69d02d1573ed98784487947c5fdd13b217f092652af4a9447c7c8f456c36a",
+    "unchanged_kernel_names": [
+      "_ZN6strata7kernels12_GLOBAL__N_117block_topk_kernelILb0EEEvPKfPKillPi",
+      "_ZN6strata7kernels12_GLOBAL__N_117block_topk_kernelILb1EEEvPKfPKillPi",
+      "_ZN6strata7kernels12_GLOBAL__N_119block_scores_kernelEPKfS3_S3_PKilPf",
+      "_ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi17ELb1ELi1EEEvPKfPKillPi",
+      "_ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi33ELb0ELi0EEEvPKfPKillPi",
+      "_ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi66ELb0ELi0EEEvPKfPKillPi",
+      "_ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi66ELb1ELi0EEEvPKfPKillPi",
+      "_ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi66ELb1ELi2EEEvPKfPKillPi",
+      "_ZN6strata7kernels12_GLOBAL__N_122block_scores_tc_kernelEPKfS3_PKilllPf",
+      "_ZN6strata7kernels12_GLOBAL__N_124block_scores_simt_kernelEPKfS3_PKilllPf",
+      "_ZN6strata7kernels12_GLOBAL__N_124block_scores_tail_kernelEPKfS3_PKilPf",
+      "_ZN6strata7kernels12_GLOBAL__N_124block_scores_wmma_kernelEPKfS3_PKilllPf",
+      "_ZN6strata7kernels12_GLOBAL__N_125block_scores_multi_kernelEPKfS3_S3_PKiilPfb"
+    ]
+  },
+  "manual_guard_review": {
+    "function_start_address": "0xF100",
+    "short_guard": {
+      "source_predicate": "last-query n_kv <= 24576",
+      "compare_address": "0xF14C",
+      "compare": "s_cmpk_lt_i32 s0, 0x6001",
+      "exit_branch_address": "0xF150",
+      "exit_target": "0x2059C"
+    },
+    "window_guard": {
+      "source_predicate": "max(n_bid) + 1 <= 17408 across all nq rows",
+      "row_nbid_load_offsets": [
+        "0x08",
+        "0x18",
+        "0x28",
+        "0x38",
+        "0x48",
+        "0x58",
+        "0x68",
+        "0x78"
+      ],
+      "scalar_max_reduction": true,
+      "compare_addresses": [
+        "0xF1B0",
+        "0xF25C"
+      ],
+      "compare": "s_cmpk_lt_u32 s7, 0x4400",
+      "exit_branch_addresses": [
+        "0xF1B8",
+        "0xF260"
+      ],
+      "body_entry_address": "0xF264",
+      "exit_target": "0x2059C"
+    },
+    "terminal_instruction": {
+      "address": "0x2059C",
+      "function_relative_offset": "0x1149C",
+      "instruction": "s_endpgm"
+    },
+    "first_barrier": {
+      "address": "0x12ABC",
+      "function_relative_offset": "0x39BC",
+      "instruction": "s_barrier"
+    },
+    "all_guard_instructions_scalar": true,
+    "no_exec_mask_mutation_in_guard": true,
+    "both_guard_exits_precede_every_barrier": true,
+    "guard_prefix_matches_wide66_except_terminal_branch_displacements": true,
+    "static_barrier_count": 10
+  },
+  "resource_comparison": {
+    "baseline_wide66": {
+      "TotalSGPRs": 104,
+      "VGPRs": 64,
+      "ScratchSize [bytes/lane]": 1048,
+      "Dynamic Stack": "False",
+      "Occupancy [waves/SIMD]": 4,
+      "SGPRs Spill": 539,
+      "VGPRs Spill": 468,
+      "LDS Size [bytes/block]": 32908
+    },
+    "candidate_wide51": {
+      "TotalSGPRs": 104,
+      "VGPRs": 64,
+      "ScratchSize [bytes/lane]": 852,
+      "Dynamic Stack": "False",
+      "Occupancy [waves/SIMD]": 4,
+      "SGPRs Spill": 385,
+      "VGPRs Spill": 388,
+      "LDS Size [bytes/block]": 32908
+    },
+    "baseline_isa_summary": {
+      "instruction_lines": 17410,
+      "barriers": 10,
+      "conditional_branches": 1283,
+      "buffer_or_scratch_load_stores": 1577
+    },
+    "candidate_isa_summary": {
+      "instruction_lines": 13823,
+      "barriers": 10,
+      "conditional_branches": 989,
+      "buffer_or_scratch_load_stores": 1381
+    }
+  },
+  "source_contract": {
+    "exact_string_1_default_off": true,
+    "only_existing_fit17_branch_changed": true,
+    "additional_launches": 0,
+    "capacity_limit_blocks": 52224,
+    "planned_200k_allocation_blocks": 51202,
+    "valid_row_precondition": "n_bid + 1 <= immutable max_blocks; this route has counted=false so reach=max_blocks",
+    "source_cpu_dispatch_cases": 906,
+    "source_cpu_guard_cases": 56
+  },
+  "blockers": [],
+  "limits": [
+    "This review is a basis for a separately authorized bounded GPU correctness run, not proof that such a run passed.",
+    "GPU correctness, graph replay and realistic wide51 performance remain unqualified.",
+    "No real 200K score/steps capture exists; the existing 64K capture exercises reg17.",
+    "Resource reductions and static instruction counts are not speed measurements."
+  ],
+  "original_automated_gate_and_build_receipts_modified": false
+}

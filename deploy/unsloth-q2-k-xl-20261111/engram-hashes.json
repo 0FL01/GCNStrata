@@ -1,0 +1,15 @@
+{
+  "2": {
+    "path": "/home/radneon/models-nvme/shared-engram/qwen38-engram-iq4_nl-2of2.gguf",
+    "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113"
+  },
+  "3": {
+    "path": "/home/radneon/models-nvme/shared-engram/qwen38-engram-iq4_nl-3of3.gguf",
+    "sha256": "05716382c280d999b81afff92b2d527fadbfd926ac225ffdc273f2d1d13331c6"
+  },
+  "4": {
+    "path": "/home/radneon/models-nvme/shared-engram/qwen38-engram-iq4_nl-4of4.gguf",
+    "sha256": "5de8b5dbf89409acc39468decafd4a4a95b13c29d88a14b0356107897829ec36"
+  },
+  "validation": "actual view headers + common reflink payload, full-file SHA256; original data bytes not rewritten"
+}

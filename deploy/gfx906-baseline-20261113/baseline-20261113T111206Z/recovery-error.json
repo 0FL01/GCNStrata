@@ -1,0 +1,7 @@
+{
+  "type": "RuntimeError",
+  "error": "Sensor or hardware fault: RuntimeError: Fan 100% or tach failure",
+  "faults": [
+    "RuntimeError: Fan 100% or tach failure"
+  ]
+}

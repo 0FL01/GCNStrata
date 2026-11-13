@@ -1,0 +1,13 @@
+test_destructor_rows_arrive_only_after_quit (test_qualification.NativeLifetimeTests.test_destructor_rows_arrive_only_after_quit) ... ok
+test_base_safety_unchanged (test_qualification.Tests.test_base_safety_unchanged) ... ok
+test_failure_and_single_use (test_qualification.Tests.test_failure_and_single_use) ... ok
+test_parser (test_qualification.Tests.test_parser) ... ok
+test_pins (test_qualification.Tests.test_pins) ... ok
+test_build_review_and_binary_gate_mutations (test_admission.AdmissionTests.test_build_review_and_binary_gate_mutations) ... ok
+test_completed_native_protocol_keeps_full_evidence (test_failure_evidence.Tests.test_completed_native_protocol_keeps_full_evidence) ... ok
+test_pre_done_failure_evidence (test_failure_evidence.Tests.test_pre_done_failure_evidence) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.061s
+
+OK

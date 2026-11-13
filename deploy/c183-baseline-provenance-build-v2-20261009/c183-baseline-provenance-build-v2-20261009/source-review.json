@@ -1,0 +1,26 @@
+{
+  "status": "PASS_V2_OUTPUT_OWNERSHIP_AND_FAILURE_RECEIPT_REVIEW",
+  "created_utc": "2026-10-09T22:02:24.800727+00:00",
+  "package": "/home/opencode/ai/c183-baseline-provenance-build-v2-20261009",
+  "reviewed_hashes": {
+    "build_inside.py": "1794c0332decc80c706e01deb1091bf07d56e63d5c764aed8eed1088540b802d",
+    "run_reproduce.py": "da6a159f8678c21c59faf782c1075ec6954fa6fe53c635fd1c0c98dfa5234a60",
+    "test_reproduce.py": "44a19137d95a6579f41e876887ac25cd32183f57b9731233a2a77e6bace8b58b",
+    "exported-build-metadata.txt": "9c85cc9536647f81b632311fb8354e74dd2ab399ce9e5c300dced3641876e167",
+    "README.md": "204c320776bf9c687eba226dfbe1a111adad566aa70a8846f24621aef9ef50b6"
+  },
+  "independent_cpu_tests_passed": 10,
+  "test_stderr_sha256": "59c06e70f6bf38ef2769c496385fef93e111356b066292ef0041b12fc6199a56",
+  "original_compile_hash_link_gates_AST_unchanged": true,
+  "checks": [
+    "Container --user matches host real uid:gid; real/effective identity equality required. Output ownership and exact0700 mode checked and recorded before Docker launch.",
+    "Verified root-provided state is host/output1000:1000, mode0700, image defaultroot with cap-drop ALL. Explicit1000:1000 narrows identity and enables ordinary owner access; no chmod or capability relaxation.",
+    "Read-only source/package/root filesystem, no network/GPU, pinned image, dropped capabilities and original subprocess/cleanup limits retained.",
+    "Earliest inner mkdir failure now emits structured failure JSON to stderr and attempts /out/inner-failure.json; fallback write errors remain in stderr without masking original exception.",
+    "Host failure receipt already exists before metadata/container execution. Ten tests cover UID/mode contract, earliest mkdir failure, unwritable fallback, original gates and bounded timeout.",
+    "AST comparison proves original reproduction body, command arrays, metadata/hash validation, archive/link input checks and step execution unchanged from reviewedv1."
+  ],
+  "preservation": "v1 package and failed actual run remain separate and unchanged. v2 must use a fresh output directory.",
+  "scope": "Source review and host unit tests only; reviewer did not run Docker, ROCm compilation, MI50 or GPU.",
+  "remaining_gate": "Root actual v2 execution must still reproduce both original object hashes and exact c183 relink hash; mismatch stops without relaxing equality."
+}

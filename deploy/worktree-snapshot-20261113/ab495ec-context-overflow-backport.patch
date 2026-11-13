@@ -1,0 +1,63 @@
+From ab495ec341ec4848cd08aee8a655bf73274de14f Mon Sep 17 00:00:00 2001
+From: Andrey Bash <bash8de@proton.me>
+Date: Tue, 10 Nov 2026 15:35:25 +0300
+Subject: [PATCH] fix(serve): backport recognizable context overflow errors
+
+---
+ serve/server.py      | 6 ++++--
+ serve/test_server.py | 4 +++-
+ 2 files changed, 7 insertions(+), 3 deletions(-)
+
+diff --git a/serve/server.py b/serve/server.py
+index d6b1fc3..55460e9 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -2791,12 +2791,14 @@ class Service:
+         room = ctx - CTX_SLACK - len(ids)
+         if max_new is None or max_new <= 0 or (self.fit_max_tokens and room < 1):
+             if room < 1:
+-                raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
++                raise ValueError(f"request exceeds the context window: "
++                                 f"prompt ({len(ids)} tokens) leaves no room to answer in the context "
+                                  f"({ctx}); requests are never truncated")
+             max_new = room
+         elif max_new > room:
+             if not self.fit_max_tokens:
+-                raise ValueError(f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
++                raise ValueError(f"request exceeds the context window: "
++                                 f"prompt ({len(ids)} tokens) + max tokens ({max_new}) exceeds the context "
+                                  f"({ctx}); requests are never truncated. Send a smaller "
+                                  f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
+                                  "model's strata-<model>.json to shorten it to the room left (#545)")
+diff --git a/serve/test_server.py b/serve/test_server.py
+index 590cf05..17397cf 100644
+--- a/serve/test_server.py
++++ b/serve/test_server.py
+@@ -139,7 +139,7 @@ class MaxTokens(unittest.TestCase):
+             with self.subTest(api=api):
+                 s, b, _, _ = self.call(api, max_tokens=CTX)
+                 self.assertEqual(s, 400)
+-                self.assertIn("exceeds the context", b["error"]["message"])
++                self.assertIn("request exceeds the context window: ", b["error"]["message"])
+                 self.assertIn("\"fit_max_tokens\": true", b["error"]["message"])     # #545: says how to get past it
+                 self.assertRegex(b["error"]["message"], r"at most \d+ here")
+ 
+@@ -160,6 +160,7 @@ class MaxTokens(unittest.TestCase):
+                 s, b, _, _ = self.call(api, text=text)
+                 self.assertEqual(s, 400, b)
+                 self.assertIn("no room to answer", b["error"]["message"])
++                self.assertIn("request exceeds the context window: ", b["error"]["message"])
+ 
+     def test_debug_log_shows_the_resolved_budget(self):
+         import contextlib
+@@ -213,6 +214,7 @@ class FitMaxTokens(unittest.TestCase):
+         s, b, _, _ = self.call("openai", text="y" * (CTX - CTX_SLACK - overhead), max_tokens=100)
+         self.assertEqual(s, 400, b)
+         self.assertIn("no room to answer", b["error"]["message"])
++        self.assertIn("request exceeds the context window: ", b["error"]["message"])
+ 
+ 
+ class VisionTempFiles(unittest.TestCase):
+-- 
+2.53.0
+

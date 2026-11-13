@@ -1,0 +1,11 @@
+test_compiled_cpu_abi_serializer_binary (test_exhaustive.Tests.test_compiled_cpu_abi_serializer_binary) ... ok
+test_duplicate_json_rejected (test_exhaustive.Tests.test_duplicate_json_rejected) ... ok
+test_exact_scope (test_exhaustive.Tests.test_exact_scope) ... ok
+test_nonzero_failure_preservation (test_exhaustive.Tests.test_nonzero_failure_preservation) ... ok
+test_parser_failure_preservation (test_exhaustive.Tests.test_parser_failure_preservation) ... ok
+test_validate (test_exhaustive.Tests.test_validate) ... ok
+
+----------------------------------------------------------------------
+Ran 6 tests in 1.487s
+
+OK

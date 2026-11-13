@@ -1,0 +1,21 @@
+{
+  "status": "HOST_ONLY_SOURCE_PATCH_PREPARED_NOT_BUILT",
+  "original_sha256": {
+    "gemm.cu": "6f73546e4b654a9cc81f4b333a09530c7425e13f6ce33ac16ecb88a05b07fabd",
+    "prefill.cpp": "1a8855dd4e1d6116f10060f2be2110014ecc2afb9e80c9164fc0689c8f175b42",
+    "generate.cpp": "2a1b3192b70fd56780fb6732c392abf54ff4f017279a6c3a463e0dac5b22d24e",
+    "gemm.hpp": "a46c76cad934f4c4114a0f984aee2a7145c8549fc7b1efee16b09d62aab2cfaf"
+  },
+  "patched_gemm_sha256": "597c3f8dbc618f2c273e5602907a6a7c073710c17ab97de12d2160acab9e35cc",
+  "patched_prefill_sha256": "3deaf1b496010712b00ac58349cbb487c18fb1341010ebd378e95de08bc10b91",
+  "observer_header_sha256": "2f545bdcda97cc9511ee71c0996b63855c1394d0f3c0e84525665f6f3c00f1d0",
+  "device_functions_unchanged": 9,
+  "kernel_launch_lines_unchanged": true,
+  "device_copy_reset_sync_event_calls_unchanged": true,
+  "extra_host_device_queries": "None: caller supplies m.device under its existing OnDevice scope; no new GPU API",
+  "source_provenance_limit": "Exact c183 source and build provenance recovered and reproduced in reviewed v4 baseline; cost build must bind that same evidence without weakening full-device byte equality",
+  "host_clock_reads_per_eligible_guard": 2,
+  "clock": "std::chrono::steady_clock",
+  "raw_duration_unit": "signed nanoseconds",
+  "required_next_gate": "Independent cost source and CPU review, root host/device build, unchanged full 55-device ELF proof, reviewed one-use cost runner, then one authorized 12K/1-token cold probe"
+}

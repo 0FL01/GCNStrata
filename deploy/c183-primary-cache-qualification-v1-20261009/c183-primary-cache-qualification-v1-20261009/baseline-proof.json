@@ -1,0 +1,293 @@
+{
+  "status": "PASS_TWO_INDEPENDENT_STORED_RAW_BASELINES_AGREE",
+  "receipts": [
+    {
+      "archive": "hc-counts-one-shot-receipts-20261009.tar.gz",
+      "archive_sha256": "bbdbfb28734f3f43c8054b39fccb47c0df3bbecdff8c95bc2aa5241162103a60",
+      "raw_stderr_sha256": "2edf636f94a156fa32e9809d675b968215c912ef99944eb065a2782e613b1f76",
+      "raw_stdout_sha256": "0db03bb6870c1738879c1fde7dd4ded36e94f6666bac6a3c1cf0b4354f672e69",
+      "output_ids": [
+        248046
+      ],
+      "routes": [
+        [
+          324,
+          99
+        ],
+        [
+          252,
+          104
+        ]
+      ],
+      "keys": [
+        {
+          "ordinal": 0,
+          "N": 320,
+          "K": 10240,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 6,
+          "N": 320,
+          "K": 10240,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 14,
+          "N": 320,
+          "K": 10240,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 28,
+          "N": 320,
+          "K": 10240,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 31,
+          "N": 10240,
+          "K": 320,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 38,
+          "N": 320,
+          "K": 10240,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 45,
+          "N": 10240,
+          "K": 320,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 66,
+          "N": 320,
+          "K": 10240,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 72,
+          "N": 320,
+          "K": 10240,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 83,
+          "N": 10240,
+          "K": 320,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 99,
+          "N": 10240,
+          "K": 320,
+          "mask": 4,
+          "hits": 2
+        }
+      ]
+    },
+    {
+      "archive": "hc-cost-one-shot-receipts-20261009.tar.gz",
+      "archive_sha256": "ca0fd0b004635dc293ddeb78b3382ac8452ce966dda0432e800022beb511c0a1",
+      "raw_stderr_sha256": "13d6f316a4553ef22786f2b0e754414f7f266effa83cc6add12dd226682ad7eb",
+      "raw_stdout_sha256": "d498d9070cf9bc94f069543b7fd25c2c280e1f85fde69b1fcad9beb55ff5075d",
+      "output_ids": [
+        248046
+      ],
+      "routes": [
+        [
+          324,
+          99
+        ],
+        [
+          252,
+          104
+        ]
+      ],
+      "keys": [
+        {
+          "ordinal": 0,
+          "N": 320,
+          "K": 10240,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 6,
+          "N": 320,
+          "K": 10240,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 14,
+          "N": 320,
+          "K": 10240,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 28,
+          "N": 320,
+          "K": 10240,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 31,
+          "N": 10240,
+          "K": 320,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 38,
+          "N": 320,
+          "K": 10240,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 45,
+          "N": 10240,
+          "K": 320,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 66,
+          "N": 320,
+          "K": 10240,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 72,
+          "N": 320,
+          "K": 10240,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 83,
+          "N": 10240,
+          "K": 320,
+          "mask": 4,
+          "hits": 2
+        },
+        {
+          "ordinal": 99,
+          "N": 10240,
+          "K": 320,
+          "mask": 4,
+          "hits": 2
+        }
+      ]
+    }
+  ],
+  "output_ids": [
+    248046
+  ],
+  "routes": [
+    [
+      324,
+      99
+    ],
+    [
+      252,
+      104
+    ]
+  ],
+  "keys": [
+    {
+      "ordinal": 0,
+      "N": 320,
+      "K": 10240,
+      "mask": 4,
+      "hits": 2
+    },
+    {
+      "ordinal": 6,
+      "N": 320,
+      "K": 10240,
+      "mask": 4,
+      "hits": 2
+    },
+    {
+      "ordinal": 14,
+      "N": 320,
+      "K": 10240,
+      "mask": 4,
+      "hits": 2
+    },
+    {
+      "ordinal": 28,
+      "N": 320,
+      "K": 10240,
+      "mask": 4,
+      "hits": 2
+    },
+    {
+      "ordinal": 31,
+      "N": 10240,
+      "K": 320,
+      "mask": 4,
+      "hits": 2
+    },
+    {
+      "ordinal": 38,
+      "N": 320,
+      "K": 10240,
+      "mask": 4,
+      "hits": 2
+    },
+    {
+      "ordinal": 45,
+      "N": 10240,
+      "K": 320,
+      "mask": 4,
+      "hits": 2
+    },
+    {
+      "ordinal": 66,
+      "N": 320,
+      "K": 10240,
+      "mask": 4,
+      "hits": 2
+    },
+    {
+      "ordinal": 72,
+      "N": 320,
+      "K": 10240,
+      "mask": 4,
+      "hits": 2
+    },
+    {
+      "ordinal": 83,
+      "N": 10240,
+      "K": 320,
+      "mask": 4,
+      "hits": 2
+    },
+    {
+      "ordinal": 99,
+      "N": 10240,
+      "K": 320,
+      "mask": 4,
+      "hits": 2
+    }
+  ]
+}

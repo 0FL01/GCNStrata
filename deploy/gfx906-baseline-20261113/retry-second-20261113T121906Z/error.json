@@ -1,0 +1,6 @@
+{
+  "error": "Sensor or hardware fault",
+  "faults": [
+    "RuntimeError: New GPU hardware or RAS fault"
+  ]
+}

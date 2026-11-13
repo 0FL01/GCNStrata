@@ -1,0 +1,7 @@
+{
+  "tag": "vision-smoke",
+  "passed": false,
+  "error_type": "RuntimeError",
+  "error": "Native engine exited before DONE",
+  "output_count": 0
+}

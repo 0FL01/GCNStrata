@@ -1,0 +1,2 @@
+strata topk probe: device=0 kernel=guarded256/reg66 nq=4 capacity_blocks=65537 active_blocks=-1 cap=2080
+strata topk mid probe: candidate=1 middle_blocks=33792 device_max_guard=1 arms=ref256/reg33/reg66

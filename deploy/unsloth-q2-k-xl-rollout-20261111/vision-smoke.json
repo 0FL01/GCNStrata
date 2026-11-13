@@ -1,0 +1,37 @@
+{
+  "id": "chatcmpl-63b3d5580b6c44ab9307463f",
+  "object": "chat.completion",
+  "created": 1794380300,
+  "model": "Qwen3.8-Flash-Next-Unsloth-UD-Q2_K_XL-Q8-PLE",
+  "choices": [
+    {
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "A red square is centered on a blue background."
+      },
+      "finish_reason": "stop"
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 76,
+    "completion_tokens": 11,
+    "total_tokens": 87,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 76,
+    "prompt_ms": 2798.7,
+    "prompt_per_token_ms": 36.825,
+    "prompt_per_second": 27.2,
+    "predicted_n": 11,
+    "predicted_ms": 204.4,
+    "predicted_per_token_ms": 18.582,
+    "predicted_per_second": 53.8,
+    "draft_n": 5,
+    "draft_n_accepted": 5
+  }
+}

@@ -1,0 +1,5 @@
+PARITY_PASS production=reference=captured; padding/end_canaries=PASS
+META captured_device=0 replay_device=0 layer=23 stage=[0,27) pos0=65536 nq=4 capacity_blocks=51202 cap=2051 batch=64 samples=7 device=AMD Radeon Pro VII
+SAMPLES_MS_PER_CALL 0.189897463 0.189689979 0.189854935 0.189892441 0.189859942 0.189842433 0.189902440
+RESULT median_ms_per_call=0.189859942 min=0.189689979 max=0.189902440 input_bytes_unchanged=PASS graph_ids=PASS
+SCOPE warm-cache isolated existing selector including guarded no-op launch; no scorer, no whole-model timing, one captured layer

@@ -1,0 +1,9 @@
+{
+  "scope": "CPU-only exact verifier source recovery; no execution performed",
+  "parent_package": "c183-baseline-provenance-build-v3-20261009",
+  "export_archive_sha256": "501a4a2f46200c909fbb0e843a63e04c81c3a49f849825960bbe5cb555426370",
+  "baseline_source": "/home/opencode/ai/qsa-200k-capture-v2-20261009/verify.base.cpp",
+  "baseline_headers": "/home/opencode/ai/strata-primary-commit-overlap/include/strata/",
+  "tests": "14 passed; no Docker or compiler execution",
+  "initial_test_failure": "Two UID-sensitive unit tests initially failed because controller UID is not MI50 UID1000. Corrected tests to mock identity; production UID1000 gate unchanged."
+}

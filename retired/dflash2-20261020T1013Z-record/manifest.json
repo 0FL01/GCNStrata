@@ -1,0 +1,39 @@
+{
+  "status": "quarantined_recoverable",
+  "observed_utc": "2026-10-20T10:17:48Z",
+  "original": "/home/radneon/strata/rnd-next-20261017/dflash2",
+  "retired": "/home/radneon/strata/retired/dflash2-20261020T1013Z",
+  "allocated_bytes": 6239670272,
+  "regular_files": 11875,
+  "directories_including_root": 1466,
+  "same_filesystem_device": 2050,
+  "destination_absent": true,
+  "active_process_commandline_matches": 0,
+  "preservation": "Entire tree including draft models, source, configurations, KEEP snapshots, raw results and diagnostics. No deletion. No symlink left at original path.",
+  "stable_dependency_confirmation": "Stable agent verified decode-fusion/comboaux64/2-comboaux/command.json has no DFlash path dependencies; binary decode-fusion/build/strata and shared runtime/data/models/shefowl-qwen38-hybrid/combined-gfx906/R mounts remain intact.",
+  "protected": [
+    "decode-fusion",
+    "q5-head-publication",
+    "KEEP-baseline-652pp-61tg-20261018",
+    "KEEP-best-gfx906-tg-11p48-20261018",
+    "hc-j48-prefill-normal-v1-build",
+    "stable MTP source and working models",
+    "/home/radneon/strata/upstream-refresh-20261016/llama-dependency"
+  ],
+  "containers": {
+    "name_prefix": "strata-span-8512a9167b4b-",
+    "count": 309,
+    "state": "all exited",
+    "writable_bytes": 9072640,
+    "action": "preserve untouched",
+    "shared_image": "sha256:bccb7ee7e7a78274519db9a43ba63c34ddd2e74bb60f8764a8f50aaee1f2c646",
+    "all_container_diff_verified": "283 containers have only added /llama,/out,/q2,/work,/work/build,/work/source mountpoint directories; 26 additionally have /work/build/ggml and /work/build/ggml/src. No other writable-layer changes in all 309."
+  },
+  "disk_bytes_freed": 0,
+  "restore_script": "restore.sh",
+  "inventory": "inventory.txt",
+  "visible_proc_cwd_exe_root_fd_matches": 0,
+  "completed_utc": "2026-10-20T10:20:38.553368+00:00",
+  "baseline_pointer": "/home/radneon/strata/rnd-next-20261017/current-mtp-baseline",
+  "baseline_target": "/home/radneon/strata/rnd-next-20261017/KEEP-stable-mtp-657pp-62tg-20261020"
+}

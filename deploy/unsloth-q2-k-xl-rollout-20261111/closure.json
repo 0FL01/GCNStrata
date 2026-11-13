@@ -1,0 +1,31 @@
+{
+  "passed": true,
+  "health": {
+    "status": "ok",
+    "max_context": 262144,
+    "model": "Qwen3.8-Flash-Next-Unsloth-UD-Q2_K_XL-Q8-PLE",
+    "images": true,
+    "api_key": true,
+    "loaded": true,
+    "service": "strata"
+  },
+  "status": {
+    "busy": false,
+    "queued": 0
+  },
+  "gpu_busy_percent": [
+    0,
+    0
+  ],
+  "container_id": "2d43d18b75c572eeb3fb69f9f173f0b36dd564722c756c78b0b517e9b4c40f31",
+  "qualified_binary_sha256": "67877d40ee363a4f33e7d9cd35da73e1d7c6ac284f5c9ee26870315552a52234",
+  "compose_only_requested_changes": true,
+  "baseline_config_unchanged": true,
+  "deleted_only_approved_paths_and_verified_engram_duplicates": true,
+  "benchmark_containers_remaining": false,
+  "startup_fatal_errors": [],
+  "free_bytes": {
+    "/home/radneon/models": 122201374720,
+    "/home/radneon/models-nvme": 60162605056
+  }
+}

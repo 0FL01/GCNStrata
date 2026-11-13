@@ -1,0 +1,34 @@
+{
+  "passed": false,
+  "performance_ratio": {
+    "pp_tok_s": 0.9966214503855504,
+    "tg_tok_s": 1.0045629909517428
+  },
+  "output_and_mtp_match": true,
+  "junction_temperature": {
+    "0000:05:00.0": {
+      "baseline_mean_mC": [
+        45907.40740740741,
+        46500
+      ],
+      "candidate_mean_mC": [
+        45972.477064220184,
+        47046.2962962963
+      ],
+      "baseline_spread_mC": 592.5925925925912,
+      "improved_beyond_spread": false
+    },
+    "0000:08:00.0": {
+      "baseline_mean_mC": [
+        43750,
+        44509.25925925926
+      ],
+      "candidate_mean_mC": [
+        44577.98165137615,
+        45222.22222222222
+      ],
+      "baseline_spread_mC": 759.2592592592628,
+      "improved_beyond_spread": false
+    }
+  }
+}

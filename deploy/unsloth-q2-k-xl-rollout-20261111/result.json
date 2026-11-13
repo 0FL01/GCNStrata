@@ -1,0 +1,21 @@
+{
+  "passed": true,
+  "health": {
+    "status": "ok",
+    "max_context": 262144,
+    "model": "Qwen3.8-Flash-Next-Unsloth-UD-Q2_K_XL-Q8-PLE",
+    "images": true,
+    "api_key": true,
+    "loaded": true,
+    "service": "strata"
+  },
+  "container_id": "2d43d18b75c572eeb3fb69f9f173f0b36dd564722c756c78b0b517e9b4c40f31",
+  "image": "sha256:bccb7ee7e7a78274519db9a43ba63c34ddd2e74bb60f8764a8f50aaee1f2c646",
+  "config": "/home/radneon/strata/configs/unsloth-q2-k-xl-20261111.json",
+  "config_sha256": "55960348257ace6ad9b574482430f90e6968313fe22f7f343599d017b0bdb39e",
+  "baseline_config_unchanged": true,
+  "model_independent_config_unchanged": true,
+  "text": "FIFO (First In, First Out) — это принцип, согласно которому первым обрабатывается или выходит тот элемент, который был добавлен в очередь раньше всех. Этот метод имитирует естественный порядок обслуживания, например, как в очереди в магазине, где первым обслуживается тот, кто пришел первым.",
+  "vision": "A red square is centered on a blue background.",
+  "rollback_compose": "/home/radneon/strata/deploy/unsloth-q2-k-xl-rollout-20261111/compose.before.yaml"
+}

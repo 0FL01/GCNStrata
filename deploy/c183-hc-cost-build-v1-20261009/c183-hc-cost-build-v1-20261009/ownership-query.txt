@@ -1,0 +1,1 @@
+{"host_uid": 1000, "host_gid": 1000, "output_uid": 1000, "output_gid": 1000, "output_mode": "0o700", "image_user": null}

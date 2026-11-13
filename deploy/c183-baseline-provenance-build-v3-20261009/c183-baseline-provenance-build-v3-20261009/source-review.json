@@ -1,0 +1,30 @@
+{
+  "status": "PASS_V3_EXACT_ARGV_ISOLATED_BUILD_SCRIPT_REVIEW",
+  "created_utc": "2026-10-09T22:28:11.047741+00:00",
+  "package": "/home/opencode/ai/c183-baseline-provenance-build-v3-20261009",
+  "reviewed_hashes": {
+    "build_inside.py": "e77d8efb80013c7bb607064902f7f4ef3374cb398ed68b6235120c76a3826ab9",
+    "run_reproduce.py": "4da5d744c7fc484846ce7f4440307e6dde298f72fb6f36acd94806a7c5c75005",
+    "test_reproduce.py": "4c6c6fd7b1126a3dffea4b7b4e30c383f5a53db6c1a0d2f32279958eb0cd70d5",
+    "exported-build-metadata.txt": "9c85cc9536647f81b632311fb8354e74dd2ab399ce9e5c300dced3641876e167",
+    "README.md": "c4c2ab4caa013628fa179834b5dc85992aa03faf1b511ecdd8d0ee9ffae2360c"
+  },
+  "independent_cpu_tests_passed": 12,
+  "test_stderr_sha256": "f129017338a5f7e0127715d9795555614d52990f45f66fa6e9bd862d6f848a91",
+  "checks": [
+    "Original gemm and prefill compile recipes are expanded verbatim, including original relative -o/-MF/-MT spellings; original link argv and /src/build-906 cwd retained.",
+    "Fresh minimal closure is copied into output/scratch-build, with exclusive file creation, streaming copy, per-file SHA verification, link-count1 and different inode/device identity checks. Source symlinks and escapes rejected. No original file is hardlinked into writable storage.",
+    "Read-only original source mounted at /src and /original; only copied scratch build nested at /src/build-906 is writable. Output remains fresh, outside source/package,0700 and host UID:GID.",
+    "Exact original archive-member pins, both original object hashes, and final c183 binary hash remain mandatory. First mismatch stops without continuing to next compile/relink or weakening equality.",
+    "Original link inputs and copied link inputs independently hashed before/after. Host verifies original copy closure after container cleanup. Source/header/object/flags/recipe pins remain unchanged.",
+    "Pinned local image, no GPU/network, read-only root, no capabilities or privilege relaxation; original timeouts and failure receipts preserved. Closure limited to4GiB and120-second checked copy loop.",
+    "All12 CPU tests independently rerun, including original-output spelling and fresh-copy isolation tests."
+  ],
+  "limitations": [
+    "Review and host tests only; no actual build/container/MI50 execution by reviewer.",
+    "v2 exact-byte mismatch remains failed. Changed HIP CUID/table localization is diagnostic evidence, not a replacement gate.",
+    "The copy deadline is checked between chunks; it is not a hard preemption guarantee for a blocked filesystem read.",
+    "Successful v3 reproduction would establish baseline provenance only; observer build/device parity and model-run admission remain separate."
+  ],
+  "blockers": []
+}

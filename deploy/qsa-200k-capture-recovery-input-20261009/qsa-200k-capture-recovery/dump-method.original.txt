@@ -1,0 +1,77 @@
+// Diagnostic only: called after run() has drained its window and copy streams.
+// No graph nodes, profiler changes, or device allocations; the arena spans are distinct.
+bool Verifier::dump_qsa_selection_once(int T, int64_t pos0, std::string& err) {
+    const char* prefix = std::getenv("STRATA_QSA_SELECT_DUMP");
+    if (!prefix || !prefix[0] || qsa_selection_dumped_ || T < 2 || pos0 < 65536) return true;
+    if (split_ || last_batch_ || groups_[T] != 1) {
+        err = "QSA selection dump requires a serial, unsplit single-session verify window";
+        return false;
+    }
+    using namespace strata::kernels;
+    static_assert(sizeof(float) == 4 && sizeof(int32_t) == 4 && sizeof(int64_t) == 8, "dump format widths");
+    const uint32_t endian = 0x01020304u;
+    if (*reinterpret_cast<const unsigned char*>(&endian) != 4) {
+        err = "QSA selection dump requires a little-endian host";
+        return false;
+    }
+    int64_t layer = le_ - 1;
+    while (layer >= lb_ && !is_qsa_layer(*g_, layer)) --layer;
+    if (layer < lb_ || T > max_t_ || max_blocks_ <= 0 || cap_ <= 0) {
+        err = "QSA selection dump: invalid stage or dimensions";
+        return false;
+    }
+    const QsaShapes s = shapes_of(*g_);
+    std::vector<int32_t> steps((size_t) T * kStepCount);
+    if (cudaMemcpy(steps.data(), step_, steps.size() * sizeof(int32_t), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        err = "QSA selection dump: step download failed";
+        return false;
+    }
+    for (int t = 0; t < T; ++t) {
+        const int32_t* st = steps.data() + (size_t) t * kStepCount;
+        if (st[kStepPos] != pos0 + t || st[kStepNKv] != pos0 + t + 1 ||
+            st[kStepNBid] != st[kStepNKv] / s.idx_block || st[kStepNBid] < 0 ||
+            (int64_t) st[kStepNBid] + 1 > max_blocks_ ||
+            st[kStepWidth] != qsa_selection_width(st[kStepNKv], s) ||
+            st[kStepWidth] <= 0 || st[kStepWidth] > cap_) {
+            err = "QSA selection dump: inconsistent device steps";
+            return false;
+        }
+    }
+    const std::string path = std::string(prefix) + ".dev" + std::to_string(device_) + ".layers" +
+                             std::to_string(lb_) + "-" + std::to_string(le_) + ".bin";
+    std::FILE* f = std::fopen(path.c_str(), "wbx");  // refuse to overwrite an earlier receipt
+    if (!f) { err = "QSA selection dump: cannot create " + path; return false; }
+    const char magic[8] = {'Q', 'S', 'D', 'U', 'M', 'P', '0', '1'};
+    // All integers little-endian int64; source strides are bytes, not packed file strides.
+    const int64_t hdr[] = {1, 0x01020304, device_, lb_, le_, layer, pos0, T, max_t_, max_blocks_, cap_,
+                           kStepCount, s.idx_block, s.idx_top_k, s.idx_dim, s.idx_n_head,
+                           max_blocks_ * 4, cap_ * 4, kStepCount * 4};
+    auto write = [&](const void* p, size_t bytes) { return std::fwrite(p, 1, bytes, f) == bytes; };
+    bool ok = write(magic, sizeof magic) && write(hdr, sizeof hdr) &&
+              write(steps.data(), steps.size() * sizeof(int32_t));
+    std::vector<float> scores;
+    std::vector<int32_t> ids;
+    for (int t = 0; ok && t < T; ++t) {
+        const int32_t* st = steps.data() + (size_t) t * kStepCount;
+        const int64_t row[] = {(int64_t) st[kStepNBid] + 1, st[kStepWidth]};
+        scores.resize((size_t) row[0]);
+        ids.resize((size_t) row[1]);
+        ok = cudaMemcpy(scores.data(), scores_ + (size_t) t * max_blocks_, scores.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost) == cudaSuccess &&
+             cudaMemcpy(ids.data(), sel_ + (size_t) t * cap_, ids.size() * sizeof(int32_t),
+                        cudaMemcpyDeviceToHost) == cudaSuccess;
+        if (ok) ok = write(row, sizeof row) && write(scores.data(), scores.size() * sizeof(float)) &&
+                     write(ids.data(), ids.size() * sizeof(int32_t));
+    }
+    if (std::fclose(f) != 0) ok = false;
+    if (!ok) {
+        std::remove(path.c_str());  // only this newly-created, incomplete file
+        err = "QSA selection dump: download/write failed: " + path;
+        return false;
+    }
+    qsa_selection_dumped_ = true;  // per verifier: stage 1 still records its own layer
+    std::fprintf(stderr, "strata QSA selection dump: %s layer=%lld pos=%lld T=%d (no timing claim)\n",
+                 path.c_str(), (long long) layer, (long long) pos0, T);
+    return true;
+}
+

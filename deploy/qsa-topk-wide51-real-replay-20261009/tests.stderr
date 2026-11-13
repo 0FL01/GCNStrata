@@ -1,0 +1,25 @@
+test_abba_failure_never_retries (test_real200k_runner.Tests.test_abba_failure_never_retries) ... ok
+test_binding_rejects_symlink_and_changed_bytes (test_real200k_runner.Tests.test_binding_rejects_symlink_and_changed_bytes) ... ok
+test_bounded_run_even_when_candidate_is_slower (test_real200k_runner.Tests.test_bounded_run_even_when_candidate_is_slower) ... ok
+test_cleanup_failure_invalidates_completion (test_real200k_runner.Tests.test_cleanup_failure_invalidates_completion) ... ok
+test_commands_exact_flags_no_profile_and_own_device (test_real200k_runner.Tests.test_commands_exact_flags_no_profile_and_own_device) ... ok
+test_complete_gate_and_capture_provenance_fail_closed (test_real200k_runner.Tests.test_complete_gate_and_capture_provenance_fail_closed) ... ok
+test_cpu_exact_id_gate_rejects_valid_but_wrong_ids (test_real200k_runner.Tests.test_cpu_exact_id_gate_rejects_valid_but_wrong_ids) ... ok
+test_default_is_noop_and_single_global_lock (test_real200k_runner.Tests.test_default_is_noop_and_single_global_lock) ... ok
+test_exact_header_parser_rows_two_through_six (test_real200k_runner.Tests.test_exact_header_parser_rows_two_through_six) ... ok
+test_exact_schedule_and_no_flag_sweep (test_real200k_runner.Tests.test_exact_schedule_and_no_flag_sweep) ... ok
+test_failure_stops_before_any_abba (test_real200k_runner.Tests.test_failure_stops_before_any_abba) ... ok
+test_missing_graph_parity_stops_immediately (test_real200k_runner.Tests.test_missing_graph_parity_stops_immediately) ... ok
+test_parser_strict_missing_duplicate_corrupt_lines (test_real200k_runner.Tests.test_parser_strict_missing_duplicate_corrupt_lines) ... ok
+test_preflight_fails_before_docker_gpu_or_launch (test_real200k_runner.Tests.test_preflight_fails_before_docker_gpu_or_launch) ... ok
+test_actual_rows_and_window (test_validate_200k.ValidateTests.test_actual_rows_and_window) ... ok
+test_fake_200k_header_rejects_old_steps (test_validate_200k.ValidateTests.test_fake_200k_header_rejects_old_steps) ... ok
+test_id_exactness_not_just_shape (test_validate_200k.ValidateTests.test_id_exactness_not_just_shape) ... ok
+test_paired_metadata_and_duplicate_rejection (test_validate_200k.ValidateTests.test_paired_metadata_and_duplicate_rejection) ... ok
+test_reject_malformed_header_and_payload (test_validate_200k.ValidateTests.test_reject_malformed_header_and_payload) ... ok
+test_reject_old64k_and_limits (test_validate_200k.ValidateTests.test_reject_old64k_and_limits) ... ok
+
+----------------------------------------------------------------------
+Ran 20 tests in 2.563s
+
+OK

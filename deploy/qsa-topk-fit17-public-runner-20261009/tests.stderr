@@ -1,0 +1,9 @@
+test_actual_capture_and_trace_modes (__main__.Tests.test_actual_capture_and_trace_modes) ... ok
+test_both_gpu_loop_has_no_discovery_gate_break (__main__.Tests.test_both_gpu_loop_has_no_discovery_gate_break) ... ok
+test_mocked_full_flow_keeps_gpu1_below30pct (__main__.Tests.test_mocked_full_flow_keeps_gpu1_below30pct) ... ok
+test_transition_examples (__main__.Tests.test_transition_examples) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.067s
+
+OK

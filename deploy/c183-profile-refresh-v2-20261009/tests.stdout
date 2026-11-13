@@ -1,0 +1,8 @@
+{"completed": true, "all_output_ids_equal": true, "performance_gain_claim": false}
+{"event": "start", "tag": "success"}
+{"event": "start", "tag": "err"}
+{"event": "start", "tag": "eof"}
+{"event": "start", "tag": "malformed"}
+{"event": "start", "tag": "timeout"}
+{"event": "start", "tag": "cancel"}
+{"event": "start", "tag": "cleanup"}

@@ -1,0 +1,46 @@
+{
+  "passed": true,
+  "same_container": true,
+  "healthy": true,
+  "model": "Qwen3.8-Flash-Next-Unsloth-UD-Q2_K_XL-Q8-PLE",
+  "context": 262144,
+  "images": true,
+  "auth": true,
+  "status": {
+    "busy": false,
+    "queued": 0,
+    "loaded": true,
+    "in_flight": 0
+  },
+  "engine_placement": {
+    "pid": 9795,
+    "binary_sha256": "67877d40ee363a4f33e7d9cd35da73e1d7c6ac284f5c9ee26870315552a52234",
+    "env": {
+      "HIP_VISIBLE_DEVICES": "0,1"
+    },
+    "mapped_render_devices": [
+      "renderD128",
+      "renderD129"
+    ]
+  },
+  "inactive_vram_before": {
+    "0000:0b:00.0": 19173376,
+    "0000:0e:00.0": 10878976
+  },
+  "inactive_vram_after": {
+    "0000:0b:00.0": 19300352,
+    "0000:0e:00.0": 11005952
+  },
+  "restart_policy": {
+    "Name": "unless-stopped",
+    "MaximumRetryCount": 0
+  },
+  "normal_fan_policy": true,
+  "target_sha256": [
+    "face662c087e324da09bac5353775f6df1228b0a5527ab774d9691ad4799ed67",
+    "face662c087e324da09bac5353775f6df1228b0a5527ab774d9691ad4799ed67",
+    "d992d0f944198306701402f9243fe69e8efcbb0ca79f9eb9060ac5855ddd2a10",
+    "8c3d8af0362d2c41251478cd7948aef8d32a0ea812424b6f3dad3851063a888e"
+  ],
+  "boot_id": "665d3e8a-04c1-4d55-9c71-f93e7daf6d81"
+}

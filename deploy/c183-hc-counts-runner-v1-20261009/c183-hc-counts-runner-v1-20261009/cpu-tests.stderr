@@ -1,0 +1,13 @@
+test_build_review_and_binary_gate_mutations (test_runner.AdmissionTests.test_build_review_and_binary_gate_mutations) ... ok
+test_changed_receipt_fails (test_runner.Tests.test_changed_receipt_fails) ... ok
+test_complete_mock_destructor_after_quit (test_runner.Tests.test_complete_mock_destructor_after_quit) ... ok
+test_input_pins (test_runner.Tests.test_input_pins) ... ok
+test_strict_parser_rejects_coverage_and_counter_errors (test_runner.Tests.test_strict_parser_rejects_coverage_and_counter_errors) ... ok
+test_watchdog_and_lock_static (test_runner.Tests.test_watchdog_and_lock_static) ... ok
+test_completed_native_protocol_keeps_full_evidence (test_failure_evidence.Tests.test_completed_native_protocol_keeps_full_evidence) ... ok
+test_pre_done_failure_evidence (test_failure_evidence.Tests.test_pre_done_failure_evidence) ... ok
+
+----------------------------------------------------------------------
+Ran 8 tests in 0.202s
+
+OK

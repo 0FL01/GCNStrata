@@ -1,0 +1,14 @@
+test_all_21_parser_configurations (__main__.RunnerTests.test_all_21_parser_configurations) ... ok
+test_commands_unset_traces_and_preserve_exact_controls (__main__.RunnerTests.test_commands_unset_traces_and_preserve_exact_controls) ... ok
+test_explicit_receipt_and_binary_hashes (__main__.RunnerTests.test_explicit_receipt_and_binary_hashes) ... ok
+test_failed_process_stops_sequence_and_keeps_exit_cleanup (__main__.RunnerTests.test_failed_process_stops_sequence_and_keeps_exit_cleanup) ... ok
+test_matrix_cannot_expand_or_break_capacity_fallback (__main__.RunnerTests.test_matrix_cannot_expand_or_break_capacity_fallback) ... ok
+test_mocked_exact_42_sequential_processes (__main__.RunnerTests.test_mocked_exact_42_sequential_processes) ... ok
+test_no_execute_and_one_shared_lock (__main__.RunnerTests.test_no_execute_and_one_shared_lock) ... ok
+test_parser_rejects_corruption_and_old_trace (__main__.RunnerTests.test_parser_rejects_corruption_and_old_trace) ... ok
+test_preflight_failure_never_reaches_gpu (__main__.RunnerTests.test_preflight_failure_never_reaches_gpu) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.058s
+
+OK

@@ -1,0 +1,91 @@
+{
+  "status": "PREPARED_NOT_COMPILED_OR_GPU_TESTED",
+  "phase": "prefill_only",
+  "candidate_kernels": [
+    "hc_exact_scale4096",
+    "hc_exact_scale512"
+  ],
+  "baseline_resources": {
+    "vgpr": 7,
+    "sgpr": 20,
+    "vgpr_spills": 0,
+    "sgpr_spills": 0,
+    "lds_bytes": 0,
+    "scratch_bytes": 0,
+    "wavefront": 64
+  },
+  "resource_admission": {
+    "no_spills_or_scratch_or_lds": true,
+    "vgpr_max": 7,
+    "sgpr_max": 20,
+    "no_generic_division_sequence": true,
+    "retain_three_wave_aggregated_guard_atomics": true,
+    "baseline_output_conversion_and_guards_require_GPU_bit_parity": true
+  },
+  "whole_request_PP_1pct_throughput_budget_ms": 1003.739603960396,
+  "primary_maximum_descriptors": [
+    {
+      "name": "W_both_halves",
+      "scale": 4096,
+      "n": 3276800,
+      "maximum_calls": 1728
+    },
+    {
+      "name": "X_down_4096",
+      "scale": 512,
+      "n": 41943040,
+      "maximum_calls": 810
+    },
+    {
+      "name": "X_down_4095",
+      "scale": 512,
+      "n": 41932800,
+      "maximum_calls": 54
+    },
+    {
+      "name": "X_up_4096",
+      "scale": 512,
+      "n": 1310720,
+      "maximum_calls": 810
+    },
+    {
+      "name": "X_up_4095",
+      "scale": 512,
+      "n": 1310400,
+      "maximum_calls": 54
+    }
+  ],
+  "maximum_converted_elements": 43032988800,
+  "unremoved_maximum_read_write_bytes": 172131955200,
+  "per_maximum_attempt_savings_needed_ms": 0.5808678263659699,
+  "actual_converter_launch_counts_observed": false,
+  "actual_attempts": 1728,
+  "actual_taken": 531,
+  "cost_screen_interpretation": "Source-derived maxima times isolated per-shape measured delta are an optimistic screening estimate, not a whole-model bound or measured current launch count. Warm/cold regimes and synthetic predicate distributions cannot establish application timing.",
+  "cost_screen_rule": "With fixed repetitions and all failures retained, park if even the most generous predeclared scenario gives weighted positive paired saving below the budget. Reaching the budget permits only investigation of actual counts and short model correctness/timing, never a speedup claim.",
+  "not_run": [
+    "HIP compilation",
+    "candidate ISA/resource inspection",
+    "GPU output/guard comparison",
+    "component timing",
+    "model build",
+    "model run"
+  ],
+  "first_GPU_gate_after_separate_approval": {
+    "kind": "fail-fast n=1 output-half-and-all-16-guard-word parity against actual baseline ELF",
+    "scales": [
+      4096,
+      512
+    ],
+    "BF16_input_hex": [
+      "0000",
+      "8000",
+      "3f80",
+      "0001",
+      "7f80",
+      "7fc1",
+      "7f81"
+    ],
+    "stop_on_first_mismatch": true
+  }
+}

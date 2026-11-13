@@ -1,0 +1,83 @@
+[
+  {
+    "busy": false,
+    "queued": 0,
+    "in_flight": 0,
+    "gpus": [
+      {
+        "device": "/sys/devices/pci0000:00/0000:00:02.0/0000:03:00.0/0000:04:00.0/0000:05:00.0",
+        "busy_percent": 0,
+        "vram_used_bytes": 16489938944
+      },
+      {
+        "device": "/sys/devices/pci0000:00/0000:00:02.2/0000:06:00.0/0000:07:00.0/0000:08:00.0",
+        "busy_percent": 0,
+        "vram_used_bytes": 16201334784
+      },
+      {
+        "device": "/sys/devices/pci0000:00/0000:00:03.0/0000:09:00.0/0000:0a:00.0/0000:0b:00.0",
+        "busy_percent": 0,
+        "vram_used_bytes": 19292160
+      },
+      {
+        "device": "/sys/devices/pci0000:00/0000:00:03.2/0000:0c:00.0/0000:0d:00.0/0000:0e:00.0",
+        "busy_percent": 0,
+        "vram_used_bytes": 10997760
+      }
+    ]
+  },
+  {
+    "busy": false,
+    "queued": 0,
+    "in_flight": 0,
+    "gpus": [
+      {
+        "device": "/sys/devices/pci0000:00/0000:00:02.0/0000:03:00.0/0000:04:00.0/0000:05:00.0",
+        "busy_percent": 0,
+        "vram_used_bytes": 16489938944
+      },
+      {
+        "device": "/sys/devices/pci0000:00/0000:00:02.2/0000:06:00.0/0000:07:00.0/0000:08:00.0",
+        "busy_percent": 0,
+        "vram_used_bytes": 16201334784
+      },
+      {
+        "device": "/sys/devices/pci0000:00/0000:00:03.0/0000:09:00.0/0000:0a:00.0/0000:0b:00.0",
+        "busy_percent": 0,
+        "vram_used_bytes": 19292160
+      },
+      {
+        "device": "/sys/devices/pci0000:00/0000:00:03.2/0000:0c:00.0/0000:0d:00.0/0000:0e:00.0",
+        "busy_percent": 0,
+        "vram_used_bytes": 10997760
+      }
+    ]
+  },
+  {
+    "busy": false,
+    "queued": 0,
+    "in_flight": 0,
+    "gpus": [
+      {
+        "device": "/sys/devices/pci0000:00/0000:00:02.0/0000:03:00.0/0000:04:00.0/0000:05:00.0",
+        "busy_percent": 0,
+        "vram_used_bytes": 16489938944
+      },
+      {
+        "device": "/sys/devices/pci0000:00/0000:00:02.2/0000:06:00.0/0000:07:00.0/0000:08:00.0",
+        "busy_percent": 0,
+        "vram_used_bytes": 16201334784
+      },
+      {
+        "device": "/sys/devices/pci0000:00/0000:00:03.0/0000:09:00.0/0000:0a:00.0/0000:0b:00.0",
+        "busy_percent": 0,
+        "vram_used_bytes": 19292160
+      },
+      {
+        "device": "/sys/devices/pci0000:00/0000:00:03.2/0000:0c:00.0/0000:0d:00.0/0000:0e:00.0",
+        "busy_percent": 0,
+        "vram_used_bytes": 10997760
+      }
+    ]
+  }
+]

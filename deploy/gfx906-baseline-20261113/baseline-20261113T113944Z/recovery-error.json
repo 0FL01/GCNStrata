@@ -1,0 +1,5 @@
+{
+  "type": "RuntimeError",
+  "error": "Candidate unqualified; production remains stopped",
+  "faults": []
+}

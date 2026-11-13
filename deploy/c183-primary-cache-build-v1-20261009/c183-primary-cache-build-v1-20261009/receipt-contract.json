@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "success_status": "PASS_PRIMARY_CACHE_BUILD_DEVICE_AND_TLS_EQUALITY",
+  "host": {
+    "path": "host-receipt.json",
+    "required": {
+      "passed": true,
+      "returncode": 0,
+      "cleanup.passed": true
+    },
+    "inner_receipt_sha256": "must equal actual SHA256 reproduction/receipt.json"
+  },
+  "inner": {
+    "path": "reproduction/receipt.json",
+    "required": {
+      "passed": true,
+      "tls_sharing.passed": true,
+      "source_review.sha256": "f46c48f0fb41a819d1fbe9d2c02783a185f8d16878c57363a5e928ca018ff4e6"
+    },
+    "binary_sha256_field": "observer_binary_sha256",
+    "source_pins_field": "observer_sources",
+    "object_pins_field": "observer_objects",
+    "tls_objects_count": 2,
+    "tls_symbol": "_ZN6strata7prefill11hc_negative7currentE"
+  },
+  "device": {
+    "path": "reproduction/device-equality.json",
+    "required": {
+      "passed": true,
+      "complete_device_payload_bytes_equal": true,
+      "complete_module_kernel_metadata_equal": true
+    },
+    "baseline.modules_count": 55,
+    "observer.modules_count": 55
+  },
+  "runtime_admission": false,
+  "same_binary_qualification_and_timing": true
+}

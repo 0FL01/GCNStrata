@@ -1,0 +1,21 @@
+{
+  "boot_id": "b7ae795a-28b7-4205-933a-9a5cc1f99eb3",
+  "production_id": "2d43d18b75c572eeb3fb69f9f173f0b36dd564722c756c78b0b517e9b4c40f31",
+  "restart_policy": {
+    "Name": "unless-stopped",
+    "MaximumRetryCount": 0
+  },
+  "uids": [
+    "c30e5961732c7312",
+    "16a64881732c7310",
+    "16a66121732c7310",
+    "168a70c1732c7310"
+  ],
+  "target_sha256": [
+    "face662c087e324da09bac5353775f6df1228b0a5527ab774d9691ad4799ed67",
+    "face662c087e324da09bac5353775f6df1228b0a5527ab774d9691ad4799ed67",
+    "d992d0f944198306701402f9243fe69e8efcbb0ca79f9eb9060ac5855ddd2a10",
+    "8c3d8af0362d2c41251478cd7948aef8d32a0ea812424b6f3dad3851063a888e"
+  ],
+  "source_identity": "/home/radneon/strata/deploy/gfx906-baseline-20261113/all-925-20261113T120714Z/identity.json"
+}

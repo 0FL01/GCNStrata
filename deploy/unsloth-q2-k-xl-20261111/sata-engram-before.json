@@ -1,0 +1,12 @@
+{
+  "/home/radneon/models/qwen38-flash-next-ud-q2_0/Qwen3.8-Flash-Next-UD-Q2_0-00003-of-00003.gguf": {
+    "sha256": "05716382c280d999b81afff92b2d527fadbfd926ac225ffdc273f2d1d13331c6",
+    "size": 28800138432,
+    "mtime_ns": 1794340141430600078
+  },
+  "/home/radneon/models/shefowl-qwen38-hybrid/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-Q2_0-00002-of-00002.gguf.iq4_nl.saved": {
+    "sha256": "316b46f3a2dbd68c900f43136ab9449f9dcc3725dfd8c794847c204bc161e113",
+    "size": 28800138432,
+    "mtime_ns": 1791278540200432170
+  }
+}

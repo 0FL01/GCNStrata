@@ -1,0 +1,110 @@
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index 3465d4ce..c0009391 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -3997,7 +3997,7 @@ __global__ void __launch_bounds__(256) native_gu_lds_kernel(const unsigned long
+ 
+ // ---- 7 (down): the group's q8_1 h rows in LDS, the tokens inside the k loop, the R2 row pairs of mode 2 -
+ // the same per-(row, entry) sums in the same order: bitwise the mode-2 output.
+-template<int TD>
++template<int TD, bool IQ4_REUSE = false>
+ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                               const int32_t* __restrict__ grp_start,
+                                                               const int32_t* __restrict__ n_groups,
+@@ -4035,6 +4035,19 @@ __global__ void __launch_bounds__(256) native_down_lds_kernel(const unsigned lon
+                 for (int j = 0; j < NTC; ++j) { s0[j] = 0.0f; s1[j] = 0.0f; }
+                 for (int k = lane; k < nb * F::ipb; k += 32) {
+                     const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
++                    if constexpr (IQ4_REUSE && TD == 20) {
++                        if constexpr (NTC > 1) {
++                            const Split<20>::W q0 = Split<20>::load(w0, kbx, iqs);
++                            const Split<20>::W q1 = Split<20>::load(w1, kbx, iqs);
++#pragma unroll
++                            for (int j = 0; j < NTC; ++j) {
++                                const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
++                                s0[j] += Split<20>::apply(q0, xk, iqs);
++                                s1[j] += Split<20>::apply(q1, xk, iqs);
++                            }
++                            continue;
++                        }
++                    }
+ #pragma unroll
+                     for (int j = 0; j < NTC; ++j) {
+                         const block_q8_1* xk = sh + (size_t) j * hb + kbx * (F::qk / 32);
+@@ -4500,18 +4513,20 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+ #if STRATA_EXP_LAYOUTS
+ #if defined(STRATA_HIP_GFX906)
+     const int requested_mode = exp_mode();
++    const bool iq4_reuse = requested_mode == 17;   // opt-in: mode16 dispatch, IQ4_NL down reuse only
++    const int mode16 = iq4_reuse ? 16 : requested_mode;
+ #if defined(__HIPCC__)
+     // Mode16 uses mode7 for other IQ formats and unsupported shapes.
+     // Query the current device before accepting either env or bench overrides.
+     const char* q2_env = std::getenv("STRATA_EXP_MODE");
+-    const bool exact_q2_request = g_exp_mode == 16 ||
+-        (g_exp_mode < 0 && q2_env && std::strcmp(q2_env, "16") == 0);
+-    const int q2_mode = requested_mode == 16 && exact_q2_request &&
+-                        q2_modes_current_device_is_gfx906() ? requested_mode : 0;
++    const bool exact_q2_request = g_exp_mode == 16 || g_exp_mode == 17 ||
++        (g_exp_mode < 0 && q2_env && (std::strcmp(q2_env, "16") == 0 || std::strcmp(q2_env, "17") == 0));
++    const int q2_mode = mode16 == 16 && exact_q2_request &&
++                        q2_modes_current_device_is_gfx906() ? mode16 : 0;
+ #else
+     const int q2_mode = 0;
+ #endif
+-    const int em0 = q2_mode ? 7 : requested_mode;
++    const int em0 = q2_mode ? 7 : mode16;
+ #else
+     // CUDA: the AMD layouts launch a block row per possible group, so a call that strides (a verify window's PCIe
+     // call, grid_groups 1..cap) keeps the CUDA layout: V100, 0 groups 11.3 vs 6.5 us, 1 group of 2 29.6 vs 21.3
+@@ -4633,8 +4648,13 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+     if ((em0d == 7 || em0d == 8) && (L.d_type == 20 || L.d_type == 42)) {
+         const dim3 gl((unsigned) ((L.n_embd + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
+         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_ff / 32) * sizeof(block_q8_1);
+-        if (L.d_type == 20) native_down_lds_kernel<20><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+-        else native_down_lds_kernel<42><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
++        if (L.d_type == 20) {
++#if defined(STRATA_HIP_GFX906)
++            if (iq4_reuse) native_down_lds_kernel<20, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
++            else
++#endif
++            native_down_lds_kernel<20><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
++        } else native_down_lds_kernel<42><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+         check("native_expert_grouped/down");
+         return;
+     }
+diff --git a/src/kernels/native_expert_bench.cpp b/src/kernels/native_expert_bench.cpp
+index 4ee2be1c..527fa1c1 100644
+--- a/src/kernels/native_expert_bench.cpp
++++ b/src/kernels/native_expert_bench.cpp
+@@ -148,13 +148,15 @@ int main(int argc, char** argv) {
+         if (inspect_intermediates) cudaMemcpyAsync(got_q.data(), (uint8_t*) dscr + 3 * fa, nq, cudaMemcpyDeviceToHost, s);
+         cudaMemcpyAsync(got.data(), dout, got.size() * 4, cudaMemcpyDeviceToHost, s);
+         if (cudaStreamSynchronize(s) != cudaSuccess) { std::printf("layer %d: CUDA error\n", l); return 1; }
+-        size_t ndiff = 0;
++        size_t ndiff = 0, nnonfinite = 0;
+         double worst = 0;
+-        for (size_t i = 0; i < ref.size(); ++i)
++        for (size_t i = 0; i < ref.size(); ++i) {
++            if (!std::isfinite(ref[i]) || !std::isfinite(got[i])) ++nnonfinite;
+             if (std::memcmp(&ref[i], &got[i], 4) != 0) {
+                 ++ndiff;
+                 worst = std::fmax(worst, std::fabs((double) ref[i] - got[i]) / (std::fabs((double) ref[i]) + 1e-6));
+             }
++        }
+         size_t ngudiff = 0, nqdiff = 0; double gu_max = 0;
+         for (size_t i = 0; i < ref_gu.size(); ++i) if (std::memcmp(&ref_gu[i], &got_gu[i], 4)) {
+             ++ngudiff; gu_max = std::fmax(gu_max, std::fabs((double) ref_gu[i] - got_gu[i]));
+@@ -183,7 +185,11 @@ int main(int argc, char** argv) {
+                     l, ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), G, T,
+                     mref, us[0][0], us[0][1], gu_b / us[0][1] / 1e3, us[0][2], d_b / us[0][2] / 1e3,
+                     mode, us[1][0], us[1][1], gu_b / us[1][1] / 1e3, us[1][2], d_b / us[1][2] / 1e3,
+-                    ndiff ? "DIFFERS" : "bitwise equal");
++                    nnonfinite ? "NONFINITE" : ndiff ? "DIFFERS" : "bitwise equal");
++        if (nnonfinite) {
++            std::printf("          %zu of %zu outputs nonfinite (ref or got)\n", nnonfinite, ref.size());
++            ++failures;
++        }
+         if (ndiff) {
+             std::printf("          %zu of %zu outputs differ, worst rel %.2e\n", ndiff, ref.size(), worst);
+             ++failures;

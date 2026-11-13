@@ -1,0 +1,12 @@
+{
+  "scope": "CPU-only counts observer build preparation",
+  "parent_package": "reviewed c183 baseline provenance v4",
+  "observer_package_sha256": "a4490090e3ac141fc13a6a1bfa0c54b6500707cad9a6640e9398eaeb0bf94998",
+  "observer_source_review_sha256": "ec1f7cdf9a6c7163ad8574edeb5a8350f4b3502b051967d68e65c1eb213a7ef9",
+  "v4_receipt_pins": [
+    "5696899be076d084e8b1896efffed5ad1981c484b79913a5486fc729f864ad87",
+    "1b483e54874fdc44b8497209068daff93eb46b798e4a1d96038f7c728b4fda27"
+  ],
+  "device_gate": "complete raw .hip_fatbin and wrapper bytes plus exhaustive bundle/module/section/symbol inventory and relocation binding",
+  "tests": "16 CPU tests, no Docker/compiler/model run"
+}

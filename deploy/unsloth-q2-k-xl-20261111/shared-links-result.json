@@ -1,0 +1,19 @@
+{
+  "passed": true,
+  "health": {
+    "status": "ok",
+    "max_context": 262144,
+    "model": "Qwen3.8-Flash-Next-Unsloth-UD-Q2_0-Q8-PLE",
+    "images": true,
+    "api_key": true,
+    "loaded": true,
+    "service": "strata"
+  },
+  "links": {
+    "/home/radneon/models/qwen38-flash-next-ud-q2_0/Qwen3.8-Flash-Next-UD-Q2_0-00003-of-00003.gguf": "/home/radneon/models-nvme/shared-engram/qwen38-engram-iq4_nl-3of3.gguf",
+    "/home/radneon/models/shefowl-qwen38-hybrid/Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-Q2_0-00002-of-00002.gguf.iq4_nl.saved": "/home/radneon/models-nvme/shared-engram/qwen38-engram-iq4_nl-2of2.gguf"
+  },
+  "container_id": "4576f5b1fbb1ec67e5685a6fcc1f31e1eeaa317acdf287bca699ba9edb7127f2",
+  "physical_payload_copies_created": false,
+  "model_config_changed": false
+}

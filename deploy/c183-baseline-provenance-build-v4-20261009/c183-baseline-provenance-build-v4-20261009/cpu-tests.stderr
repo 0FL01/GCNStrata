@@ -1,0 +1,19 @@
+test_actual_export_flags_and_link (test_reproduce.Tests.test_actual_export_flags_and_link) ... ok
+test_container_isolation_and_no_observer (test_reproduce.Tests.test_container_isolation_and_no_observer) ... ok
+test_earliest_inner_mkdir_failure (test_reproduce.Tests.test_earliest_inner_mkdir_failure) ... ok
+test_exact_commands_output_only_changes (test_reproduce.Tests.test_exact_commands_output_only_changes) ... ok
+test_exact_original_output_spellings (test_reproduce.Tests.test_exact_original_output_spellings) ... ok
+test_hash_gates_and_order_are_fixed (test_reproduce.Tests.test_hash_gates_and_order_are_fixed) ... ok
+test_minimal_fresh_copy_closure (test_reproduce.Tests.test_minimal_fresh_copy_closure) ... ok
+test_nonzero_step_preserves_evidence (test_reproduce.Tests.test_nonzero_step_preserves_evidence) ... ok
+test_output_uid_contract (test_reproduce.Tests.test_output_uid_contract) ... ok
+test_replacement_rejects_any_other_member_change (test_reproduce.Tests.test_replacement_rejects_any_other_member_change) ... ok
+test_source_mismatch_keeps_host_receipt (test_reproduce.Tests.test_source_mismatch_keeps_host_receipt) ... ok
+test_timeout_kills_owned_process_group (test_reproduce.Tests.test_timeout_kills_owned_process_group) ... ok
+test_unwritable_fallback_still_emits_json (test_reproduce.Tests.test_unwritable_fallback_still_emits_json) ... ok
+test_verifier_recipe_pins_and_overlay (test_reproduce.Tests.test_verifier_recipe_pins_and_overlay) ... ok
+
+----------------------------------------------------------------------
+Ran 14 tests in 0.134s
+
+OK

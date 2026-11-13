@@ -1,0 +1,26 @@
+test_actual_export_flags_and_link (test_reproduce.Tests.test_actual_export_flags_and_link) ... ok
+test_archive_replacement_rejects_other_member (test_reproduce.Tests.test_archive_replacement_rejects_other_member) ... ok
+test_container_isolation_and_no_observer (test_reproduce.Tests.test_container_isolation_and_no_observer) ... ok
+test_earliest_inner_mkdir_failure (test_reproduce.Tests.test_earliest_inner_mkdir_failure) ... ok
+test_exact_commands_output_only_changes (test_reproduce.Tests.test_exact_commands_output_only_changes) ... ok
+test_exact_original_output_spellings (test_reproduce.Tests.test_exact_original_output_spellings) ... ok
+test_header_overlay_copy_and_change_rejection (test_reproduce.Tests.test_header_overlay_copy_and_change_rejection) ... ok
+test_minimal_fresh_copy_closure (test_reproduce.Tests.test_minimal_fresh_copy_closure) ... ok
+test_nonzero_step_preserves_evidence (test_reproduce.Tests.test_nonzero_step_preserves_evidence) ... ok
+test_observer_pins_and_mounts (test_reproduce.Tests.test_observer_pins_and_mounts) ... ok
+test_output_uid_contract (test_reproduce.Tests.test_output_uid_contract) ... ok
+test_real_device_payload_self_check_and_mutation_rejection (test_reproduce.Tests.test_real_device_payload_self_check_and_mutation_rejection) ... ok
+test_source_mismatch_keeps_host_receipt (test_reproduce.Tests.test_source_mismatch_keeps_host_receipt) ... ok
+test_timeout_kills_owned_process_group (test_reproduce.Tests.test_timeout_kills_owned_process_group) ... ok
+test_unwritable_fallback_still_emits_json (test_reproduce.Tests.test_unwritable_fallback_still_emits_json) ... ok
+test_v4_receipts_and_every_closure_hash_required (test_reproduce.Tests.test_v4_receipts_and_every_closure_hash_required) ... ok
+test_defined_coalescible_tls (test_tls_verify.Tests.test_defined_coalescible_tls) ... ok
+test_dynsym_not_double_counted (test_tls_verify.Tests.test_dynsym_not_double_counted) ... ok
+test_noncoalesced_or_missing_rejected (test_tls_verify.Tests.test_noncoalesced_or_missing_rejected) ... ok
+test_objects_need_comdat_and_tls_reference (test_tls_verify.Tests.test_objects_need_comdat_and_tls_reference) ... ok
+test_real_two_tu_coalescence_and_thread_isolation (test_tls_cross_tu.TestCrossTU.test_real_two_tu_coalescence_and_thread_isolation) ... ok
+
+----------------------------------------------------------------------
+Ran 21 tests in 1.329s
+
+OK

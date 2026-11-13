@@ -1,0 +1,15 @@
+{
+  "passed": true,
+  "gpu_executed": false,
+  "candidate_sha256": "7036ef4eb84a145bbeeab46d0a735548cd719a656c5dcf6ec2a3ab0e3e089964",
+  "dispatch_cases": 294,
+  "guard_cases": 152,
+  "negative_template_cases": [
+    "16,true,3",
+    "17,false,3",
+    "66,false,4",
+    "17,true,4",
+    "66,true,3",
+    "66,true,5"
+  ]
+}

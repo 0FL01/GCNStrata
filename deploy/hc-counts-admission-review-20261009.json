@@ -1,0 +1,30 @@
+{
+  "status": "PASS_EXACT_COUNTS_ONLY_SINGLE_PROBE_ADMISSION",
+  "passed": true,
+  "source_and_cpu_review_passed": true,
+  "build_provenance_and_device_gate_passed": true,
+  "created_utc": "2026-10-09T23:04:32.100119+00:00",
+  "bindings": {
+    "binary_sha256": "bbc06a73a3aa64bfb80b1f43bde918bbc0c7903a4ff00a7ecd43b9809aadbe21",
+    "build_receipt_sha256": "2b788ee15b8b7b7817eb5902b5fbc3519587186fce37458fbab1776e6be3cc22",
+    "inner_receipt_sha256": "c4aaa27e22b5b2242e215a8ad4a04f2a2bb023e281a2eb0102239e2bb64b5342",
+    "device_gate_sha256": "770821a3eb9927d8d94175145a9fb7a05759f21e4410b768cbbd4f4f5935198a",
+    "runner_sha256": "8a4a4d029b63417199760e9822265bef7451b8bb7681e18544f5321bf1b437b9",
+    "input_pins_sha256": "87100bb263ec7c0023c68494cb19c4c2b3fc6552f6bef8470864bd0d0cc9c952"
+  },
+  "source_review_sha256": "3ce9408bfea6f5a3a4e94050bd9e9af6195de6b686ad39dab32dceb68e8bdd9c",
+  "actual_build_review_sha256": "461300e13885515de7ec73b5bd05a40d0acbefd010b9f9c90e6e1672997f403a",
+  "scope": "One fresh counts-only process, frozen12288-token prefix, one generated token then QUIT; no automatic retry, performance claim, configuration change, API start or power change.",
+  "evidence": [
+    "Eight independent CPU/mock tests pass.",
+    "Actual observer binary hash verified; all55 GPU module payloads and complete module/kernel metadata, raw wrappers and relocation mapping independently compare equal to frozen c183; recomputed gate exactly equals saved device receipt.",
+    "Actual observer starting link inputs match successful exact-c183 v4 closure; only gemm and prefill members change; remaining prefill member and repaired verifier archive unchanged.",
+    "Actual host/inner exit0 and cleanup PASS; all67 exported artifact hash entries verify.",
+    "Runtime must validate exact review bindings and actual geometry/counters; any failure stops without retry."
+  ],
+  "limitations": [
+    "GPU/model runtime has not occurred; this admits only the bounded diagnostic probe, not performance or production promotion.",
+    "Unavailable files omitted from the narrow receipt export are covered by reviewed runner receipts; binary and exported prefill archive were independently verified.",
+    "Visible lifecycle consistency does not prove content immutability."
+  ]
+}

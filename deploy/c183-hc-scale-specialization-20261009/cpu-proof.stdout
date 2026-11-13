@@ -1,0 +1,47 @@
+{
+  "scope": "CPU model and finite-value mathematical proof; no GPU execution",
+  "cpu_non_nan_equivalence_passed": true,
+  "all_gpu_bit_equivalence_established": false,
+  "candidate_source_retains_division_expression": true,
+  "finite_proof": "For any finite half h, h/2^k with k=9 or12 is exactly representable in FP32; nonzero magnitude ranges from2^-36 to127.9375. Multiplication by the exact inverse and division therefore have the same correctly rounded finite result. Signed zeros retain sign in this arithmetic model.",
+  "limitations": [
+    "Host half/NaN conversion behavior is not evidence of AMD GPU NaN payload behavior.",
+    "Constant folding may alter forward conversion ISA, including signed-zero behavior. Every GPU output half bit and all guard words must match actual c183.",
+    "NaN inputs are enumerated and explicitly deferred to GPU comparison, not silently treated as CPU-proven.",
+    "No model correctness, runtime speed, or whole-model gain is established."
+  ],
+  "scales": [
+    {
+      "shift": 12,
+      "scale": 4096,
+      "inverse_exact_hex": "0x1.0000000000000p-12",
+      "counts": {
+        "bf16_patterns_enumerated": 65536,
+        "non_nan_output_and_guard_equivalent": 65282,
+        "nan_input_patterns_gpu_required": 254,
+        "half_patterns_enumerated": 65536,
+        "finite_half_inverse_bits_equal": 63488,
+        "infinite_half_inverse_bits_equal": 2,
+        "nan_half_patterns_gpu_required": 2046,
+        "negative_zero_forward_model_checks": 1
+      },
+      "non_nan_cpu_records_sha256": "4cbf1f3fb9a4606f417ba0a2a6e4adb10acb73a9aa20bad57d09ecc750a108ae"
+    },
+    {
+      "shift": 9,
+      "scale": 512,
+      "inverse_exact_hex": "0x1.0000000000000p-9",
+      "counts": {
+        "bf16_patterns_enumerated": 65536,
+        "non_nan_output_and_guard_equivalent": 65282,
+        "nan_input_patterns_gpu_required": 254,
+        "half_patterns_enumerated": 65536,
+        "finite_half_inverse_bits_equal": 63488,
+        "infinite_half_inverse_bits_equal": 2,
+        "nan_half_patterns_gpu_required": 2046,
+        "negative_zero_forward_model_checks": 1
+      },
+      "non_nan_cpu_records_sha256": "34e8ebbc09734e4d984886e59bfabe8cc28e3edd004e1838a5c79c6b38764f7f"
+    }
+  ]
+}

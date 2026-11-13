@@ -1,0 +1,12 @@
+test_bad_samples_and_json (test_screen.Tests.test_bad_samples_and_json) ... ok
+test_budget_and_gate (test_screen.Tests.test_budget_and_gate) ... ok
+test_compiled_core_and_real_parser (test_screen.Tests.test_compiled_core_and_real_parser) ... ok
+test_failure_preservation (test_screen.Tests.test_failure_preservation) ... ok
+test_no_cross_scenario_mixing (test_screen.Tests.test_no_cross_scenario_mixing) ... ok
+test_pins (test_screen.Tests.test_pins) ... ok
+test_raw_event_agreement (test_screen.Tests.test_raw_event_agreement) ... ok
+
+----------------------------------------------------------------------
+Ran 7 tests in 1.702s
+
+OK

@@ -1,0 +1,38 @@
+--- /home/opencode/ai/c183-profile-refresh-v2-20261009/native_arm.py	2026-10-09 21:54:29.470144780 +0200
++++ /home/opencode/ai/c183-hc-counts-runner-v1-20261009/native_arm.py	2026-10-10 00:55:08.291003900 +0200
+@@ -42,7 +42,7 @@
+                     q.put(None)
+             t=threading.Thread(target=reader,daemon=True);t.start();last=0
+             while done is None:
+-                now=time.monotonic();need(now-started<1800,'native arm timeout');need(not (out/'cancel').exists(),'cancellation marker')
++                now=time.monotonic();need(now-started<300,'native arm timeout');need(not (out/'cancel').exists(),'cancellation marker')
+                 if now-last>=5:samples.append({'elapsed_s':now-started,'gpus':gpu(ds)});last=now
+                 try:line=q.get(timeout=5)
+                 except queue.Empty:continue
+@@ -62,7 +62,16 @@
+                     m['private_native_forensics']=capture_native_done(private,tag,line,tokens)
+                     write(out/(tag+'.manifest.json'),m)
+                     need(request_start is not None,'DONE before READY');done=line.split();m['request_wall_s']=time.monotonic()-request_start
+-            p.stdin.write('QUIT\n');p.stdin.flush();p.stdin.close();code=p.wait(timeout=120);t.join(timeout=5);need(code==0,'native exit')
++            p.stdin.write('QUIT\n');p.stdin.flush();p.stdin.close()
++            shutdown_started=time.monotonic()
++            while p.poll() is None:
++                need(time.monotonic()-shutdown_started<60,'native shutdown timeout')
++                need(not (out/'cancel').exists(),'cancellation marker')
++                samples.append({'elapsed_s':time.monotonic()-started,'phase':'shutdown','gpus':gpu(ds)})
++                try:p.wait(timeout=2)
++                except subprocess.TimeoutExpired:pass
++            code=p.returncode;t.join(timeout=5);need(code==0,'native exit')
++            need(not t.is_alive() and reader_error is None,'stdout capture incomplete before admission')
+             err.flush();stderr=os.pread(err.fileno(),os.fstat(err.fileno()).st_size,0).decode(errors='replace');topology=fit17_topology(stderr);m['fit17_host_topology']=topology;need('strata attn-reduce12: selected=1 ' not in stderr,'unexpected performance trace')
+             suffix=suffix_totals(stderr);m['suffix_drafts']=suffix
+             if r['flags'].get('STRATA_GFX906_ATTN_QUERY_SWIZZLE_TRACE')=='1':need('attn-query-swizzle: active=1 ' in stderr,'candidate QSA route absent')
+@@ -71,7 +80,7 @@
+         need(all(0<=x<248320 for x in tokens),'output ID domain')
+         pm,dm=map(float,done[3:5]);need(math.isfinite(pm) and math.isfinite(dm) and pm>0 and dm>0,'durations')
+         extended=native_counter_fields(done)
+-        result={'tag':tag,'passed':True,'prompt_tokens':n,'actual_outputs':new,'prompt_ms':pm,'decode_ms':dm,'PP':n*1000/pm,'TG':new*1000/dm,'accepted':int(done[6]),'offered':int(done[7]),'cache_hits':int(done[9]),'lookups':int(done[10]),'prompt_reused':int(done[8]),'prompt_read':int(done[14]),'output_ids':tokens,**extended,'engine_info':info,'suffix_drafts':suffix,'fit17_host_topology':topology,'timing_scope':'unpaired diagnostic timing only; no performance comparison','request_wall_s':m['request_wall_s'],'load_wall_s':m['load_wall_s']}
++        result={'tag':tag,'passed':True,'prompt_tokens':n,'actual_outputs':new,'prompt_ms':pm,'decode_ms':dm,'accepted':int(done[6]),'offered':int(done[7]),'cache_hits':int(done[9]),'lookups':int(done[10]),'prompt_reused':int(done[8]),'prompt_read':int(done[14]),'output_ids':tokens,**extended,'engine_info':info,'suffix_drafts':suffix,'fit17_host_topology':topology,'timing_scope':'counts only; durations retained as raw diagnostics, no throughput or performance claim','request_wall_s':m['request_wall_s'],'load_wall_s':m['load_wall_s']}
+         write(out/(tag+'.result.json'),result);completed=True;return result
+     finally:
+         failure=sys.exc_info()[1]

@@ -1,0 +1,31 @@
+{
+  "passed": true,
+  "gpu_executed": false,
+  "timing_claim": false,
+  "source_only": true,
+  "cpu_compiler": "c++ (Debian 14.2.0-19) 14.2.0",
+  "source": {
+    "qsa_select.fit17.cu": "5fc5d78c6155fa0987dee751a875ab714516c88209b0938db17699061cc7de1a",
+    "qsa_select.radix-stop.cu": "587c02f9a76916605be595bbf8cdf4ce72ac04edbade4c80686772e72903064c",
+    "qsa_select.radix-stop.cu.patch": "694531ccfcfe3da6017540af121bb774bdf0d0896b0112a6e4dcd67a0491d38b"
+  },
+  "extracted_cpp_sha256": "100aef42da26f00efaf59352e35ff3b48c742bbfd1298139c458dfff5f11aa5e",
+  "extracted_sections": [
+    "actual order_key",
+    "actual weighted digit/stop decision",
+    "actual per-thread gt/eq count + full-key writer",
+    "actual output emission"
+  ],
+  "modeled_sections": [
+    "histogram aggregation",
+    "barrier happens-before",
+    "block_excl_scan as integer prefix sums"
+  ],
+  "raw_float_key_cases": 100014,
+  "adversarial_source_snippet_cases": 3136,
+  "capture_replay_in_this_run": false,
+  "prior_capture_evidence": "provenance/cpu-source-proof.json; frozen controller source evidence only, not rerun here",
+  "limitations": [
+    "GPU compiler, execution, barrier behavior, graph parity, and performance are not tested by this CPU suite."
+  ]
+}

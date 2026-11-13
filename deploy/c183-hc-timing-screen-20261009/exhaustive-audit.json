@@ -1,0 +1,61 @@
+{
+  "status": "PASS_EXHAUSTIVE_RAW_GPU_PARITY_AUDIT",
+  "created_utc": "2026-10-09T21:11:41.905209+00:00",
+  "archive_sha256": "929e9bbf426d0dc987f02c2c6039ad2e74383783c9161c964a9cdbd3080cafae",
+  "safe_extraction": "Hash checked before extraction; only regular files/directories, approved topdirs, no absolute/traversal/link members. Fresh directory.",
+  "manifests": {
+    "hc-scale-exhaustive-results": {
+      "files_verified": 2200,
+      "manifest_sha256": "89534483197cafe3281b539c2872aec3418692a7a9de60a10bcd50bedb58f588"
+    },
+    "hc-scale-exhaustive-build": {
+      "files_verified": 6,
+      "manifest_sha256": "507fbbcf1d426bf2ea7737450aa04ba5177ba36e5f10c4aa0664a077d1a15e57"
+    }
+  },
+  "summary_sha256": "18136ad023ebea7b2c8e3e020300152e1e61607c6548bd9e8d49b8e1428f5303",
+  "driver_sha256": "7d808f3ecb9ac682aaff8a7c6c21b47c5f3b17f4f521ce7f5924cdeb87c51144",
+  "rechecker_sha256": "e1c1517a23675b845f611496c6cd857ba7543583d890b45ece7dd7ef0ec8a94e",
+  "rechecker_receipt_sha256": "1bcbb96f6725ab0480e469bef27dedfd1ded8faa2f1350cf81347b7e3fd7b7ee",
+  "rechecker_rerun_matches_original": true,
+  "own_audit": {
+    "all_patterns_exactly_once_per_scale": true,
+    "scalar_pairs": 131072,
+    "mixed_pairs": 36,
+    "total_pairs": 131108,
+    "total_launches": 262216,
+    "batches": 548,
+    "zero_hip_return_codes": 266070,
+    "raw_event_counts": {
+      "hip_rc": 266070,
+      "batch_begin": 548,
+      "batch_complete": 548,
+      "complete": 1
+    },
+    "all_16_stats_words_and_half_outputs_equal": true,
+    "canaries_intact": true,
+    "inactive_stats_zero": true,
+    "n0_no_write": true,
+    "all_four_stages_consistent": true,
+    "native_wrapper_exit": 0,
+    "cleanup_passed": true
+  },
+  "scalar_flag_histograms": {
+    "4096": {
+      "(0, 0, 0)": 8703,
+      "(0, 0, 1)": 24833,
+      "(0, 1, 1)": 31744,
+      "(1, 1, 0)": 130,
+      "(1, 1, 1)": 126
+    },
+    "512": {
+      "(0, 0, 0)": 8703,
+      "(0, 0, 1)": 25601,
+      "(0, 1, 1)": 30976,
+      "(1, 1, 0)": 130,
+      "(1, 1, 1)": 126
+    }
+  },
+  "no_gpu_rerun": true,
+  "limits": "Scalar all-encoding and prescribed mixed-tail/offset equivalence to exact baseline at scales4096/512 only. No full model integration or speed claim."
+}

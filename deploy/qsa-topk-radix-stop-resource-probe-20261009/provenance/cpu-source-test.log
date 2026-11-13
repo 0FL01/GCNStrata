@@ -1,0 +1,8 @@
+{
+  "passed": true,
+  "raw_float_key_cases": 100014,
+  "source_cases": 3136,
+  "captures": 4,
+  "real_rows": 16,
+  "output": "/home/opencode/ai/qsa-topk-radix-stop-audit-20261009/cpu-source-proof.json"
+}

@@ -1,0 +1,198 @@
+[
+  {
+    "archive": "hc-counts-one-shot-receipts-20261009.tar.gz",
+    "passed": true,
+    "primary_weights": 108,
+    "peer_weights": 84,
+    "output_ids": [
+      248046
+    ],
+    "routes": [
+      [
+        324,
+        99
+      ],
+      [
+        252,
+        104
+      ]
+    ],
+    "negative_keys": [
+      {
+        "ordinal": 0,
+        "N": 320,
+        "K": 10240,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 6,
+        "N": 320,
+        "K": 10240,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 14,
+        "N": 320,
+        "K": 10240,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 28,
+        "N": 320,
+        "K": 10240,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 31,
+        "N": 10240,
+        "K": 320,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 38,
+        "N": 320,
+        "K": 10240,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 45,
+        "N": 10240,
+        "K": 320,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 66,
+        "N": 320,
+        "K": 10240,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 72,
+        "N": 320,
+        "K": 10240,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 83,
+        "N": 10240,
+        "K": 320,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 99,
+        "N": 10240,
+        "K": 320,
+        "mask": 4,
+        "hits": 2
+      }
+    ]
+  },
+  {
+    "archive": "hc-cost-one-shot-receipts-20261009.tar.gz",
+    "passed": true,
+    "primary_weights": 108,
+    "peer_weights": 84,
+    "output_ids": [
+      248046
+    ],
+    "routes": [
+      [
+        324,
+        99
+      ],
+      [
+        252,
+        104
+      ]
+    ],
+    "negative_keys": [
+      {
+        "ordinal": 0,
+        "N": 320,
+        "K": 10240,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 6,
+        "N": 320,
+        "K": 10240,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 14,
+        "N": 320,
+        "K": 10240,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 28,
+        "N": 320,
+        "K": 10240,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 31,
+        "N": 10240,
+        "K": 320,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 38,
+        "N": 320,
+        "K": 10240,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 45,
+        "N": 10240,
+        "K": 320,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 66,
+        "N": 320,
+        "K": 10240,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 72,
+        "N": 320,
+        "K": 10240,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 83,
+        "N": 10240,
+        "K": 320,
+        "mask": 4,
+        "hits": 2
+      },
+      {
+        "ordinal": 99,
+        "N": 10240,
+        "K": 320,
+        "mask": 4,
+        "hits": 2
+      }
+    ]
+  }
+]

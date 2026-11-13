@@ -1,0 +1,86 @@
+{
+  "passed": true,
+  "allowed_modes": [
+    1,
+    2
+  ],
+  "scope": "Bounded correctness/component runtime diagnostic only. No production promotion or model-gain claim.",
+  "source_sha256": "21efb8501aa41ce938daa497c5b3196e275e39a4fadd9138da2cb4e8cf2aded1",
+  "patch_sha256": "a119128d75a0bbadc3af8b40ee1f60a9bdfe190a0e14903bfbcac3877212a81e",
+  "qsa_topk_fit17_probe_sha256": "380aa0e19dd63a42ab75dab5f5d85550501ca504a91e69561ff4ce9728662b40",
+  "qsa_reg17_transition_sha256": "575b583ddf303791641e6688e606a731e30d2ebdd7fa7a5bab49af2f5fb4c2f3",
+  "object_sha256": "35e9386e41d7bb03c3acb80293664def41e26cae901f62f1880109e28769c65b",
+  "archive_sha256": "fea8098de61592012a4d31beb9ea1fb0bb9f58edf6464068221ad55c9d984472",
+  "resources": {
+    "old_guarded66": {
+      "sgpr": 104,
+      "vgpr": 64,
+      "scratch_bytes_per_lane": 1048,
+      "sgpr_spills": 527,
+      "vgpr_spills": 467,
+      "lds_bytes_per_block": 32908,
+      "occupancy_waves_per_simd": 4
+    },
+    "scalar17": {
+      "sgpr": 104,
+      "vgpr": 64,
+      "scratch_bytes_per_lane": 56,
+      "sgpr_spills": 44,
+      "vgpr_spills": 25,
+      "lds_bytes_per_block": 32908,
+      "occupancy_waves_per_simd": 4
+    },
+    "hist2_17": {
+      "sgpr": 104,
+      "vgpr": 64,
+      "scratch_bytes_per_lane": 304,
+      "sgpr_spills": 163,
+      "vgpr_spills": 114,
+      "lds_bytes_per_block": 32908,
+      "occupancy_waves_per_simd": 4
+    },
+    "wide66": {
+      "sgpr": 104,
+      "vgpr": 64,
+      "scratch_bytes_per_lane": 1048,
+      "sgpr_spills": 539,
+      "vgpr_spills": 468,
+      "lds_bytes_per_block": 32908,
+      "occupancy_waves_per_simd": 4
+    }
+  },
+  "resource_decision": "Both17 variants reduce scratch/spills versus replaced old66 with unchanged allocated registers/LDS/occupancy. Scalar17 is substantially lighter than hist2_17; neither is spill-free. Hist2_17 remains credible for bounded interaction screen, not a presumed improvement.",
+  "wide_caveat": "Wide66 scratch/LDS/occupancy unchanged, SGPR/VGPR spill counts +12/+1; guard and extra launch overhead remain. Separate200K component/later matched model controls required if64K passes.",
+  "actual_guards_verified": true,
+  "actual_guards": "Current last-nkv<0x6001 rejects both17 variants and wide to s_endpgm. gridDim-gated scalar n_bid loads offsets0x8 through0x78 form max. Both17 bodies accept max_bid<=0x43ff; wide accepts>=0x4400. All rejects precede key/output/barrier work. PER17 bound17408 includes emptytail.",
+  "hist2_collectives_verified": true,
+  "hist2_collectives": "Saved assembly shows physical lane&32, 64-bit ballot half extraction, logical32 source index plus ds_bpermute, safe zero leader, popcount*4 ds_add, exec restoration before second ballot, scalar remainder and separate tail.",
+  "platform_logical32_shim_verified": true,
+  "baseline_and_counted_reference_isa_equivalent": true,
+  "isa_normalization": "Complete saved function instruction lines, removing comments/directives and normalizing local basic-block function numbers; not whole-object byte identity.",
+  "unchanged_instruction_sha256": {
+    "guarded66": "3f00f2fca39f7fff341c3881de796d1cbf12dcf7297288c433bf91d7b83229df",
+    "counted33": "942ac1addadb03cc50f2c1383fde748976c01bd1086546060d161e1f034eebc4",
+    "counted66": "a2294bf2b4543d94b46be390845942da64a36ffc2f160ad62f513984cbf1a5b5",
+    "reference_normal": "dea46c9aa1ab1c382a645a3743a495c7e6ba2b2b287dca6b1fe6f4b9543a2819",
+    "reference_short": "f17f17c94bfa7b6fafd4278d9a1c63ecec7995a0dd2200999f719837352d45ef"
+  },
+  "receipts": {
+    "baseline-resources.log": "f21c53f11a121e1faefec539e43f1c8a6f81f94c35c21ac02277bda997aee94b",
+    "fit17-resources.log": "54fcc3b0e181a9798d55dcf949448e18df0af253d43d2d2863a5a98e2652a633",
+    "build.json": "43ca2ec5d44e9fc4abd689a587a1e3b2fd13519ef4dea0a20c3160b199e13493",
+    "build-sha256.txt": "e5d1ce2e0416482e7d167fdd2559193f45cc0d543156a7e5bc50cb8a824c0c28",
+    "transition-build-sha256.txt": "a2afa2ac09fae437bb1a9a0e6d3f6546ac0314933598f6b642a03455b5b278af",
+    "preprocessor-proof.json": "2e4eaa1442205c24280eb7f6b9b854c7e18a040a71e9c84affa2cefdced2f8c2",
+    "qsa_select.base-hip-amdgcn-amd-amdhsa-gfx906.s": "0f5b4b42e059ccf01d6472fc535231d64ad05a8c80940eb0efa7ab1f179cd622",
+    "qsa_select.fit17-hip-amdgcn-amd-amdhsa-gfx906.s": "0cdde0f80fe1f3444d676e3f3d73ee8396d44f5dea31f3e2799ada4c0ec03549"
+  },
+  "export_terminal_confirmed_by_root": true,
+  "wrapper_review": {
+    "passed": true,
+    "sha256": "95579778a7162c1c13ac730eca3c04d47e5dbd61d7304d1b1f0afef99b07d374",
+    "independent_cpu_tests_passed": 4,
+    "scope": "Transitions bothGPUs/allT/modes first; separateGPU0 ABBAeachmode; negative budget outcome continuesothermode; GPU1 timing onlyeligiblemodes; noAPIstart/stop/health/configwrites. Requires previouslyverified HIPordinal/BDFmapping; helper itself checksPCIset, not mapping."
+  },
+  "reviewer_gpu_or_mi50_operations": false
+}

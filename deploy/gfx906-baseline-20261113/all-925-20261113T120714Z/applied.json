@@ -1,0 +1,12 @@
+{
+  "passed": true,
+  "all_four_limit_mV": 925,
+  "target_sha256": [
+    "face662c087e324da09bac5353775f6df1228b0a5527ab774d9691ad4799ed67",
+    "face662c087e324da09bac5353775f6df1228b0a5527ab774d9691ad4799ed67",
+    "d992d0f944198306701402f9243fe69e8efcbb0ca79f9eb9060ac5855ddd2a10",
+    "d992d0f944198306701402f9243fe69e8efcbb0ca79f9eb9060ac5855ddd2a10"
+  ],
+  "other_table_bytes_unchanged": true,
+  "clocks_and_power_cap_unchanged": true
+}

@@ -1,0 +1,13 @@
+{
+  "passed": true,
+  "python_tests": 45,
+  "original_receipt_validation_passed": true,
+  "original_receipt_unmodified": true,
+  "original_v2_package_bound": true,
+  "default_runner_cli_offline": true,
+  "cpp_compiled_by_preparer": false,
+  "gpu_executed_by_preparer": false,
+  "mi50_accessed_by_preparer": false,
+  "package_sha256": "cf839efcc75d335e8c16bf047bb1480117f9e7dc8c679dee090af55df7fe59f3",
+  "test_log_sha256": "98e35ec8ead1ec885efaccb37c21c641cb23963dc4821a68e0ece58599c77d94"
+}

@@ -1,0 +1,236 @@
+{
+  "verified_utc": "2026-10-06T07:25:14.957467+00:00",
+  "passed": true,
+  "source_revision": "6f32ec070f23ced9f50e704d854d775da52591ab",
+  "llama_revision": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
+  "download": {
+    "repo": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF",
+    "revision": "5348543e0147355ac9cbcb031184a3546350988e",
+    "file": "mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+    "bytes": 907543008,
+    "url": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/resolve/5348543e0147355ac9cbcb031184a3546350988e/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+    "path": "/home/radneon/strata/runtime/vision/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+    "elapsed_s": 57.49398779706098,
+    "gguf_magic_verified": true
+  },
+  "configuration": {
+    "exe": "/src/build-vision-cpu/bin/strata-vision",
+    "mmproj": "/src/runtime/vision/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+    "model": "/models/qwen38-flash-next-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+    "gpu": false,
+    "threads": 16,
+    "max_tokens": 1024
+  },
+  "engine_vision_flag": true,
+  "build_gpu_backends_disabled": true,
+  "probe": {
+    "native_exit": 0,
+    "passed": true,
+    "elapsed_s": 14.252369562978856,
+    "stdout": "READY 2560\nOK 1024 32 32 12549\n",
+    "image_sha256": "31118a967e1a4dcbdfbc445b2d108522bdb4269a301c31ddb33c7dd44028f02c",
+    "tokens": 1024,
+    "grid": [
+      32,
+      32
+    ],
+    "embedding_dim": 2560,
+    "all_finite": true,
+    "vram_before": {
+      "/sys/devices/pci0000:00/0000:00:02.0/0000:03:00.0/0000:04:00.0/0000:05:00.0": 16599810048,
+      "/sys/devices/pci0000:00/0000:00:03.0/0000:06:00.0/0000:07:00.0/0000:08:00.0": 15912468480
+    },
+    "vram_after": {
+      "/sys/devices/pci0000:00/0000:00:02.0/0000:03:00.0/0000:04:00.0/0000:05:00.0": 16599810048,
+      "/sys/devices/pci0000:00/0000:00:03.0/0000:06:00.0/0000:07:00.0/0000:08:00.0": 15912468480
+    },
+    "vram_unchanged": true,
+    "gpu_devices_exposed_to_probe": false,
+    "argv": [
+      "docker",
+      "run",
+      "--rm",
+      "-i",
+      "--name",
+      "strata-vision-cpu-probe",
+      "--entrypoint",
+      "/src/build-vision-cpu/bin/strata-vision",
+      "-v",
+      "/home/radneon/strata:/src",
+      "-v",
+      "/home/radneon/models-nvme:/models:ro",
+      "sha256:bccb7ee7e7a78274519db9a43ba63c34ddd2e74bb60f8764a8f50aaee1f2c646",
+      "--mmproj",
+      "/src/runtime/vision/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+      "--model",
+      "/models/qwen38-flash-next-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+      "--threads",
+      "16",
+      "--max-tokens",
+      "1024"
+    ]
+  },
+  "api": {
+    "passed": true,
+    "health": {
+      "status": "ok",
+      "max_context": 131072,
+      "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M",
+      "images": true,
+      "api_key": true,
+      "loaded": true,
+      "service": "strata"
+    },
+    "image_trials": [
+      {
+        "trial": 0,
+        "elapsed_s": 17.15897246694658,
+        "response": {
+          "id": "chatcmpl-a2d815a6aead41138c476474",
+          "object": "chat.completion",
+          "created": 1791271333,
+          "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "red blue"
+              },
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 1062,
+            "completion_tokens": 3,
+            "total_tokens": 1065,
+            "prompt_tokens_details": {
+              "cached_tokens": 0
+            }
+          },
+          "timings": {
+            "cache_n": 0,
+            "prompt_n": 1062,
+            "prompt_ms": 4500.9,
+            "prompt_per_token_ms": 4.238,
+            "prompt_per_second": 236.0,
+            "predicted_n": 3,
+            "predicted_ms": 119.9,
+            "predicted_per_token_ms": 39.967,
+            "predicted_per_second": 25.0,
+            "draft_n": 3,
+            "draft_n_accepted": 3
+          }
+        }
+      },
+      {
+        "trial": 1,
+        "elapsed_s": 0.1982847540639341,
+        "response": {
+          "id": "chatcmpl-f601a5da584d4fa598afe5f5",
+          "object": "chat.completion",
+          "created": 1791271338,
+          "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "red blue"
+              },
+              "finish_reason": "stop"
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 1062,
+            "completion_tokens": 3,
+            "total_tokens": 1065,
+            "prompt_tokens_details": {
+              "cached_tokens": 1055
+            }
+          },
+          "timings": {
+            "cache_n": 1055,
+            "prompt_n": 7,
+            "prompt_ms": 81.5,
+            "prompt_per_token_ms": 11.643,
+            "prompt_per_second": 85.9,
+            "predicted_n": 3,
+            "predicted_ms": 84.8,
+            "predicted_per_token_ms": 28.267,
+            "predicted_per_second": 35.4,
+            "draft_n": 3,
+            "draft_n_accepted": 3
+          }
+        }
+      }
+    ],
+    "text_smoke": {
+      "id": "chatcmpl-8ed28beabf89406c8ebf6659",
+      "object": "chat.completion",
+      "created": 1791271338,
+      "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M",
+      "choices": [
+        {
+          "index": 0,
+          "message": {
+            "role": "assistant",
+            "content": "42"
+          },
+          "finish_reason": "stop"
+        }
+      ],
+      "usage": {
+        "prompt_tokens": 28,
+        "completion_tokens": 3,
+        "total_tokens": 31,
+        "prompt_tokens_details": {
+          "cached_tokens": 0
+        }
+      },
+      "timings": {
+        "cache_n": 0,
+        "prompt_n": 28,
+        "prompt_ms": 411.3,
+        "prompt_per_token_ms": 14.689,
+        "prompt_per_second": 68.1,
+        "predicted_n": 3,
+        "predicted_ms": 83.3,
+        "predicted_per_token_ms": 27.767,
+        "predicted_per_second": 36.0,
+        "draft_n": 3,
+        "draft_n_accepted": 3
+      }
+    },
+    "vision_processes": [
+      {
+        "pid": 7,
+        "argv": [
+          "/src/build-vision-cpu/bin/strata-vision",
+          "--mmproj",
+          "/src/runtime/vision/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+          "--model",
+          "/models/qwen38-flash-next-IQ1_M/Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf",
+          "--threads",
+          "16",
+          "--max-tokens",
+          "1024"
+        ],
+        "memory": {
+          "VmHWM": "1180960 kB",
+          "VmRSS": "1180960 kB",
+          "Threads": "1"
+        },
+        "gpu_libraries": [],
+        "gpu_device_fds": []
+      }
+    ],
+    "unauthenticated_models": 401,
+    "ui": 404,
+    "scope": "synthetic1024x1024 red-left/blue-right image twice and text reuse; CPU backend/mappings/fds checked, not broad vision accuracy"
+  },
+  "service_running": true,
+  "docker_health": "healthy",
+  "own_engine_development_still_paused": true,
+  "previous_failed_attempt": "deployment-result.json: missing native --vision flag, text service restored before corrected attempt"
+}

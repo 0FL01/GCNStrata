@@ -1,0 +1,15 @@
+{
+  "baseline_sha256": {
+    "src/prefill/gemm.cu": "6f73546e4b654a9cc81f4b333a09530c7425e13f6ce33ac16ecb88a05b07fabd",
+    "src/prefill/prefill.cpp": "1a8855dd4e1d6116f10060f2be2110014ecc2afb9e80c9164fc0689c8f175b42",
+    "include/strata/prefill/gemm.hpp": "a46c76cad934f4c4114a0f984aee2a7145c8549fc7b1efee16b09d62aab2cfaf"
+  },
+  "candidate_sha256": {
+    "include/strata/prefill/gemm.hpp": "a46c76cad934f4c4114a0f984aee2a7145c8549fc7b1efee16b09d62aab2cfaf",
+    "include/strata/prefill/hc_negative_cache.hpp": "973aa1dd196c578d52bb2107e2826f2aae271400a036abefda3c8ca3135e59a2",
+    "src/prefill/gemm.cu": "34d9eebdb4a43691bec0af73512dd1104c62be2a3586a435f007bba2dc18d774",
+    "src/prefill/prefill.cpp": "6993ea906198364e8bca514bcb8df42bfe8fe3f7531fff96522903e00197b6cb"
+  },
+  "context_tar_sha256": "bba374c2479ae51d28b832dead10165e0ba6d5d9e063b086315220f18d5a3869",
+  "patch_sha256": "652da8573cd570f996857ebcb5fc61c5c004f57c1873d9868b42662dd7a22b50"
+}

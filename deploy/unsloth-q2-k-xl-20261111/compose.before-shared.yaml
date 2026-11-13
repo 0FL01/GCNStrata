@@ -1,0 +1,52 @@
+services:
+  strata:
+    image: sha256:bccb7ee7e7a78274519db9a43ba63c34ddd2e74bb60f8764a8f50aaee1f2c646
+    container_name: strata-api
+    working_dir: /src
+    entrypoint: ["python3", "-u", "/src/serve/server.py"]
+    command: ["--engine", "strata", "--config", "/src/configs/unsloth-q2-20261110.json", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      STRATA_HTTP_AUX_CPUS: "1"
+      STRATA_API_KEY: "${LLAMA_API_KEY:?Existing LLAMA_API_KEY is required}"
+      STRATA_ARENA_MMAP: "1"
+      STRATA_STAGE_TRIM: "1"
+      STRATA_EXP_MODE: "16"
+      STRATA_Q2_AVX2_SPREAD: "1"
+      STRATA_GFX906_TOPK_REG: "2"
+      STRATA_MMVF_RPB: "4"
+      STRATA_TSUM: "0"
+      STRATA_GR_UP_EXACT: "0"
+      STRATA_MMVF_ROWS: "1"
+      STRATA_HIP_SWIGLU_FUSED: "1"
+      STRATA_GDN_HEAD: "1"
+      STRATA_GDN_PP: "2"
+      STRATA_GDN_CONVL2: "1"
+      STRATA_GDN_NOY: "1"
+      STRATA_API_ONLY: "1"
+      STRATA_DISABLE_TELEMETRY: "1"
+      HIP_VISIBLE_DEVICES: "0,1"
+      DO_NOT_TRACK: "1"
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    devices: ["/dev/kfd:/dev/kfd", "/dev/dri:/dev/dri"]
+    group_add: ["video"]
+    ipc: host
+    ulimits:
+      memlock: {soft: -1, hard: -1}
+    ports: ["0.0.0.0:8080:8080"]
+    volumes:
+      - /home/radneon/strata:/src
+      - /home/radneon/strata/releases/gfx906-bounds-main-53e6c6a5/strata:/qualified-strata:ro
+      - /home/radneon/models-nvme:/models:ro
+      - /home/radneon/models:/sata:ro
+    healthcheck:
+      test: ["CMD", "python3", "/src/deploy/healthcheck.py"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 300s
+    restart: unless-stopped
+    stop_grace_period: 120s
+    logging:
+      driver: json-file
+      options: {max-size: "20m", max-file: "5"}

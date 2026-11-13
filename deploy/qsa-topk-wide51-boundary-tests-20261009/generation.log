@@ -1,0 +1,9 @@
+{
+  "fixture_count": 15,
+  "future_process_count": 21,
+  "future_graph_replays": 606,
+  "fixture_cases": 426,
+  "fixture_rows": 2496,
+  "gpu_executed": false,
+  "timing_claim": false
+}

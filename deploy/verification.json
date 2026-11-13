@@ -1,0 +1,97 @@
+{
+  "source_revision": "6f32ec070f23ced9f50e704d854d775da52591ab",
+  "local_patches": [
+    "gfx906-template-macro-fix.patch",
+    "api-only-no-telemetry.patch"
+  ],
+  "passed": true,
+  "configured_context": 131072,
+  "largest_tested_prompt_tokens": 5053,
+  "long_smoke_response": {
+    "id": "chatcmpl-166724cd1db5493e9bb023ef",
+    "object": "chat.completion",
+    "created": 1791242792,
+    "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": "The code assigns sequential integer values from 0 to 349 to uniquely named variables, such as `value_0` through `value_349`. Each variable name corresponds exactly to its assigned integer value, creating a direct mapping between the identifier and the number. These assignments are labeled as deterministic fillers, likely serving as placeholders or padding in the script."
+        },
+        "finish_reason": "stop"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 5053,
+      "completion_tokens": 76,
+      "total_tokens": 5129,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "cache_n": 0,
+      "prompt_n": 5053,
+      "prompt_ms": 13560.3,
+      "prompt_per_token_ms": 2.684,
+      "prompt_per_second": 372.6,
+      "predicted_n": 76,
+      "predicted_ms": 1819.2,
+      "predicted_per_token_ms": 23.937,
+      "predicted_per_second": 41.8,
+      "draft_n": 69,
+      "draft_n_accepted": 41
+    }
+  },
+  "long_smoke_elapsed_s": 15.418203367036767,
+  "targeted_gpu_ctest": {
+    "passed": 5,
+    "failed": 0
+  },
+  "python_unittest": {
+    "run": 26,
+    "skipped": 5,
+    "failed": 0
+  },
+  "scope": "deployment and short/5053-token functional smoke, not independent model parity or occupied128K qualification",
+  "final_off": true,
+  "lifecycle": {
+    "events": [
+      {
+        "kind": "first_stop",
+        "utc": "2026-10-05T23:28:25.444795+00:00",
+        "container_absent": true,
+        "port_closed": true,
+        "autostart_removed": true
+      },
+      {
+        "kind": "restart_ready",
+        "utc": "2026-10-05T23:28:52.982273+00:00",
+        "health": {
+          "status": "ok",
+          "max_context": 131072,
+          "model": "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M",
+          "images": false,
+          "api_key": true,
+          "loaded": true,
+          "service": "strata"
+        },
+        "restart_policy": "unless-stopped"
+      },
+      {
+        "kind": "restart_arithmetic_and_auth_smoke",
+        "utc": "2026-10-05T23:28:53.779811+00:00",
+        "passed": true
+      },
+      {
+        "kind": "final_stop",
+        "utc": "2026-10-05T23:28:58.268129+00:00",
+        "container_absent": true,
+        "port_closed": true,
+        "autostart_removed": true
+      }
+    ],
+    "final_off": true
+  }
+}

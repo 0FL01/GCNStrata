@@ -1,0 +1,17 @@
+test_bad_results (test_abba.Tests.test_bad_results) ... ok
+test_drift_retained (test_abba.Tests.test_drift_retained) ... ok
+test_mock_schedule_and_failure (test_abba.Tests.test_mock_schedule_and_failure) ... ok
+test_order (test_abba.Tests.test_order) ... ok
+test_positive_screen (test_abba.Tests.test_positive_screen) ... ok
+test_qual_gate_mutations (test_abba.Tests.test_qual_gate_mutations) ... ok
+test_reverse_pair_required (test_abba.Tests.test_reverse_pair_required) ... ok
+test_tg_control (test_abba.Tests.test_tg_control) ... ok
+test_completed_native_protocol_keeps_full_evidence (test_failure_evidence.Tests.test_completed_native_protocol_keeps_full_evidence) ... ok
+test_pre_done_failure_evidence (test_failure_evidence.Tests.test_pre_done_failure_evidence) ... ok
+test_bound_admission_and_mutations (test_admission.Tests.test_bound_admission_and_mutations) ... ok
+test_raw_tail_rejected (test_admission.Tests.test_raw_tail_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 12 tests in 0.094s
+
+OK

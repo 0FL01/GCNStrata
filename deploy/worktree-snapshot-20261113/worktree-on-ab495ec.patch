@@ -1,0 +1,1376 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index bd576ef..80b0bd3 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -766,6 +766,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   target_include_directories(gr_parity PRIVATE ${_strata_gpu_include_directories})
+   target_link_libraries(gr_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+   add_test(NAME gr_parity COMMAND gr_parity --selftest)
++  add_executable(gr_up_exact_check src/kernels/gr_up_exact_check.cpp)
++  target_include_directories(gr_up_exact_check PRIVATE ${_strata_gpu_include_directories})
++  target_link_libraries(gr_up_exact_check PRIVATE strata_kernels ${_strata_gpu_runtime_target})
++
+ 
+   add_executable(gdn_parity src/kernels/gdn_parity.cpp)
+   target_include_directories(gdn_parity PRIVATE ${_strata_gpu_include_directories})
+@@ -874,6 +878,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   target_include_directories(qsa_topk_parity PRIVATE ${_strata_gpu_include_directories})
+   target_link_libraries(qsa_topk_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+   add_test(NAME qsa_topk_parity COMMAND qsa_topk_parity --selftest)
++  if(STRATA_HIP_GFX906)
++    add_test(NAME qsa_topk_gfx906_guarded COMMAND qsa_topk_parity 24577 6 3 204800 0)
++    set_tests_properties(qsa_topk_gfx906_guarded PROPERTIES
++      ENVIRONMENT "STRATA_GFX906_TOPK_REG=2" TIMEOUT 120)
++  endif()
+ 
+   # ---- P2.S4: the PLE n-gram hash, the IQ4_NL table read, and the PLE block ----
+   # `ngram.cpp` is host-only but lives in `strata_kernels` because `ple.cu` shares its geometry constants, and
+@@ -903,6 +912,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
+   target_include_directories(kv_stream_parity PRIVATE ${_strata_gpu_include_directories})
+   target_link_libraries(kv_stream_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+   add_test(NAME kv_stream_parity COMMAND kv_stream_parity)
++  if(TARGET strata_prefill)
++    add_executable(kv_append_dma_probe src/kernels/kv_append_dma_probe.cpp)
++    target_include_directories(kv_append_dma_probe PRIVATE ${_strata_gpu_include_directories})
++    target_link_libraries(kv_append_dma_probe PRIVATE strata_prefill strata_kernels ${_strata_gpu_runtime_target})
++  endif()
++
+ 
+   # PR #120: the hybrid K8V4 KV (INT8 K + rotated Q4_0 V) vs host references (GPU, synthetic, no model).
+   add_executable(kv_hybrid_parity src/kernels/kv_hybrid_parity.cpp)
+@@ -1185,7 +1200,16 @@ if(STRATA_NATIVE_EXPERTS)
+   # against ggml-cpu's dot, on random blocks; --bench: ms per expert on one thread, the weights streamed from DRAM
+   add_executable(iq_avx2_parity src/kernels/cpu/iq_avx2_parity.cpp)
+   target_link_libraries(iq_avx2_parity PRIVATE strata_kernels_cpu)
++  add_executable(q2_unpack_spread_check src/kernels/cpu/q2_unpack_spread_check.cpp)
++  target_link_libraries(q2_unpack_spread_check PRIVATE strata_kernels_cpu)
++
+   if(STRATA_BUILD_TESTS)
++    add_test(NAME q2_unpack_spread_check COMMAND q2_unpack_spread_check)
++    set_tests_properties(q2_unpack_spread_check PROPERTIES
++      ENVIRONMENT "STRATA_Q2_AVX2_SPREAD=0" SKIP_RETURN_CODE 77 TIMEOUT 60)
++    add_test(NAME iq_avx2_parity_q2_spread COMMAND iq_avx2_parity)
++    set_tests_properties(iq_avx2_parity_q2_spread PROPERTIES
++      ENVIRONMENT "STRATA_Q2_AVX2_SPREAD=1" SKIP_RETURN_CODE 77 TIMEOUT 60)
+     add_test(NAME iq_avx2_parity COMMAND iq_avx2_parity)
+     add_test(NAME iq_avx2_parity_iq3s_mt1 COMMAND ${CMAKE_COMMAND} -E env STRATA_IQ3S_MT1=1 $<TARGET_FILE:iq_avx2_parity>)
+   endif()
+@@ -1247,6 +1271,12 @@ if(STRATA_NATIVE_EXPERTS)
+       target_link_libraries(prefill_fused_iq_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
+       add_test(NAME prefill_fused_iq_test COMMAND prefill_fused_iq_test)
+       set_tests_properties(prefill_fused_iq_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
++      # the MoE input quantized per token and scattered to its rows (mmq::quantize_scatter) against the per-row
++      # gather: the same q8_1 bytes for every MMQ layout (--bench: both at 2K, 8K and 32K tokens)
++      add_executable(prefill_mmq_scatter_test tests/cuda/prefill_mmq_scatter_test.cpp)
++      target_link_libraries(prefill_mmq_scatter_test PRIVATE strata_mmq ggml-base ${_strata_gpu_runtime_target})
++      add_test(NAME prefill_mmq_scatter_test COMMAND prefill_mmq_scatter_test)
++      set_tests_properties(prefill_mmq_scatter_test PROPERTIES TIMEOUT 120)
+     endif()
+     if(STRATA_BUILD_TESTS AND STRATA_MMQ_KQUANTS)
+       # the UD-Q4_K_XL expert formats through MMQ against ggml's dequantized weights (synthetic, a few seconds)
+diff --git a/include/strata/kernels/cpu/expert.hpp b/include/strata/kernels/cpu/expert.hpp
+index 8510598..bbf72b0 100644
+--- a/include/strata/kernels/cpu/expert.hpp
++++ b/include/strata/kernels/cpu/expert.hpp
+@@ -188,6 +188,11 @@ void q2_0_gguf_rows_multi_avx2_legacy(const uint8_t* w, size_t row_bytes, int nb
+ /// The same rows with AVX-VNNI on or off, not as cpu_avxvnni_ok() says (tests and benches; on only where it holds).
+ void q2_0_gguf_rows_multi_avx2_v(bool vnni, const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a,
+                                  int nt, float* const* out, int r0, int r1);
++// Explicit exact-unpack candidate for parity and microbenchmarks; engine opt-in STRATA_Q2_AVX2_SPREAD=1.
++void q2_0_gguf_rows_multi_avx2_spread(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
++                                      float* const* out, int r0, int r1);
++void q2_0_gguf_rows_multi_avx2_pair(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
++                                    float* const* out, int r0, int r1);
+ void act_quant_q8_1_avx2(const float* x, int n, ActQ& a);
+ 
+ void s2_expert_scalar(const uint8_t* blob, const float* x, float* out, bool quant_acts);
+diff --git a/include/strata/platform/hip_compat/strata_hip.h b/include/strata/platform/hip_compat/strata_hip.h
+index 5af9b68..77acbbf 100644
+--- a/include/strata/platform/hip_compat/strata_hip.h
++++ b/include/strata/platform/hip_compat/strata_hip.h
+@@ -303,3 +303,7 @@ static __device__ __forceinline__ unsigned int strata_byte_perm(unsigned int x,
+ #define __byte_perm(x, y, s) strata_byte_perm((unsigned int) (x), (unsigned int) (y), (unsigned int) (s))
+ 
+ #endif  // device side
++
++// gfx906: stream-priority APIs used by the 0.1.40 MTP path.
++#define cudaDeviceGetStreamPriorityRange hipDeviceGetStreamPriorityRange
++#define cudaStreamCreateWithPriority hipStreamCreateWithPriority
+diff --git a/include/strata/prefill/moe_mmq.hpp b/include/strata/prefill/moe_mmq.hpp
+index 5c5dd71..4d2ab43 100644
+--- a/include/strata/prefill/moe_mmq.hpp
++++ b/include/strata/prefill/moe_mmq.hpp
+@@ -29,6 +29,12 @@ size_t q8_bytes(int64_t rows, int64_t cols);
+ /// ids is null); `x` has `ld` floats per row.
+ void quantize(const float* x, const int32_t* ids, void* xq, int ggml_type, int64_t cols, int64_t ld, int64_t rows,
+               void* stream);
++/// The rows quantize(x, src, ...) writes for tokens x k_used rows in expert order, written token by token: token t's
++/// row of x is quantized once and stored at rows slot[t * k_used + k] (`slot` the inverse of `src`) - the same bytes,
++/// a k_used-th of the quantizations (llama.cpp's quantize_scatter_mmq_q8_1_cuda).  STRATA_QUANT_GATHER=1: quantize()
++/// over `src`, as before.
++void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int ggml_type, int64_t cols,
++                      int64_t ld, int64_t tokens, int k_used, void* stream);
+ 
+ /// One launch over n experts whose weights lie `expert_bytes` apart from `w`: for expert e, the activation rows
+ /// [bounds[e], bounds[e+1]) of `xq` (bounds on the device, n+1 entries) times its [w_rows, w_cols] matrix into
+diff --git a/serve/frontend.py b/serve/frontend.py
+index fe104b5..ba5787a 100644
+--- a/serve/frontend.py
++++ b/serve/frontend.py
+@@ -302,6 +302,34 @@ def tool_arguments(raw) -> dict:
+     return {"arguments": json.dumps(raw, ensure_ascii=False)}
+ 
+ 
++def _order_chat_tool_results(messages: list[dict]) -> None:
++    """The template pairs results by position, so restore call order while IDs are still available.
++
++    Only a complete, unambiguous run of results is reordered. Legacy or incomplete histories keep their
++    received order. IDs are private to this conversion and never reach the template.
++    """
++    i = 0
++    while i < len(messages):
++        if messages[i]["role"] != "tool":
++            i += 1
++            continue
++        j = i + 1
++        while j < len(messages) and messages[j]["role"] == "tool":
++            j += 1
++        prev = messages[i - 1] if i else {}
++        calls = [c.get("_call_id") for c in prev.get("tool_calls") or []] if prev.get("role") == "assistant" else []
++        results = [m.get("_call_id") for m in messages[i:j]]
++        if len(calls) == len(results) and all(isinstance(cid, str) and cid for cid in calls + results):
++            if len(set(calls)) == len(calls) and len(set(results)) == len(results) and set(calls) == set(results):
++                rank = {cid: n for n, cid in enumerate(calls)}
++                messages[i:j] = sorted(messages[i:j], key=lambda m: rank[m["_call_id"]])
++        i = j
++    for message in messages:
++        message.pop("_call_id", None)
++        for call in message.get("tool_calls") or []:
++            call.pop("_call_id", None)
++
++
+ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
+     """OpenAI Chat Completions -> (template messages, template tools, template kwargs)."""
+     messages = []
+@@ -310,6 +338,8 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
+         if role == "developer":
+             role = "system"
+         out = {"role": role, "content": _parts_of(m.get("content")) if role in ("user", "tool", "assistant") else _text_of(m.get("content"))}
++        if role == "tool":
++            out["_call_id"] = m.get("tool_call_id")
+         if m.get("reasoning_content"):
+             out["reasoning_content"] = m["reasoning_content"]
+         if m.get("tool_calls"):
+@@ -318,9 +348,11 @@ def openai_to_messages(req: dict) -> tuple[list[dict], list[dict] | None, dict]:
+                 fn = c.get("function", c)
+                 if not isinstance(fn, dict):
+                     raise ValueError("tool_calls must be a list of objects (each with a \"function\" object)")
+-                calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"))}})
++                calls.append({"function": {"name": fn.get("name"), "arguments": tool_arguments(fn.get("arguments"))},
++                              "_call_id": c.get("id")})
+             out["tool_calls"] = calls
+         messages.append(out)
++    _order_chat_tool_results(messages)
+     tools = [t.get("function", t) if t.get("type") == "function" else t
+              for t in _tool_list(req.get("tools"), "function")] or None
+     kwargs = {}
+@@ -393,11 +425,11 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
+             elif kind == "thinking":
+                 reasoning.append(block.get("thinking", ""))
+             elif kind == "tool_use":
+-                calls.append({"function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}})
++                calls.append({"_call_id": block.get("id"), "function": {"name": block.get("name"), "arguments": tool_arguments(block.get("input"))}})
+             elif kind == "tool_result":
+                 # A tool's image (Claude Code's Read of a picture) reaches the encoder like a user's, as the OpenAI
+                 # path's tool messages already do; a text-only result is one string, as before.
+-                messages.append({"role": "tool", "content": _parts_of(block.get("content"))})
++                messages.append({"role": "tool", "_call_id": block.get("tool_use_id"), "content": _parts_of(block.get("content"))})
+         if text or calls or reasoning or parts:
+             # an image sent beside tool results stays in this turn instead of being dropped
+             out = {"role": m["role"], "content": _parts_of(parts) if _has_image(parts) else "".join(text)}
+@@ -406,6 +438,7 @@ def anthropic_to_messages(req: dict, think_unasked: bool = True) -> tuple[list[d
+             if calls:
+                 out["tool_calls"] = calls
+             messages.append(out)
++    _order_chat_tool_results(messages)
+     tools = [{"name": t["name"], "description": t.get("description", ""), "parameters": t.get("input_schema", {})}
+              for t in _tool_list(req.get("tools"), None)] or None
+     kwargs = {}
+diff --git a/serve/responses.py b/serve/responses.py
+index 01f2b17..b7a03d2 100644
+--- a/serve/responses.py
++++ b/serve/responses.py
+@@ -209,26 +209,9 @@ def input_messages(req: dict) -> list[dict]:
+ 
+ 
+ def _order_tool_results(messages):
+-    """The template places tool results by position: each run of tool messages is put in the order of the calls of
+-    the assistant turn before it (a client may send the results in the order they finished), then the private call
+-    ids are dropped."""
+-    i = 0
+-    while i < len(messages):
+-        if messages[i]["role"] != "tool":
+-            i += 1
+-            continue
+-        j = i
+-        while j < len(messages) and messages[j]["role"] == "tool":
+-            j += 1
+-        prev = messages[i - 1] if i else {}
+-        order = [c.get("_call_id") for c in prev.get("tool_calls") or []]
+-        rank = {cid: k for k, cid in enumerate(order) if cid}
+-        messages[i:j] = sorted(messages[i:j], key=lambda m: rank.get(m.get("_call_id"), len(order)))
+-        i = j
+-    for m in messages:
+-        m.pop("_call_id", None)
+-        for c in m.get("tool_calls") or []:
+-            c.pop("_call_id", None)
++    # Use the same complete, unique, string-ID matching contract as Chat.
++    from serve.frontend import _order_chat_tool_results
++    _order_chat_tool_results(messages)
+ 
+ 
+ def request_tools(req: dict):
+diff --git a/serve/server.py b/serve/server.py
+index 55460e9..c693f45 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -63,6 +63,7 @@ from serve.winjob import contain  # noqa: E402
+ from serve.structured import StructuredOutputError, prepare_format, validated_json  # noqa: E402
+ from serve import responses as responses_api  # noqa: E402
+ from serve.responses import ResponsesError, error_body as responses_error_body  # noqa: E402
++from serve.prefix_metadata import begin as _prefix_diag_begin, observe as _prefix_diag_observe  # noqa: E402
+ 
+ IM_END = "<|im_end|>"
+ IMAGE_PAD = "<|image_pad|>"
+@@ -254,10 +255,21 @@ class EngineStarting(RuntimeError):
+     not a 400 about the prompt."""
+ 
+ 
++class ClientGone(Exception):
++    """The client left while waiting or preparing; no request work should start."""
++
++
+ class ModelBusy(RuntimeError):
+     """Explicit model controls must not interrupt active or queued requests."""
+ 
+ 
++class EngineNonFinite(ValueError):
++    """#879: the engine's DONE (or a slot's BDONE) said `nonfinite`: a window's logits held a NaN or an infinity.  The
++    engine wrote none of that window's tokens and drops every cached state that may carry the poison, so its next
++    request reads the prompt from token 0.  Service.run sends a request that had produced nothing yet once more, and
++    ends one that had started (as "length").  A ValueError, so a stream that has started reports it as an error event."""
++
++
+ class EngineSilent(EngineDied):
+     """#481: the engine said nothing for too long during a request (or never acknowledged a STOP): the two sides lost
+     step - the engine waiting for its next command, the server for this request's end - and the server ended it.  An
+@@ -877,6 +889,13 @@ class StrataEngine:
+                 v = tune.get(k)
+                 if isinstance(v, (int, float)) and not isinstance(v, bool) and 0.0 <= float(v) <= 1.0:
+                     keys += f" {k}={float(v)!r}"
++        # Stable MTP preset: default helpers to the qualified auxiliary CPU placement.
++        # Explicit per-request strata_tune.aux_cpus=0 still disables it.
++        ac = tune.get("aux_cpus") if isinstance(tune, dict) else None
++        if ac is None and os.environ.get("STRATA_HTTP_AUX_CPUS") == "1":
++            ac = True
++        if isinstance(ac, bool) or (isinstance(ac, (int, float)) and ac in (0, 1)):
++            keys += f" aux_cpus={int(ac)}"
+         # "strata_checkpoint": false - a one-shot call (a classification, a probe) whose turn no later request
+         # extends: no conversation checkpoint for it (#830).  It still reuses a cached prefix.  Absent = as before.
+         if sampling.get("strata_checkpoint") is False:
+@@ -904,15 +923,19 @@ class StrataEngine:
+         for each `T`; returns ("done", None) at DONE, or ("badm", continues) at BADM (after DONE).  `stop_when()`
+         true sends STOP once (the request is then read to its DONE)."""
+         stopped = False
++        beat = time.monotonic()
+         while True:
+             try:
+-                line = self.lines.get(timeout=10.0)
++                line = self.lines.get(timeout=0.5)
+             except queue.Empty:
+                 if cancel.is_set() and not stopped:
+                     self._send("STOP")
+                     stopped = True
+-                yield None
++                if time.monotonic() - beat >= 10.0:
++                    beat = time.monotonic()
++                    yield None
+                 continue
++            beat = time.monotonic()
+             if line is None:
+                 raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
+             if not line.startswith(("PP ", "INFO")):
+@@ -1339,12 +1362,14 @@ class StrataEngine:
+             self.proc.stdin.flush()
+         except OSError:                                  # the pipe is gone: the engine died (not the client)
+             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
++        _prefix_diag_seq = _prefix_diag_begin(self, ids, max_new, head, bool(embeddings))
+         done = False
+         # #481: how long the engine may stay silent from here.  Until the first line: the request's first prompt
+         # chunk at the slowest prompt reading on top of silence_s; a PP line resets it to its own chunk's time.
+         silence = float(self.silence_s or 0)
+         allow = silence + min(len(ids), PP_CHUNK_MAX) / PP_FLOOR_TOK_S if silence > 0 else 0.0
+         heard, read_to = time.monotonic(), 0
++        beat = heard
+         try:
+             while True:
+                 wait = 10.0
+@@ -1355,17 +1380,22 @@ class StrataEngine:
+                         raise self._silent(f"the engine said nothing for {time.monotonic() - heard:.0f} s during "
+                                            "the request")
+                 try:
+-                    line = self.lines.get(timeout=wait)
++                    line = self.lines.get(timeout=min(wait, 0.5))
+                 except queue.Empty:
+                     if cancel.is_set():
+                         return
+-                    if wait >= 10.0:
+-                        yield None                        # the 10 s heartbeat (the deadline's short waits are not)
++                    if allow > 0 and time.monotonic() - heard >= allow:
++                        continue
++                    if time.monotonic() - beat >= 10.0:
++                        beat = time.monotonic()
++                        yield None                        # polling does not add HTTP heartbeats
+                     continue
+                 if line is None:
+                     done = True
+                     raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})")
++                _prefix_diag_observe(self, _prefix_diag_seq, line, cancelled=cancel.is_set())
+                 heard = time.monotonic()                  # any line is output: T, PP, RESUME, INFO ...
++                beat = heard
+                 if line.startswith("T "):
+                     allow = silence
+                     if cancel.is_set():
+@@ -1392,6 +1422,8 @@ class StrataEngine:
+                 elif line.startswith("DONE"):
+                     self._parse_done(line)
+                     done = True
++                    if self.last.get("finish") == "nonfinite":
++                        raise EngineNonFinite("the engine's logits became non-finite (#879)")
+                     return
+                 elif line.startswith("ERR"):
+                     done = True
+@@ -1417,6 +1449,7 @@ class StrataEngine:
+                     except queue.Empty:
+                         raise self._silent("the engine did not finish the request after it was stopped (STOP) "
+                                            f"within {allow:.0f} s") from None
++                    _prefix_diag_observe(self, _prefix_diag_seq, line, cancelled=cancel.is_set(), drained=True)
+                     if line is None or line.startswith("ERR"):
+                         break
+                     if line.startswith("DONE"):
+@@ -2199,6 +2232,7 @@ class Service:
+         self.min_free_vram_mib = 0
+         self.before_load = None
+         self.vram_reserve = None                         # #533: the last POST /v1/vram reserve (None: the start's)
++        self.reasoning_close_retry = False  # narrow #1053 backport, opt-in
+         self.reasoning_loop_recovery = False
+         self.reasoning_budget_tokens = 0                 # #123: the config's default thinking budget (0: none)
+         self.repeat_stop_tokens = REPEAT_STOP_TOKENS     # #606: one token this many times in a row ends a reply (0: off)
+@@ -2507,6 +2541,8 @@ class Service:
+ 
+     def start_telemetry(self):
+         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
++        if os.environ.get("STRATA_DISABLE_TELEMETRY") == "1":
++            return
+         if getattr(self, "telemetry", None) is None:
+             from serve.telemetry import Telemetry
+             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
+@@ -2705,7 +2741,24 @@ class Service:
+         prompt, plain = unmark_think_literals(prompt, self.literals)
+         return self.tok.encode(prompt, parse_special=True, plain=plain)
+ 
+-    def _note_unreadable_tool_images(self, messages):
++    @contextlib.contextmanager
++    def _turn(self, cancel=None):
++        if cancel is not None and cancel.is_set():
++            raise ClientGone()
++        if cancel is None:
++            self.fifo.acquire()
++        else:
++            while not self.fifo.acquire(timeout=0.25):
++                if cancel.is_set():
++                    raise ClientGone()
++        try:
++            if cancel is not None and cancel.is_set():
++                raise ClientGone()
++            yield
++        finally:
++            self.fifo.release()
++
++    def _note_unreadable_tool_images(self, messages, cancel=None):
+         """A picture a tool returned (Claude Code's Read of an image file) that this server cannot read - it has no
+         image encoder, or the encoder refuses that picture - becomes a short note in its place instead of a 400.
+         Clients resend the whole history every turn, so one unreadable tool picture would fail every later request of
+@@ -2723,9 +2776,11 @@ class Service:
+                 if why is None:
+                     src = item["source"]
+                     try:
++                        if cancel is not None and cancel.is_set():
++                            raise ClientGone()
+                         if src.startswith(("http://", "https://")):
+                             src = fetched[item["source"]] = Vision.download(src)   # outside the FIFO, as in prepare()
+-                        with self.fifo:          # the encoder takes its turn with the requests (see below)
++                        with self._turn(cancel):  # cancellation-aware ownership
+                             self.vision.encode(src)
+                     except (ValueError, OSError) as e:
+                         why = str(e)
+@@ -2734,11 +2789,20 @@ class Service:
+                     content[n] = {"type": "text", "text": f"[image omitted: {why}]"}
+         return fetched
+ 
+-    def prepare(self, messages, tools, kwargs, max_new=None, force=None):
++    def prepare(self, messages, tools, kwargs, max_new=None, force=None, cancel=None):
++        """Keep the acquired image turn until cached source files have been copied."""
++        with contextlib.ExitStack() as image_turn:
++            return self._prepare(messages, tools, kwargs, max_new, force, cancel, image_turn=image_turn)
++
++    def _prepare(self, messages, tools, kwargs, max_new=None, force=None, cancel=None, *, image_turn):
+         """-> (ids, thinking, max_new). An unset or non-positive max_new (some clients send -1) means "unlimited":
+         the rest of the context.  `force` (forced_call): without thinking the reply starts with it, so it ends the
+         prompt; with thinking, Service.run writes it once the thinking is over."""
+-        fetched = self._note_unreadable_tool_images(messages)
++        if cancel is not None and cancel.is_set():
++            raise ClientGone()
++        fetched = self._note_unreadable_tool_images(messages, cancel)
++        if cancel is not None and cancel.is_set():
++            raise ClientGone()
+         ids = self.encode_prompt(messages, tools, kwargs)
+         if force and kwargs.get("enable_thinking", True) is False:
+             ids = ids + self.tok.encode(force, parse_special=True)
+@@ -2752,14 +2816,23 @@ class Service:
+             start = self.tok.encode(VISION_START, parse_special=True)[0]
+             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
+             # for as long as urlopen waited.
+-            images = [fetched[src] if src in fetched else Vision.download(src) if src.startswith(("http://", "https://"))
+-                      else src for src in images]
++            def fetch(src):
++                if cancel is not None and cancel.is_set():
++                    raise ClientGone()
++                return fetched[src] if src in fetched else Vision.download(src) if src.startswith(("http://", "https://")) else src
++            images = [fetch(src) for src in images]
+             # Encode only while the engine is idle: the engine and the image encoder (a separate process) must not
+             # run on the GPU at the same time - an encode during a running request left that request stuck at
+             # "reading the prompt" with CPU and GPU busy, for good (reproduced).  So encoding takes its turn in the
+             # same FIFO as the requests.
+-            with self.fifo:
+-                encoded = [self.vision.encode(src) for src in images]
++            image_turn.enter_context(self._turn(cancel))
++            encoded = []
++            for src in images:
++                if cancel is not None and cancel.is_set():
++                    raise ClientGone()
++                encoded.append(self.vision.encode(src))
++            if cancel is not None and cancel.is_set():
++                raise ClientGone()
+             # one <|image_pad|> per image -> one per image token.  Only the markers the template writes for an image
+             # (right after <|vision_start|>) are images: the same text inside a message (an agent reading these docs,
+             # #150) is kept as plain text, or it took an image's place and the counts no longer matched.
+@@ -2803,6 +2876,8 @@ class Service:
+                                  f"max_tokens (at most {max(0, room)} here), or add \"fit_max_tokens\": true to the "
+                                  "model's strata-<model>.json to shorten it to the room left (#545)")
+             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
++        if cancel is not None and cancel.is_set():
++            raise ClientGone()
+         if images:
+             # The request's images in one file for GENI (~10 MB a picture), written once nothing above refuses the
+             # request: one refused after it (the engine starting, no room) left it in the vision directory for good,
+@@ -2867,6 +2942,8 @@ class Service:
+         parser = OutputParser(thinking=thinking, tools=tools, stream_tools=True)
+         detok, n, finish = Detokenizer(self.tok), 0, "length"
+         run_tok, run_len, repeated = None, 0, False     # #606: the current run of one repeated token
++        answered, close_retried = False, False
++        nf_retried = False  # one retry for the whole request, independent of #1053
+         thinking_n = 0                                  # tokens written while thinking (Responses' reasoning_tokens)
+         stop_list = stop_strings(sampling)
+         stops = StopMatcher(stop_list) if stop_list else None
+@@ -2912,7 +2989,32 @@ class Service:
+             self.status["queued"] += 1
+         try:
+             # --batch: the engine runs several requests at once (StrataEngine.generate_batched orders them)
+-            with (contextlib.nullcontext() if getattr(self.engine, "batch", 0) else self.fifo):
++            turn = contextlib.ExitStack()
++            if not getattr(self.engine, "batch", 0):
++                got = False
++                beat = time.monotonic()
++                try:
++                    while not cancel.is_set():
++                        got = self.fifo.acquire(timeout=0.25)
++                        if got:
++                            turn.callback(self.fifo.release)
++                            break
++                        if not cancel.is_set() and time.monotonic() - beat >= 10.0:
++                            beat = time.monotonic()
++                            yield "ping", None
++                except BaseException:
++                    turn.close()
++                    with self.status_lock:
++                        self.status["queued"] -= 1
++                    raise
++                if not got or cancel.is_set():
++                    turn.close()
++                    with self.status_lock:
++                        self.status["queued"] -= 1
++                    yield "done", {"finish": "cancel", "completion_tokens": 0, "reused": 0, "timings": None,
++                                   "reasoning_tokens": 0, "reasoning_recoveries": 0}
++                    return
++            with turn:
+                 try:
+                     with self.status_lock:
+                         if trace is not None:
+@@ -2942,6 +3044,8 @@ class Service:
+                             else self.engine.generate(prompt, max_new - n, sampling, cancel)
+                         recover_prompt = None
+                         seg, wrap, leaving = [], False, False   # this pass's tokens; the budget is reached; closed
++                        token_stop = None
++                        nonfinite = False
+                         opens = False                   # the thinking is over: write the forced call's opening
+                         try:
+                             for t in gen:
+@@ -2954,6 +3058,11 @@ class Service:
+                                     with self.status_lock:
+                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
+                                 if t in self.stop_ids:
++                                    token_stop = t
++                                    print("[reasoning-boundary] " + json.dumps({"event": "eos", "token_id": t,
++                                          "parser_state": parser.state, "pending_calls": len(parser.pending),
++                                          "buffer_chars": len(parser.buf), "answered": answered,
++                                          "generated": n, "max_new": max_new}), flush=True)
+                                     finish = "stop"
+                                     raw_ids.append(t)
+                                     break
+@@ -2973,6 +3082,8 @@ class Service:
+                                 for ev in evs:
+                                     if self.reasoning_loop_recovery and ev.kind == "reasoning":
+                                         reasoning_text += ev.text or ""
++                                    if ev.kind in ("content", "tool_start", "tool_call"):
++                                        answered = True
+                                     yield "event", ev
+                                 if stops is not None and stops.hit is not None:
+                                     finish = "stop"         # gen.close() below STOPs the engine, as for a stop token
+@@ -3002,6 +3113,8 @@ class Service:
+                                     elif parser.state == "content" and not parser.buf and not detok.pending():
+                                         opens = True
+                                         break
++                        except EngineNonFinite:
++                            nonfinite = True
+                         except EngineDied as e:
+                             finish = "error"
+                             self._say_died(e)
+@@ -3023,6 +3136,22 @@ class Service:
+                                 self._say_died(e)
+                                 if not leaving and not cancel.is_set():
+                                     raise
++                        if nonfinite:
++                            if cancel.is_set():
++                                finish = "cancel"
++                                break
++                            if n == 0 and not nf_retried:
++                                nf_retried = True
++                                # Only this discarded pass must not masquerade as the retry's DONE.
++                                engine_last0 = before = getattr(self.engine, "last", None)
++                                print("[strata] non-finite before the first token: retrying once", flush=True)
++                                continue
++                            if n == 0:
++                                finish = "error"
++                                raise EngineNonFinite("the model's output became non-finite twice in a row (#879)")
++                            print(f"[strata] non-finite after {n} tokens: ending as length", flush=True)
++                            finish = "length"
++                            break
+                         if recover_prompt is not None and not cancel.is_set() and n < max_new:
+                             recovery_count += 1
+                             # Only the two settings that keep the same words coming are raised (temperature to at
+@@ -3043,6 +3172,30 @@ class Service:
+                                   f"(coverage={repeat_coverage:.3f}); resuming the same output with the low-effort "
+                                   "instruction (reasoning_loop_recovery)", flush=True)
+                             continue
++                        # #1053: bounded recovery of a natural EOS before </think>, never a tool or client stop.
++                        if (self.reasoning_close_retry and thinking and thinking_n > 0
++                                and token_stop is not None and finish == "stop" and not close_retried
++                                and not answered and not wrap and not opens and parser.state == "reasoning"
++                                and not parser.pending and not parser.buf and not detok.pending()
++                                and not stop_list and not cancel.is_set() and not repeated and not looped):
++                            extra = self.tok.encode("\n</think>\n\n", parse_special=True)
++                            if max_new - n - len(extra) >= 1:
++                                close_retried = True
++                                print("[reasoning-boundary] " + json.dumps({"event": "close_retry",
++                                      "reason": "eos_inside_reasoning_without_answer_or_call",
++                                      "generated": n, "remaining_after_close": max_new - n - len(extra),
++                                      "retry": 1}), flush=True)
++                                for t in extra:
++                                    n += 1
++                                    raw_ids.append(t)
++                                    thinking_n += parser.state in ("reasoning", "rcall")
++                                    evs = cut(parser.feed(detok.push(t)))
++                                    self._note(n, evs, st, rate)
++                                    for ev in evs:
++                                        yield "event", ev
++                                prompt = prompt + seg + extra
++                                finish = "length"
++                                continue
+                         if not (wrap or opens) or cancel.is_set():
+                             break
+                         # #123: the thinking reached reasoning_budget_tokens.  Close it the way the model would (a
+@@ -3314,7 +3467,11 @@ def run_with_mcp(svc: Service, hub, messages, tools, kw, ids, thinking, max_new,
+                          **({"reasoning_content": "".join(reasoning).strip()} if reasoning else {}),
+                          "tool_calls": [{"function": {"name": c.name, "arguments": c.arguments}} for c in calls]})
+         messages += [{"role": "tool", "content": r} for r in results]
+-        ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req)
++        try:
++            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_req, cancel=cancel)
++        except ClientGone:
++            done = {**done, "finish": "cancel"}
++            break
+     yield "done", {**done, "completion_tokens": total, "prompt_tokens": len(ids)}
+ 
+ 
+@@ -3762,6 +3919,9 @@ def make_handler(svc: Service):
+ 
+         def do_GET(self):
+             path = self.path.split("?")[0].rstrip("/")
++            if os.environ.get("STRATA_API_ONLY") == "1" and (path in ("", "/api-monitor") or path.startswith(("/web/", "/fonts/"))):
++                self._json(404, {"error": {"message": "API-only deployment"}})
++                return
+             if path.startswith("/fonts/"):
+                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
+                 name = path[len("/fonts/"):]
+@@ -3976,6 +4136,9 @@ def make_handler(svc: Service):
+                     self._count_tokens(req)
+                 else:
+                     self._json(404, {"error": {"message": "not found"}})
++            except EngineNonFinite as e:
++                self._json(503, responses_error_body(str(e), "server_error") if path == "/v1/responses"
++                           else {"error": {"type": "server_error", "message": str(e)}})
+             except ValueError as e:
+                 print(f"[strata] 400 invalid request: {e}", flush=True)
+                 if path == "/v1/responses":
+@@ -3994,6 +4157,8 @@ def make_handler(svc: Service):
+             except EngineStuck as e:                         # an unload or restart that could not end the engine
+                 self._json(503, {"error": {"type": "server_error", "message": str(e)}})
+ 
++            except ClientGone:
++                self._note(outcome="disconnected")
+             except OSError:
+                 self._note(outcome="disconnected")
+                 raise                                        # as before #332: the server's own handling
+@@ -4215,10 +4380,10 @@ def make_handler(svc: Service):
+                 raise ValueError("a forced tool_choice with MCP tools is not supported")
+             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
+             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
+-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force)
+-            _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
+             cancel = threading.Event()
+-            self._watch_client(cancel)                       # #430 #431
++            self._watch_client(cancel)
++            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, cancel=cancel)
++            _debug_req("openai", req, messages, tools, max_new, thinking, len(ids))
+             run = run_with_mcp(svc, svc.mcp, messages, tools, kw, ids, thinking, max_new, max_req, req, cancel,
+                                {t["name"] for t in extra}) if use_mcp else None
+             chunks = openai_chunks(svc, req, ids, thinking, tools, max_new, cancel, run=run, force=force)
+@@ -4256,16 +4421,16 @@ def make_handler(svc: Service):
+         def _responses(self, req):
+             """#451: POST /v1/responses - OpenAI's Responses API, stateless (serve/responses.py), on the chat path.
+             Errors use the Responses format; once the stream has started they arrive as a response.failed event."""
++            cancel = threading.Event()
++            self._watch_client(cancel)
+             try:
+-                ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req)
++                ids, thinking, tools, max_new, asm, validator, req = self._responses_prepare(req, cancel)
+             except ResponsesError as e:
+                 return self._json(e.status, e.body())
+             except ModelBusy as e:
+                 return self._json(409, responses_error_body(str(e), "server_error", code="model_busy"))
+             except (GpuBusy, EngineStarting, EngineStuck, EngineDied) as e:
+                 return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+-            cancel = threading.Event()
+-            self._watch_client(cancel)                       # #430 #431
+ 
+             def check(text, finish):
+                 return validated_json(text, validator, finish)
+@@ -4292,6 +4457,8 @@ def make_handler(svc: Service):
+                 except EngineDied as e:
+                     return self._json(503, responses_error_body(f"{e}; the next request restarts it", "server_error",
+                                                                 code="server_error"))
++                except EngineNonFinite as e:
++                    return self._json(503, responses_error_body(str(e), "server_error", code="server_error"))
+                 except ValueError as e:                      # the engine's ERR line
+                     return self._json(500, responses_error_body(str(e), "server_error", code="server_error"))
+                 return self._json(200, result)
+@@ -4336,7 +4503,7 @@ def make_handler(svc: Service):
+             except OSError:
+                 pass
+ 
+-        def _responses_prepare(self, req):
++        def _responses_prepare(self, req, cancel=None):
+             responses_api.check_request(req)
+             messages = responses_api.input_messages(req)
+             tools, names, skipped = responses_api.request_tools(req)
+@@ -4369,7 +4536,7 @@ def make_handler(svc: Service):
+                 raise ResponsesError(str(e), "stop") from None
+             svc.load()
+             try:
+-                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0)
++                ids, thinking, max_new = svc.prepare(messages, tools, kw, req.get("max_output_tokens") or 0, cancel=cancel)
+             except ResponsesError:
+                 raise
+             except ValueError as e:                          # too long for the context, an image without vision
+@@ -4401,10 +4568,10 @@ def make_handler(svc: Service):
+             max_new = int(req.get("max_tokens") or 0)                  # 0/-1: the rest of the context
+             svc.reasoning_budget(req)                         # a bad value is a 400 before anything is sent
+             stop_strings(req)                                 # ... and so is a bad stop / stop_sequences
+-            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force)
+-            _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
+             cancel = threading.Event()
+-            self._watch_client(cancel)                       # #430 #431
++            self._watch_client(cancel)
++            ids, thinking, max_new = svc.prepare(messages, tools, kw, max_new, force=force, cancel=cancel)
++            _debug_req("anthropic", req, messages, tools, max_new, thinking, len(ids))
+             events = anthropic_events(svc, req, ids, thinking, tools, max_new, cancel, force=force)
+             events = self._capture(events, "anthropic")
+             if not req.get("stream"):
+@@ -4893,6 +5060,7 @@ def main() -> int:
+     if svc.allowed_hosts:
+         print("[strata] Host check off: any name reaches this server (allowed_hosts \"*\")" if "*" in svc.allowed_hosts
+               else f"[strata] also answers to the host names {', '.join(svc.allowed_hosts)} (allowed_hosts)", flush=True)
++    svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True
+     svc.api_monitor = a.api_monitor or cfg.get("api_monitor") is True
+     if svc.api_monitor:
+         print("[strata] API request monitor on (/api-monitor): the last 100 requests' prompts and answers are kept in "
+diff --git a/src/core/vmm.cpp b/src/core/vmm.cpp
+index d66f17b..9ada955 100644
+--- a/src/core/vmm.cpp
++++ b/src/core/vmm.cpp
+@@ -1,6 +1,6 @@
+ #include "strata/core/vmm.hpp"
+ 
+-#if !defined(STRATA_USE_HIP)
++#if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
+ #include <cuda.h>
+ #include <cuda_runtime.h>
+ 
+diff --git a/src/kernels/cpu/q2_avx2.cpp b/src/kernels/cpu/q2_avx2.cpp
+index c406d42..7a46036 100644
+--- a/src/kernels/cpu/q2_avx2.cpp
++++ b/src/kernels/cpu/q2_avx2.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <immintrin.h>
+ 
++#include <algorithm>
+ #include <cmath>
+ #include <cstdlib>
+ #include <cstring>
+@@ -48,12 +49,31 @@ inline void unpack64(const uint8_t* codes, __m256i& lo, __m256i& hi) {
+     hi = _mm256_set_m128i(_mm_unpackhi_epi16(b0, b1), _mm_unpacklo_epi16(b0, b1));  // values 32..63
+ }
+ 
+-// ---- the row kernel, twice: the AVX2 form and the AVX-VNNI one (q2_avx2_rows.inl)
++// Widen eight packed bytes to32-bit lanes, then spread each byte's four codes.
++// This changes only integer unpacking; row FMAs, corrections and reduction stay unchanged.
++inline void unpack64_spread(const uint8_t* codes, __m256i& lo, __m256i& hi) {
++    const __m128i b = _mm_loadu_si128((const __m128i*)codes);
++    auto spread = [](__m256i q) {
++        q = _mm256_and_si256(_mm256_or_si256(q, _mm256_slli_epi32(q,12)), _mm256_set1_epi32(0x000f000f));
++        return _mm256_and_si256(_mm256_or_si256(q, _mm256_slli_epi32(q,6)), _mm256_set1_epi32(0x03030303));
++    };
++    lo = spread(_mm256_cvtepu8_epi32(b));
++    hi = spread(_mm256_cvtepu8_epi32(_mm_srli_si128(b,8)));
++}
++
++// ---- the row kernel: AVX2, exact-unpack AVX2, and AVX-VNNI (q2_avx2_rows.inl)
+ namespace plain {
+ #define STRATA_ROWS_VNNI 0
+ #define STRATA_ROWS_FN
+ #include "q2_avx2_rows.inl"
+ }  // namespace plain
++namespace spread {
++#define STRATA_ROWS_VNNI 0
++#define STRATA_ROWS_FN
++#define unpack64 unpack64_spread
++#include "q2_avx2_rows.inl"
++#undef unpack64
++}  // namespace spread
+ #if STRATA_AVXVNNI
+ namespace vnni {
+ #define STRATA_ROWS_VNNI 1
+@@ -143,6 +163,52 @@ void rows_bp(const uint8_t* w, size_t row_bytes, int npairs, const ActQ* const*
+     }
+ }
+ 
++// Two independent output rows share activation loads; each row retains its FMA sequence.
++template<int NT>
++void rows_pair(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a,
++               float* const* out, int r0, int r1) {
++    int r = r0;
++    for (; r + 1 < r1; r += 2) {
++        __m256 acc[2][NT];
++        float corr[2][NT] = {};
++        for (int p = 0; p < 2; ++p)
++            for (int t = 0; t < NT; ++t) acc[p][t] = _mm256_setzero_ps();
++        for (int b = 0; b < nblocks; ++b) {
++            __m256i lo[2], hi[2];
++            float d[2];
++            for (int p = 0; p < 2; ++p) {
++                const uint8_t* blk = w + size_t(r + p) * row_bytes + b * 18;
++                d[p] = h2f(blk);
++                unpack64_spread(blk + 2, lo[p], hi[p]);
++            }
++            for (int t = 0; t < NT; ++t) {
++                const int8_t* q = a[t]->q + b * 64;
++                const __m256i x0 = _mm256_loadu_si256((const __m256i*)q);
++                const __m256i x1 = _mm256_loadu_si256((const __m256i*)(q + 32));
++                const float s0 = a[t]->scale[2 * b], s1 = a[t]->scale[2 * b + 1];
++                const float hx = a[t]->hx[2 * b] + a[t]->hx[2 * b + 1];
++                for (int p = 0; p < 2; ++p) {
++                    const __m256i v0 = plain::dot4(lo[p], x0), v1 = plain::dot4(hi[p], x1);
++                    acc[p][t] = _mm256_fmadd_ps(_mm256_set1_ps(d[p] * s0), _mm256_cvtepi32_ps(v0), acc[p][t]);
++                    acc[p][t] = _mm256_fmadd_ps(_mm256_set1_ps(d[p] * s1), _mm256_cvtepi32_ps(v1), acc[p][t]);
++                    corr[p][t] += d[p] * hx;
++                }
++            }
++        }
++        for (int p = 0; p < 2; ++p) for (int t = 0; t < NT; ++t) {
++            const __m128 h = _mm_add_ps(_mm256_castps256_ps128(acc[p][t]), _mm256_extractf128_ps(acc[p][t], 1));
++            const __m128 s = _mm_add_ps(h, _mm_movehl_ps(h, h));
++            out[t][r + p] = _mm_cvtss_f32(_mm_add_ss(s, _mm_movehdup_ps(s))) - corr[p][t];
++        }
++    }
++    if (r < r1) spread::rows_nt(w, row_bytes, nblocks, a, NT, out, r, r1);
++}
++
++const bool kUnpackSpread = [] {
++    const char* e = std::getenv("STRATA_Q2_AVX2_SPREAD");
++    return e && e[0] == '1';
++}();
++
+ const bool kBitplane = [] {
+     const char* e = std::getenv("STRATA_Q2_BITPLANE");
+     return e != nullptr && e[0] == '1';
+@@ -161,7 +227,31 @@ void q2_0_gguf_rows_multi_avx2_v(bool vnni_rows, const uint8_t* w, size_t row_by
+     }
+ #endif
+     (void) vnni_rows;
+-    plain::rows_nt(w, row_bytes, nblocks, a, nt, out, r0, r1);
++    if (kUnpackSpread && (nblocks == 10 || nblocks == 40) && nt % 4 != 0)
++        q2_0_gguf_rows_multi_avx2_spread(w, row_bytes, nblocks, a, nt, out, r0, r1);
++    else plain::rows_nt(w, row_bytes, nblocks, a, nt, out, r0, r1);
++}
++
++void q2_0_gguf_rows_multi_avx2_spread(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
++                                      float* const* out, int r0, int r1) {
++    if (nt % 4 == 0) {
++        plain::rows_nt(w, row_bytes, nblocks, a, nt, out, r0, r1);
++        return;
++    }
++    // Four-token groups lost in the measured AVX2 screen; keep that exact baseline kernel.
++    // Preserve the existing 4+remainder partition at widths5..8.
++    for (int t0 = 0; t0 < nt; t0 += 4) {
++        const int k = std::min(4, nt - t0);
++        if (k == 4) plain::rows_nt(w, row_bytes, nblocks, a + t0, k, out + t0, r0, r1);
++        else spread::rows_nt(w, row_bytes, nblocks, a + t0, k, out + t0, r0, r1);
++    }
++}
++
++void q2_0_gguf_rows_multi_avx2_pair(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
++                                    float* const* out, int r0, int r1) {
++    if (nt == 1) rows_pair<1>(w, row_bytes, nblocks, a, out, r0, r1);
++    else if (nt == 2) rows_pair<2>(w, row_bytes, nblocks, a, out, r0, r1);
++    else q2_0_gguf_rows_multi_avx2_spread(w, row_bytes, nblocks, a, nt, out, r0, r1);
+ }
+ 
+ void q2_0_gguf_rows_multi_avx2_legacy(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt,
+diff --git a/src/kernels/cuda/fused_gr.cu b/src/kernels/cuda/fused_gr.cu
+index a00c424..ccb880a 100644
+--- a/src/kernels/cuda/fused_gr.cu
++++ b/src/kernels/cuda/fused_gr.cu
+@@ -831,7 +831,9 @@ int down_chunk(bool staged, int* tile_out) {
+ // takes first).
+ #if defined(STRATA_HIP_GFX906)
+ __global__ void __launch_bounds__(THREADS) gr_norm_fast_kernel(GrMulti m);   // below, with the AMD fast path
++template<int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m);
++void launch_up_fast(const GrMulti& m, cudaStream_t st);
+ }  // namespace
+ static bool gr_fast();
+ namespace {
+@@ -906,7 +908,7 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long
+     }
+     if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+ #if defined(STRATA_HIP_GFX906)
+-    if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
++    if (fast) launch_up_fast(m, st);
+     else
+ #endif
+     switch (no_multi_gr ? kFusedGrMaxT : n_tok) {
+@@ -1004,11 +1006,12 @@ __device__ __forceinline__ float xor8(float v) {
+     for (int o = 4; o > 0; o >>= 1) v += __shfl_xor(v, o, 64);
+     return v;
+ }
++template<int MAX_T, bool EXACT_T>
+ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
+-    __shared__ __align__(16) float lo[kFusedGrMaxT][LR];
+-    __shared__ float g[kFusedGrMaxT][HC][UPM_COLS];
++    __shared__ __align__(16) float lo[MAX_T][LR];
++    __shared__ float g[MAX_T][HC][UPM_COLS];
+     const int t = threadIdx.x, j = t & 7, grp = t >> 3;
+-    const int T = m.T;
++    const int T = EXACT_T ? MAX_T : m.T;
+     const int d0 = blockIdx.x * UPM_COLS;
+     static_assert(LR == 40 * 8 && HC * UPM_COLS == 64 && THREADS == 256, "geometry");
+     uint4 w[2][5];
+@@ -1036,8 +1039,8 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
+         const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
+         float mine = 0.0f;
+ #pragma unroll
+-        for (int k = 0; k < kFusedGrMaxT; ++k) {
+-            if (k >= T) break;
++        for (int k = 0; k < MAX_T; ++k) {
++            if (!EXACT_T && k >= T) break;
+             const float* l = lo[k];
+             const float p0 = dot8(w[p][0], l + j * 8) + dot8(w[p][4], l + (32 + j) * 8);   // old lane j
+             const float p1 = dot8(w[p][1], l + (j + 8) * 8);                               // old lane j + 8
+@@ -1065,6 +1068,29 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
+         m.a[k].mixed[d0 + col] = s / (float) HC;
+     }
+ }
++void launch_up_fast(const GrMulti& m, cudaStream_t st) {
++    static const int exact = [] {
++        const char* e = std::getenv("STRATA_GR_UP_EXACT");
++        return e ? std::atoi(e) : 0;
++    }();
++    // Screened on both gfx906 cards: T1/T2/T5 win; T6 regresses, T3/T4 are noise.
++    // Mode2 retains the all-width prototype for reproducible component comparisons.
++    if (exact == 2 || (exact == 1 && (m.T == 1 || m.T == 2 || m.T == 5))) {
++        switch (m.T) {
++#define STRATA_GR_UP_CASE(T) case T: gr_up_fast_kernel<T, true><<<UPM_BLOCKS, THREADS, 0, st>>>(m); return
++            STRATA_GR_UP_CASE(1);
++            STRATA_GR_UP_CASE(2);
++            STRATA_GR_UP_CASE(3);
++            STRATA_GR_UP_CASE(4);
++            STRATA_GR_UP_CASE(5);
++            STRATA_GR_UP_CASE(6);
++#undef STRATA_GR_UP_CASE
++            default: break;
++        }
++    }
++    gr_up_fast_kernel<><<<UPM_BLOCKS, THREADS, 0, st>>>(m);
++}
++
+ #endif
+ 
+ #if defined(STRATA_HIP_GFX906)
+@@ -1733,14 +1759,14 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
+             m);
+         gr_down_finish_kernel<<<(unsigned) ((n_tok * GS_ROWS + 255) / 256), 256, 0, st>>>(m);
+         if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, stream);
+-        if (fast) gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
++        if (fast) launch_up_fast(m, st);
+         else gr_up_multi_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+         const cudaError_t e = cudaGetLastError();
+         if (e != cudaSuccess) {
+             std::fprintf(stderr, "fused_gr_read_multi: %s\n", cudaGetErrorString(e));
+             std::exit(1);
+         }
+-        return;
++        return false;  // no fused q8_1 output; caller quantizes
+     }
+ #endif
+     // the default read (STRATA_GR_V3 unset): v1, or the bitwise-equal v2 / v3 this card's check accepted
+diff --git a/src/kernels/cuda/iq_kernels.cu b/src/kernels/cuda/iq_kernels.cu
+index c4d76c4..2c672f9 100644
+--- a/src/kernels/cuda/iq_kernels.cu
++++ b/src/kernels/cuda/iq_kernels.cu
+@@ -3138,7 +3138,7 @@ __device__ __forceinline__ float q2_dot_spread(const void* vbq, const block_q8_1
+ }
+ // Q2_0 token-inner R2 without shared memory. Keep the baseline CTA geometry
+ // for singleton groups; reuse each thread's weight rows across up to NT tokens.
+-template<int NT, int RB>
++template<int NT, int RB, bool SPREAD = false>
+ __global__ void __launch_bounds__(256) native_gu_q2_global_kernel(
+     const unsigned long long* __restrict__ grp_ptr, const int32_t* __restrict__ grp_start,
+     const int32_t* __restrict__ n_groups, const int32_t* __restrict__ ent_tok,
+@@ -3177,8 +3177,8 @@ __global__ void __launch_bounds__(256) native_gu_q2_global_kernel(
+ #pragma unroll
+                     for (int j = 0; j < N; ++j) {
+                         const block_q8_1* xx = x[j] + kb * (Fmt<42>::qk / 32);
+-                        a[j] += q2_dot_fast(w0, xx, kb, iq);
+-                        b[j] += q2_dot_fast(w1, xx, kb, iq);
++                        a[j] += SPREAD ? q2_dot_spread(w0, xx, kb, iq) : q2_dot_fast(w0, xx, kb, iq);
++                        b[j] += SPREAD ? q2_dot_spread(w1, xx, kb, iq) : q2_dot_fast(w1, xx, kb, iq);
+                     }
+                 }
+ #pragma unroll
+@@ -3544,12 +3544,14 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+     if (g_exp_phase != 2) {
+ #endif
+ #if defined(STRATA_HIP_GFX906)
+-    const bool lds_gu = (em0 == 5 || em0 == 6 || em0 == 7 || em0 == 8 || em0 == 13 || em0 == 15) && (L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23);
++    const bool lds_gu = (em0 == 5 || em0 == 6 || em0 == 7 || em0 == 8 || em0 == 13 || em0 == 15 || em0 == 16) && (L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23);
+     // Modes 13/15 share the gfx906 Q2_0 gate/up candidate. Mode 15 only adds
+-    // fast Q2_0 down unpacking. Qualified geometry: Flash-Next H=2560, FF=640.
+-    if ((em0 == 13 || em0 == 15) && L.gu_type == 42 && L.n_embd == 2560 && L.n_ff == 640) {
++    // fast Q2_0 down unpacking. Experimental mode 16 also spreads gate/up bytes.
++    // Qualified geometry: Flash-Next H=2560, FF=640.
++    if ((em0 == 13 || em0 == 15 || em0 == 16) && L.gu_type == 42 && L.n_embd == 2560 && L.n_ff == 640) {
+         const dim3 gl((unsigned)((2 * L.n_ff + 15) / 16), (unsigned)cap_groups);
+-        native_gu_q2_global_kernel<4,16><<<gl,256,0,s>>>(grp_ptr,grp_start,n_groups,ent_tok,X,L,gate,up);
++        if (em0 == 16) native_gu_q2_global_kernel<4,16,true><<<gl,256,0,s>>>(grp_ptr,grp_start,n_groups,ent_tok,X,L,gate,up);
++        else native_gu_q2_global_kernel<4,16><<<gl,256,0,s>>>(grp_ptr,grp_start,n_groups,ent_tok,X,L,gate,up);
+     } else if (lds_gu) {
+         const dim3 gl((unsigned) ((2 * L.n_ff + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
+         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_embd / 32) * sizeof(block_q8_1);
+@@ -3609,11 +3611,11 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
+     const int d_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 640) ? (L.d_type == 20 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
+     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
+ #if defined(STRATA_HIP_GFX906)
+-    if ((em0 == 7 || em0 == 8 || em0 == 13 || em0 == 15) && (L.d_type == 20 || L.d_type == 42)) {
++    if ((em0 == 7 || em0 == 8 || em0 == 13 || em0 == 15 || em0 == 16) && (L.d_type == 20 || L.d_type == 42)) {
+         const dim3 gl((unsigned) ((L.n_embd + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
+         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_ff / 32) * sizeof(block_q8_1);
+         if (L.d_type == 20) native_down_lds_kernel<20><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+-        else if (em0 == 15 && L.n_embd == 2560 && L.n_ff == 640) native_down_lds_kernel<42, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
++        else if ((em0 == 15 || em0 == 16) && L.n_embd == 2560 && L.n_ff == 640) native_down_lds_kernel<42, true><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+         else native_down_lds_kernel<42><<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
+         check("native_expert_grouped/down");
+         return;
+diff --git a/src/kernels/cuda/native_bf16.cu b/src/kernels/cuda/native_bf16.cu
+index a059c5f..ce7c4b5 100644
+--- a/src/kernels/cuda/native_bf16.cu
++++ b/src/kernels/cuda/native_bf16.cu
+@@ -169,7 +169,7 @@ __global__ void bf16_f32_mmvf_rows_kernel(const float* __restrict__ x, int64_t l
+             }
+         }
+     }
+-    if constexpr (TS) {   // S26 STRATA_TSUM=1: the RPB x NT warp sums (both stages) as transposed butterflies, bitwise the same
++    if constexpr (TS && RPB * NT <= 32) {   // The transposed reduction holds at most 32 outputs; larger tiles use the exact plain sums.
+         constexpr int V = RPB * NT, P = s26ts::pow2_ceil(V);
+         const int lane = t & 31, j = s26ts::tsum_token<P>(lane);
+         const bool own = lane == s26ts::tsum_lane<P>(j) && j < V;
+@@ -215,10 +215,9 @@ __global__ void bf16_f32_mmvf_rows_kernel(const float* __restrict__ x, int64_t l
+                     if (k < n_tok) y[(size_t) k * ldy + o0 + r] = acc[r][k];
+ }
+ 
+-template <int B>
+-void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out, int n_tok,
++template <int B, int RPB>
++void launch_rows_impl(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out, int n_tok,
+                  cudaStream_t st, const uint16_t* w_aux = nullptr, float* y_aux = nullptr, int64_t ldy_aux = 0) {
+-    constexpr int RPB = 4;
+     const unsigned nb = (unsigned) ((n_out + RPB - 1) / RPB);
+     static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
+     if (w_aux != nullptr) {   // S26 STRATA_LFUSE: + one aux row block
+@@ -238,6 +237,24 @@ void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64
+     else bf16_f32_mmvf_rows_kernel<B, 8, RPB><<<nb, B, 0, st>>>(x, ldx, w, y, ldy, n_in, n_out, n_tok);
+ }
+ 
++template <int B>
++void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out, int n_tok,
++                 cudaStream_t st, const uint16_t* w_aux = nullptr, float* y_aux = nullptr, int64_t ldy_aux = 0) {
++#if defined(STRATA_HIP_GFX906)
++    static const int rows = [] { const char* v = std::getenv("STRATA_MMVF_RPB"); return v ? std::atoi(v) : 4; }();
++    // Select measured matrix shapes; eight-row tiles spill at NT8.
++    if (rows == 1 && ((n_in == 10240 && n_out == 320) || (n_in == 320 && n_out == 10240))) {
++        launch_rows_impl<B, 2>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st, w_aux, y_aux, ldy_aux); return;
++    }
++    if (rows == 1 && n_in == 2560 && n_out == 10240 && n_tok <= 4) {
++        launch_rows_impl<B, 8>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st, w_aux, y_aux, ldy_aux); return;
++    }
++    if (rows == 2) { launch_rows_impl<B, 2>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st, w_aux, y_aux, ldy_aux); return; }
++    if (rows == 8) { launch_rows_impl<B, 8>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st, w_aux, y_aux, ldy_aux); return; }
++#endif
++    launch_rows_impl<B, 4>(x, ldx, w, y, ldy, n_in, n_out, n_tok, st, w_aux, y_aux, ldy_aux);
++}
++
+ int mmvf_block_size(int64_t n_in) {
+     int best = 32;
+     int64_t best_iterations = (n_in + 63) / 64;
+diff --git a/src/kernels/cuda/qsa_select.cu b/src/kernels/cuda/qsa_select.cu
+index 917cc19..4fec90d 100644
+--- a/src/kernels/cuda/qsa_select.cu
++++ b/src/kernels/cuda/qsa_select.cu
+@@ -18,6 +18,7 @@ namespace {
+ constexpr int IDX_DIM = 128, IDX_HEADS = 4, R = 4;
+ constexpr int SCORE_WARPS = 8;
+ constexpr int TOPK_T = 256;
++constexpr int64_t GFX906_TOPK_SHORT_CELLS = 24576;
+ 
+ __device__ __forceinline__ uint32_t order_key(float s) {
+     const float v = s + 0.0f;
+@@ -55,6 +56,7 @@ __global__ void __launch_bounds__(SCORE_WARPS * 32) block_scores_kernel(const fl
+     }
+ }
+ 
++template <bool SHORT_ONLY = false>
+ __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restrict__ scores,
+                                                             const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                             int64_t cap, int32_t* __restrict__ ids) {
+@@ -64,6 +66,7 @@ __global__ void __launch_bounds__(TOPK_T) block_topk_kernel(const float* __restr
+     const int64_t qi = blockIdx.x;
+     const int32_t* st = steps + qi * kStepCount;
+     const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
++    if constexpr (SHORT_ONLY) { if (steps[((int64_t)gridDim.x - 1) * kStepCount + kStepNKv] > GFX906_TOPK_SHORT_CELLS) return; }
+     int32_t* out = ids + qi * cap;
+     const int t = threadIdx.x;
+     if (n_kv <= width) {                               // everything is selected: the identity, ascending
+@@ -526,7 +529,7 @@ __device__ __forceinline__ int block_excl_scan(int v, int* s_warp, int& total) {
+     return r;
+ }
+ 
+-template <int PER>
++template <int PER, bool LONG_ONLY = false>
+ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __restrict__ scores,
+                                                               const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                               int64_t cap, int32_t* __restrict__ ids) {
+@@ -536,6 +539,7 @@ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __res
+     const int64_t qi = blockIdx.x;
+     const int32_t* st = steps + qi * kStepCount;
+     const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
++    if constexpr (LONG_ONLY) { if (steps[((int64_t)gridDim.x - 1) * kStepCount + kStepNKv] <= GFX906_TOPK_SHORT_CELLS) return; }
+     int32_t* out = ids + qi * cap;
+     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+     if (n_kv <= width) {
+@@ -1117,7 +1121,7 @@ void qsa_block_topk_ref(const float* scores, const int32_t* steps, int64_t nq, i
+         std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
+         std::exit(1);
+     }
+-    block_topk_kernel<<<(unsigned) nq, TOPK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
++    block_topk_kernel<false><<<(unsigned) nq, TOPK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+     const cudaError_t e = cudaGetLastError();
+     if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk: %s\n", cudaGetErrorString(e)); std::exit(1); }
+ }
+@@ -1239,10 +1243,33 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
+                          (any_card || topk_active_turing_device());
+ #endif
+     const int64_t reach = counted && active_blocks < max_blocks ? active_blocks : max_blocks;
+-    const int64_t fit = (int64_t) TK_T * (counted ? TK_PER_MAX : TK_PER);
++#if defined(STRATA_HIP_GFX906)
++    static const int decode_reg66 = [] {
++        const char* v = std::getenv("STRATA_GFX906_TOPK_REG");
++        return v ? std::atoi(v) : 0;
++    }();
++    const bool extended_decode = (decode_reg66 == 1 || decode_reg66 == 2) && !counted && nq <= 8;
++#else
++    const bool extended_decode = false;
++#endif
++    const int64_t fit = (int64_t) TK_T * ((counted || extended_decode) ? TK_PER_MAX : TK_PER);
+ #if defined(__HIPCC__)
+     constexpr int64_t kRegMinBlocks = 7168;   // gfx1201: below ~28K cells the 1,024-thread kernel's fixed cost loses to the ref
+     const bool too_small = counted && reach < kRegMinBlocks;
++#if defined(STRATA_HIP_GFX906)
++    static const bool trace = std::getenv("STRATA_TOPK_TRACE") != nullptr;
++    if (trace) {
++        int device = 0; cudaGetDevice(&device);
++        const int route = (old || too_small || reach > fit) ? 0 : (reach <= (int64_t) TK_T * TK_PER ? 1 : (decode_reg66 == 2 && !counted ? 3 : 2));
++        static unsigned seen[16] = {};
++        if (device >= 0 && device < 16 && !(seen[device] & (1u << route))) {
++            seen[device] |= 1u << route;
++            std::fprintf(stderr, "strata topk probe: device=%d kernel=%s nq=%lld capacity_blocks=%lld active_blocks=%lld cap=%lld\n",
++                         device, route == 0 ? "reference256" : route == 1 ? "reg33" : route == 2 ? "reg66" : "guarded256/reg66",
++                         (long long)nq, (long long)max_blocks, (long long)active_blocks, (long long)cap);
++        }
++    }
++#endif
+     if (old || too_small || reach > fit) {
+ #else
+     constexpr int64_t kWideMinBlocks = 4608;   // RTX 3060: a prompt batch below ~18K cells is faster on the ref
+@@ -1256,6 +1283,18 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
+         std::fprintf(stderr, "qsa_block_topk: unsupported geometry or cap\n");
+         std::exit(1);
+     }
++#if defined(STRATA_HIP_GFX906)
++    // Both launches read current device steps: capture is safe across growth and restores.
++    // Use the final query for the whole window, so a threshold crossing does not run both bodies.
++    // Each guard precedes every barrier. Exactly one arm writes all rows.
++    if (decode_reg66 == 2 && extended_decode && reach > (int64_t) TK_T * TK_PER) {
++        block_topk_kernel<true><<<(unsigned)nq, TOPK_T, 0, (cudaStream_t)stream>>>(scores, steps, max_blocks, cap, ids);
++        block_topk_reg_kernel<TK_PER_MAX, true><<<(unsigned)nq, TK_T, 0, (cudaStream_t)stream>>>(scores, steps, max_blocks, cap, ids);
++        const cudaError_t e = cudaGetLastError();
++        if (e != cudaSuccess) { std::fprintf(stderr, "qsa_block_topk guarded: %s\n", cudaGetErrorString(e)); std::exit(1); }
++        return;
++    }
++#endif
+ #if !defined(__HIPCC__)
+     // Turing prefill (the `counted` bound) above ~90K cells (22,528 blocks): the wide kernel, which reads the keys
+     // coalesced, instead of the register kernel's uncoalesced per-thread runs (PR #743: 131K, 1.03 -> 0.75 ms); the
+diff --git a/src/kernels/mmvf_rows_parity.cpp b/src/kernels/mmvf_rows_parity.cpp
+index 189f561..3a8a4aa 100644
+--- a/src/kernels/mmvf_rows_parity.cpp
++++ b/src/kernels/mmvf_rows_parity.cpp
+@@ -16,12 +16,12 @@ static void ck(cudaError_t e) {
+ template<class T> static T* alloc(size_t n) {
+     T* p = nullptr; ck(cudaMalloc(&p, n * sizeof(T))); return p;
+ }
+-int main() {
++int main(int argc, char**) {
+     const char* flag = std::getenv("STRATA_MMVF_ROWS");
+     if (!flag || flag[0] != '1') { std::fprintf(stderr, "set STRATA_MMVF_ROWS=1\n"); return 2; }
+     cudaStream_t s; ck(cudaStreamCreate(&s));
+     const int shapes[][2] = {{64,64},{192,67},{512,65},{640,128},{2560,48},
+-                             {2560,128},{2560,512},{2560,2560},{10240,320}};
++                             {2560,128},{2560,512},{2560,2560},{2560,10240},{10240,320},{320,10240}};
+     size_t cases = 0, values = 0, mismatches = 0;
+     for (const auto& shape : shapes) for (int nt = 1; nt <= 8; ++nt)
+     for (int pad : {0,2}) for (int range : {0,1,2}) {
+@@ -61,6 +61,16 @@ int main() {
+             if (bad) std::printf("FAIL ni=%d no=%d nt=%d pad=%d range=%d different=%zu\n",ni,no,nt,pad,range,bad);
+         };
+         compare(ref,got,count);
++        if (argc > 1 && pad == 0 && range == 0 && nt >= 2 && no >= 64) {
++            cudaEvent_t a,b; ck(cudaEventCreate(&a)); ck(cudaEventCreate(&b));
++            for (int i=0;i<10;++i) ck(cudaGraphLaunch(exec,s));
++            ck(cudaEventRecord(a,s));
++            for (int i=0;i<100;++i) ck(cudaGraphLaunch(exec,s));
++            ck(cudaEventRecord(b,s)); ck(cudaEventSynchronize(b));
++            float ms=0; ck(cudaEventElapsedTime(&ms,a,b));
++            std::printf("BENCH ni=%d no=%d nt=%d us=%.6f\n",ni,no,nt,ms*10);
++            ck(cudaEventDestroy(a)); ck(cudaEventDestroy(b));
++        }
+         ck(cudaMemset(got,0xff,count*4));
+         const bool fused = k::bf16_gemv_fp32_mmvf_multi_aux(dx,ldx,dw,got,ldy,ni,no,nt,
+                                                           dw+(size_t)no*ni,aux,3,s);
+diff --git a/src/kernels/qsa_topk_parity.cpp b/src/kernels/qsa_topk_parity.cpp
+index d14af3e..b881219 100644
+--- a/src/kernels/qsa_topk_parity.cpp
++++ b/src/kernels/qsa_topk_parity.cpp
+@@ -20,6 +20,7 @@
+ #include <cstdlib>
+ #include <cstring>
+ #include <random>
++#include <limits>
+ #include <vector>
+ 
+ namespace k = strata::kernels;
+@@ -57,11 +58,11 @@ bool run_case(int64_t ctx, int64_t nq, int reps, int64_t capacity, bool counted)
+     float* d_scores = nullptr;
+     ck(cudaMalloc(&d_steps, steps.size() * 4), "malloc");
+     ck(cudaMalloc(&d_scores, scores.size() * 4), "malloc");
+-    ck(cudaMalloc(&ids_ref, (size_t) (nq * cap) * 4), "malloc");
+-    ck(cudaMalloc(&ids_new, (size_t) (nq * cap) * 4), "malloc");
++    ck(cudaMalloc(&ids_ref, ((size_t) (nq * cap) + 16) * 4), "malloc");
++    ck(cudaMalloc(&ids_new, ((size_t) (nq * cap) + 16) * 4), "malloc");
+     ck(cudaMemcpy(d_steps, steps.data(), steps.size() * 4, cudaMemcpyHostToDevice), "upload");
+     const int64_t active = counted ? steps[(size_t) ((nq - 1) * k::kStepCount + k::kStepNBid)] + 1 : -1;
+-    std::vector<int32_t> a((size_t) (nq * cap)), b(a.size());
++    std::vector<int32_t> a((size_t) (nq * cap) + 16), b(a.size());
+     auto same = [&](const std::vector<float>& sc) -> int64_t {
+         ck(cudaMemcpy(d_scores, sc.data(), sc.size() * 4, cudaMemcpyHostToDevice), "upload");
+         ck(cudaMemset(ids_ref, 0xff, a.size() * 4), "memset");
+@@ -76,8 +77,22 @@ bool run_case(int64_t ctx, int64_t nq, int reps, int64_t capacity, bool counted)
+             const int64_t w = steps[(size_t) (i * k::kStepCount + k::kStepWidth)];
+             n += std::equal(a.begin() + i * cap, a.begin() + i * cap + w, b.begin() + i * cap);
+         }
++        for(size_t j=(size_t)(nq*cap);j<a.size();++j)if(a[j]!=-1 || b[j]!=-1)return -1;
+         return n;
+     };
++
++    std::vector<float> adversarial=scores;
++    for(int64_t i=0;i<nq;++i) {
++        const int64_t nb=steps[(size_t)(i*k::kStepCount+k::kStepNBid)]+1;
++        for(int64_t j=0;j<max_blocks;++j) {
++            auto &v=adversarial[(size_t)(i*max_blocks+j)];
++            if(j>=nb) v=std::numeric_limits<float>::infinity();
++            else if(j%97==0) v=std::numeric_limits<float>::quiet_NaN();
++            else if(j%53==0) v=-0.0f;
++            else if(j%47==0) v=0.0f;
++        }
++    }
++    const int64_t same_special = same(adversarial);
+     const int64_t same_tied = same(tied), same_equal = same(equal), same_cont = same(scores);   // d_scores: continuous
+     cudaEvent_t e0, e1;
+     ck(cudaEventCreate(&e0), "event");
+@@ -93,15 +108,47 @@ bool run_case(int64_t ctx, int64_t nq, int reps, int64_t capacity, bool counted)
+     };
+     const float t_ref = timed([&] { k::qsa_block_topk_ref(d_scores, d_steps, nq, max_blocks, cap, s, ids_ref, nullptr); });
+     const float t_new = timed([&] { k::qsa_block_topk(d_scores, d_steps, nq, max_blocks, cap, s, ids_new, nullptr, active); });
++
++    const bool graph_ran=!counted && capacity==204800;
++    bool graph_ok=true;
++    if(graph_ran) {
++        cudaStream_t stream;ck(cudaStreamCreate(&stream),"stream");
++        cudaGraph_t graph;cudaGraphExec_t exec;
++        ck(cudaStreamBeginCapture(stream,cudaStreamCaptureModeGlobal),"capture");
++        k::qsa_block_topk(d_scores,d_steps,nq,max_blocks,cap,s,ids_new,stream,active);
++        ck(cudaStreamEndCapture(stream,&graph),"capture end");
++        ck(cudaGraphInstantiate(&exec,graph,nullptr,nullptr,0),"instantiate");
++        for(int64_t next_ctx: {4096ll,24577ll,65536ll,131072ll,200000ll,204800ll,4096ll}) {
++            for(int64_t i=0;i<nq;++i) {
++                int32_t* st=steps.data()+i*k::kStepCount;
++                int64_t pos=next_ctx-nq+i;
++                st[k::kStepPos]=(int32_t)pos;st[k::kStepNKv]=(int32_t)(pos+1);
++                st[k::kStepNBid]=(int32_t)((pos+1)/s.idx_block);
++                st[k::kStepWidth]=(int32_t)k::qsa_selection_width(pos+1,s);
++            }
++            ck(cudaMemcpy(d_steps,steps.data(),steps.size()*4,cudaMemcpyHostToDevice),"new steps");
++            ck(cudaMemset(ids_ref,0xff,a.size()*4),"reset ref");
++            ck(cudaMemset(ids_new,0xff,a.size()*4),"reset new");
++            k::qsa_block_topk_ref(d_scores,d_steps,nq,max_blocks,cap,s,ids_ref,stream);
++            ck(cudaGraphLaunch(exec,stream),"replay");ck(cudaStreamSynchronize(stream),"replay sync");
++            ck(cudaMemcpy(a.data(),ids_ref,a.size()*4,cudaMemcpyDeviceToHost),"read ref");
++            ck(cudaMemcpy(b.data(),ids_new,b.size()*4,cudaMemcpyDeviceToHost),"read new");
++            graph_ok=graph_ok && a==b;
++            for(size_t j=(size_t)(nq*cap);j<a.size();++j)graph_ok=graph_ok && a[j]==-1 && b[j]==-1;
++        }
++        ck(cudaGraphExecDestroy(exec),"exec destroy");ck(cudaGraphDestroy(graph),"graph destroy");
++        ck(cudaStreamDestroy(stream),"stream destroy");
++    }
+     cudaEventDestroy(e0); cudaEventDestroy(e1);
+     cudaFree(d_steps); cudaFree(d_scores); cudaFree(ids_ref); cudaFree(ids_new);
+-    const bool ok = same_cont == nq && same_tied == nq && same_equal == nq;
++    const bool ok = same_cont == nq && same_tied == nq && same_equal == nq && same_special == nq && graph_ok;
+     std::printf("%s context %lld under a capacity of %lld (%lld blocks), %lld queries %s: reference %.3f ms, "
+                 "dispatched %.3f ms (%.1fx); identical ids: continuous %lld/%lld, 64 levels %lld/%lld, equal scores "
+                 "%lld/%lld\n", ok ? "PASS" : "FAIL", (long long) ctx, (long long) capacity, (long long) max_blocks,
+                 (long long) nq, counted ? "with their block count" : "without a block count", t_ref, t_new, t_ref / t_new,
+                 (long long) same_cont, (long long) nq, (long long) same_tied,
+                 (long long) nq, (long long) same_equal, (long long) nq);
++    std::printf("adversarial=%lld/%lld changed-step-graph=%s\n",(long long)same_special,(long long)nq,graph_ran?(graph_ok?"PASS":"FAIL"):"SKIP");
+     return ok;
+ }
+ }  // namespace
+diff --git a/src/prefill/moe_mmq.cu b/src/prefill/moe_mmq.cu
+index b0446f8..84af865 100644
+--- a/src/prefill/moe_mmq.cu
++++ b/src/prefill/moe_mmq.cu
+@@ -182,6 +182,19 @@ void quantize(const float* x, const int32_t* ids, void* xq, int t, int64_t cols,
+     ck(cudaGetLastError(), "quantize");
+ }
+ 
++void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, void* xq, int t, int64_t cols, int64_t ld,
++                      int64_t tokens, int k_used, void* stream) {
++    if (tokens <= 0 || k_used <= 0) return;
++    static const bool gather = [] { const char* e = std::getenv("STRATA_QUANT_GATHER"); return e != nullptr && std::atoi(e) != 0; }();
++    if (gather) {
++        quantize(x, src, xq, t, cols, ld, tokens * k_used, stream);
++        return;
++    }
++    quantize_scatter_mmq_q8_1_cuda(x, slot, xq, (ggml_type) t, cols, ld, pad512(cols), tokens, tokens * k_used, k_used,
++                                   (cudaStream_t) stream);
++    ck(cudaGetLastError(), "quantize_scatter");
++}
++
+ Context::Context() {
+     int dev = 0;
+     cudaGetDevice(&dev);
+diff --git a/src/prefill/prefill.cpp b/src/prefill/prefill.cpp
+index 7b53ac9..f2da2a5 100644
+--- a/src/prefill/prefill.cpp
++++ b/src/prefill/prefill.cpp
+@@ -56,6 +56,7 @@ bool fits(int, int64_t) { return false; }
+ size_t matrix_bytes(int, int64_t, int64_t) { return 0; }
+ size_t q8_bytes(int64_t, int64_t) { return 0; }
+ void quantize(const float*, const int32_t*, void*, int, int64_t, int64_t, int64_t, void*) {}
++void quantize_scatter(const float*, const int32_t*, const int32_t*, void*, int, int64_t, int64_t, int64_t, int, void*) {}
+ Context::Context() {}
+ Context::~Context() {}
+ void Context::run(const Product&, void*) {}
+@@ -2670,8 +2671,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
+                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
+                         pt.mark(kPfGather, cs);
+                         if (use_mmq) {
+-                            // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`
+-                            mmq::quantize(m.mixed, m.src_dev, m.Xq, mmq_gt, N, N, T * K, m.cs);
++                            // step 2b: the layer's activations as q8_1 rows in expert order, straight from `mixed`:
++                            // each token quantized once and written to its K rows (slot_dev, the inverse of src_dev)
++                            mmq::quantize_scatter(m.mixed, m.slot_dev, m.src_dev, m.Xq, mmq_gt, N, N, T, (int) K, m.cs);
+                             // each group's rows: absolute bounds (gate/up reads the layer's rows), relative ones (down
+                             // reads the group's own quantized H)
+                             const size_t n = order.size(), ng = (n + MMQ_GROUP - 1) / MMQ_GROUP;

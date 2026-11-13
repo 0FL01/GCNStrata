@@ -1,0 +1,11 @@
+{
+  "scope": "controller-only source review, no compilation or GPU execution",
+  "patch_sha256": "0ac3ddb0c400c4b4bf97c14a52c8fe2c7e0dd5903c2a7c02f5dd0f378fcccb36",
+  "patched_verify_sha256": "1f1d113a8e60730b2e0c6303eb290bcba5c766e42f4d7168427ad9982b62dbd5",
+  "verdict": "no blocking source defect under fresh exclusively owned private-directory assumption",
+  "unchanged_abi": "verify.hpp, Verifier layout, kernel signatures and QSDUMP01 unchanged",
+  "stream_rule": "after existing successful cs completion and checked copy completion, before next stage; existing HIP status API must return None on all relevant streams",
+  "capture_state": "process-local atomic states indexed by device 0 and 1; success once, failed attempts not retried",
+  "private_file_rule": "held validated directory fd, openat exclusive 0600, fstatat inode-checked incomplete unlinkat, fresh directory must not be concurrently mutated by same-UID actors",
+  "remaining_checks": ["root C++ compilation", "root runtime access for explicit UID/GID", "native c183 versus diagnostic output and counter parity", "actual paired 200K fixtures", "CPU and direct/graph replay parity on actual fixture", "separate WIDE51 parity and performance qualification"]
+}

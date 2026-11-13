@@ -1,0 +1,43 @@
+{
+  "status": "PASS_SOURCE_AND_CONTROLLER_CPU_TESTS_ONLY",
+  "created_utc": "2026-10-09T21:01:13.290131+00:00",
+  "package": "/home/opencode/ai/c183-hc-exhaustive-parity-20261009",
+  "reviewed_hashes": {
+    "exhaustive.cpp": "4146210f92c99d32249d7df2fd55d82671cfc2b04c5c67de0eed1f24f8b8f8f8",
+    "core.hpp": "b9c3c717782af3c71b3091eb1b6bc2131b07a5a1c267672e158e7702fc9a4cff",
+    "recheck.py": "e1c1517a23675b845f611496c6cd857ba7543583d890b45ece7dd7ef0ec8a94e",
+    "run_exhaustive.py": "999dbab5cf21334b06c6eeba4b1ba95bf50deccaa9a3a4dda15e146326de4f1a",
+    "watchdog.hpp": "e828ab87c860f657646334ebe494851151f2d6cd2ac0861d6019ed0358fb2d49",
+    "hip_log.hpp": "73a621bc17b0781b73b9690f1261494b47c5420bccca3e146823928141a7c7b8",
+    "test_core.cpp": "a9d6f2c29763ef38c3d0e762fa8fcf536918af2f593159fb18be0f5ead17ecc5",
+    "test_exhaustive.py": "ca54214661e2e526e441b8c85e385c459dabeb17299f4178a95d811e456ac8e9",
+    "baseline.elf": "5abe1289b549a9fa4ad7da00398fd81179a6d3b414bd2b3c44b749d5e315f377",
+    "candidate.elf": "3f0c5ecb285232b1e338bf0aa51ebe729eefaa547388c14ebbd488167105ecf9",
+    "native_support.py": "850a18e95a5a2e13013f778ecb7b807809def5e62154fe9ff91acfe63b8f05bf",
+    "qsa_probe_safety.py": "749392111a9646aa7b7c03ae0cea8c30253922c23d9e9330ad7415222e929e45"
+  },
+  "cpu_tests": {
+    "passed": 6,
+    "failed": 0,
+    "independently_rerun": true,
+    "stderr_sha256": "f48eeb2da2d4107fb070e0e867e99e9b1ac961e625f52936d9ce6ad03adaa184"
+  },
+  "checks": {
+    "argument_packing": "Baseline pointer-to-argument list has input uint16*, output uint16*, int64 n, uint32* stats, float scale; candidate has exactly first four. Args remains live across synchronous host module-launch submission.",
+    "coverage": "For each scale4096/512: 256 batches of256 scalar pairs cover BF16 0..65535 exactly once; 18 mixed pairs at n0,1,63,64,65,255,256,257,448 and offsets0/5. Total548batches,131108pairs,262216launches (262144scalar+72mixed).",
+    "independence": "Each arm/pattern owns disjoint n+2 halfword input/output record and23-word stats record. Every batch resets buffers.16stats words start at1+offset; offset5 ends before guard22. Maximum buffer allocations cover every prescribed record.",
+    "parity": "All inputs unchanged; exterior input/output/stats canaries; every halfword and all16stats words compared baseline/candidate. Active stats flags1..3 limited0/1; other words zero. n0 still one block, output guards and allstats unchanged.",
+    "raw_evidence": "Initial snapshot precedes upload; staged copies saved before native parity comparison. Failure preserves already-flushed stages, stdout, stderr, exit, error, hashes and cleanup. Partial stages do not prove complete readback.",
+    "parser": "Independent binary header/size/input/guard/parity validation and exact batch coverage; initial sentinel/zero validation; duplicate JSON keys and non-integer/nonzero HIP rc rejected.",
+    "watchdog": "Native SIGALRM default action + alarm300 starts at main entry; independent one-second CPU termination test passes. Wrapper also polls deadline, rejects elapsed>=300 after exit, and cleans owned container. SIGALRM may truncate current raw stage; cannot PASS. OS/driver teardown remains separately bounded cleanup, not a hard hardware preemption guarantee.",
+    "safety": "Exact ELFs/resource proof/image/helper hashes checked; GPU0 physical PCI gate; high mode190W/cooldown/thermal checks; exclusive lock; all containers/API off; cancellation; no retries; API left stopped. Review performed only on controller; no HIP driver build or GPU execution."
+  },
+  "blockers": [],
+  "not_established": [
+    "HIP driver compilation",
+    "Actual GPU exhaustive parity",
+    "Full model correctness",
+    "Performance or speedup"
+  ],
+  "original_tiny_failure": "Original wrapper JSON failure unchanged; recovered tiny computational parity remains separate."
+}

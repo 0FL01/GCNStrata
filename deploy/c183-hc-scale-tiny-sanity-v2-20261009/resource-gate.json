@@ -1,0 +1,93 @@
+{
+  "created_utc": "2026-10-09T20:45:13.419025+00:00",
+  "gate": "PASS_RESOURCE_AND_STATIC_ISA_ONLY",
+  "gpu_parity": "UNRUN",
+  "speed_claim": null,
+  "controller_only": true,
+  "gpu_access": false,
+  "new_compile": false,
+  "method": "Read ELF64 section headers and decode raw AMDGPU MessagePack note with Python stdlib; compare every disassembly word against little-endian ELF text bytes; verify elected-lane atomic instruction windows. No LLVM tool invocation or GPU use.",
+  "candidate_elf": "/home/opencode/ai/c183-hc-scale-resource-receipts-20261009/hc-scale-specialization-resource-inspected/hc_fixed_scale.gfx906.elf",
+  "candidate_sha256": "3f0c5ecb285232b1e338bf0aa51ebe729eefaa547388c14ebbd488167105ecf9",
+  "candidate_bytes": 6600,
+  "target": "amdgcn-amd-amdhsa--gfx906",
+  "opcode_words_verified": 219,
+  "entire_text_bytes_covered": 876,
+  "baseline_sha256": "5abe1289b549a9fa4ad7da00398fd81179a6d3b414bd2b3c44b749d5e315f377",
+  "baseline_opcode_words_verified": 107,
+  "baseline_kernel": "_ZN6strata7prefill12_GLOBAL__N_120hc_plain_bf16_to_f16ILb0ELb1ELb1EEEvPKtP6__halflPjf",
+  "baseline_resource_metadata": {
+    ".vgpr_count": 7,
+    ".sgpr_count": 20,
+    ".group_segment_fixed_size": 0,
+    ".private_segment_fixed_size": 0,
+    ".vgpr_spill_count": 0,
+    ".sgpr_spill_count": 0,
+    ".wavefront_size": 64,
+    ".uses_dynamic_stack": false
+  },
+  "limits": {
+    "VGPR": 7,
+    "SGPR": 20,
+    "LDS": 0,
+    "scratch": 0,
+    "spills": 0,
+    "wave": 64
+  },
+  "kernels": [
+    {
+      "name": "hc_exact_scale4096",
+      "resource_metadata": {
+        ".vgpr_count": 5,
+        ".sgpr_count": 20,
+        ".group_segment_fixed_size": 0,
+        ".private_segment_fixed_size": 0,
+        ".vgpr_spill_count": 0,
+        ".sgpr_spill_count": 0,
+        ".wavefront_size": 64,
+        ".uses_dynamic_stack": false
+      },
+      "resource_gate": "PASS",
+      "generic_divide_absent": true,
+      "elected_active_lane_atomic_sites": [
+        "global_atomic_or v3, v4, s[14:15] offset:4                 // 000000001FC4: DD248004 000E0403",
+        "global_atomic_or v2, v3, s[14:15] offset:8                 // 000000002018: DD248008 000E0302",
+        "global_atomic_or v0, v1, s[14:15] offset:12                // 000000002064: DD24800C 000E0100"
+      ],
+      "forward_opcode": "v_fma_mixlo_f16",
+      "backward_opcode": "v_fma_mix_f32, neg(0), op_sel_hi:[1,0,0]"
+    },
+    {
+      "name": "hc_exact_scale512",
+      "resource_metadata": {
+        ".vgpr_count": 5,
+        ".sgpr_count": 20,
+        ".group_segment_fixed_size": 0,
+        ".private_segment_fixed_size": 0,
+        ".vgpr_spill_count": 0,
+        ".sgpr_spill_count": 0,
+        ".wavefront_size": 64,
+        ".uses_dynamic_stack": false
+      },
+      "resource_gate": "PASS",
+      "generic_divide_absent": true,
+      "elected_active_lane_atomic_sites": [
+        "global_atomic_or v3, v4, s[14:15] offset:4                 // 0000000021C0: DD248004 000E0403",
+        "global_atomic_or v2, v3, s[14:15] offset:8                 // 000000002214: DD248008 000E0302",
+        "global_atomic_or v0, v1, s[14:15] offset:12                // 000000002260: DD24800C 000E0100"
+      ],
+      "forward_opcode": "v_fma_mixlo_f16",
+      "backward_opcode": "v_fma_mix_f32, neg(0), op_sel_hi:[1,0,0]"
+    }
+  ],
+  "remaining_gates": [
+    "Actual gfx906 n=1 parity for signed zero, infinities and NaN payload/signaling cases.",
+    "Forward fma_mixlo_f16 signed-zero/NaN semantics and changed backward fma_mix_f32 neg(0) must not be inferred from CPU proof."
+  ],
+  "input_hashes": {
+    "/home/opencode/ai/c183-hc-scale-resource-receipts-20261009/hc-scale-specialization-resource-inspected/hc_fixed_scale.gfx906.elf": "3f0c5ecb285232b1e338bf0aa51ebe729eefaa547388c14ebbd488167105ecf9",
+    "/home/opencode/ai/c183-hc-scale-resource-receipts-20261009/hc-scale-specialization-resource-inspected/candidate.notes": "19ba230dc515e6a03421b59dfe56fd1026813b0cc3a4957de76623a63ab8b4db",
+    "/home/opencode/ai/c183-hc-scale-resource-receipts-20261009/hc-scale-specialization-resource-inspected/candidate.disasm": "748e9e9dcb414aab3e7a3b0456581526da89c57e491ca9986b723cddf92b5bbb",
+    "/home/opencode/ai/c183-hc-scale-resource-receipts-20261009/hc-scale-specialization-resource/build-receipt.json": "7087e8a8050196fcfab5975c9f43a5ee6a2c640c9bcfb88b3763b4b23537ac53"
+  }
+}

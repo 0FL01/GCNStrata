@@ -1,0 +1,23 @@
+{
+  "passed": true,
+  "health": {
+    "status": "ok",
+    "max_context": 262144,
+    "model": "Qwen3.8-Flash-Next-Unsloth-UD-Q2_0-Q8-PLE",
+    "images": true,
+    "api_key": true,
+    "loaded": true,
+    "service": "strata"
+  },
+  "container_id": "8f93042541acc73709da26846ae8842972bea59c343822e85623e32fbe096e0b",
+  "image": "sha256:bccb7ee7e7a78274519db9a43ba63c34ddd2e74bb60f8764a8f50aaee1f2c646",
+  "config": "/src/configs/unsloth-q2-20261110.json",
+  "docker_health": "healthy",
+  "busy": false,
+  "queued": 0,
+  "text_reply": "FIFO (First-In, First-Out) — это принцип работы структуры данных, при котором элементы обрабатываются в том же порядке, в котором они были добавлены.",
+  "vision_reply": "The image features a solid red square centered on a solid blue background.",
+  "rollback_compose": "/home/radneon/strata/deploy/unsloth-q2-rollout-20261110/compose.before.yaml",
+  "mtp": "existing Strata Q2_0 experts/Q8_0 projections",
+  "vision_device": "CPU"
+}

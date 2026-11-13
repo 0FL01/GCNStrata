@@ -1,0 +1,9 @@
+test_actual_old_real_and_new_trace_examples (__main__.Parsers.test_actual_old_real_and_new_trace_examples) ... ok
+test_actual_old_transitions_and_synthetic_fit17 (__main__.Parsers.test_actual_old_transitions_and_synthetic_fit17) ... ok
+test_mocked_offline_order_and_negative_continuation (__main__.Parsers.test_mocked_offline_order_and_negative_continuation) ... ok
+test_scoring_negative_does_not_raise (__main__.Parsers.test_scoring_negative_does_not_raise) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.011s
+
+OK

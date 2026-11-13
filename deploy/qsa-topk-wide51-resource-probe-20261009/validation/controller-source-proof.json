@@ -1,0 +1,68 @@
+{
+  "passed": true,
+  "gpu_executed": false,
+  "source_only": true,
+  "dispatch_cases": 906,
+  "guard_cases": 56,
+  "static_assert_matrix": [
+    {
+      "per": 17,
+      "long_only": true,
+      "window_guard": 1,
+      "accepted": true
+    },
+    {
+      "per": 51,
+      "long_only": true,
+      "window_guard": 2,
+      "accepted": true
+    },
+    {
+      "per": 66,
+      "long_only": true,
+      "window_guard": 2,
+      "accepted": true
+    },
+    {
+      "per": 51,
+      "long_only": false,
+      "window_guard": 2,
+      "accepted": false
+    },
+    {
+      "per": 51,
+      "long_only": true,
+      "window_guard": 1,
+      "accepted": false
+    },
+    {
+      "per": 17,
+      "long_only": true,
+      "window_guard": 2,
+      "accepted": false
+    },
+    {
+      "per": 51,
+      "long_only": true,
+      "window_guard": 3,
+      "accepted": false
+    },
+    {
+      "per": 50,
+      "long_only": true,
+      "window_guard": 2,
+      "accepted": false
+    }
+  ],
+  "all_other_source_bytes_preserved": true,
+  "launch_count_preserved": true,
+  "capacity_contract": "Every valid n_bid + 1 <= immutable max_blocks; unknown invalid rows are not supported.",
+  "base_sha256": "5fc5d78c6155fa0987dee751a875ab714516c88209b0938db17699061cc7de1a",
+  "candidate_sha256": "98f30cd9fb2fd80619a8caf70c6c1d74bb5c7c14d50ca312b36158cd9518ae08",
+  "patch_sha256": "5e76afb859a5612bb0e99ac7646707a516906a998196b133c1681cf48533d28a",
+  "limitations": [
+    "CPU dispatch uses extracted host function with launch recording; no GPU semantic or performance claim.",
+    "Existing FIT17 trace text remains byte-identical and does not identify WIDE51.",
+    "The 64K fixture exercises reg17 and cannot qualify wide51 performance."
+  ]
+}

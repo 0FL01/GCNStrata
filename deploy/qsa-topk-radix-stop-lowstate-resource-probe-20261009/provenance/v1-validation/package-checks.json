@@ -1,0 +1,25 @@
+{
+  "passed": true,
+  "gpu_executed": false,
+  "candidate_changed": false,
+  "pinned_inputs": {
+    "qsa_select.fit17.cu": "5fc5d78c6155fa0987dee751a875ab714516c88209b0938db17699061cc7de1a",
+    "qsa_select.radix-stop.cu": "587c02f9a76916605be595bbf8cdf4ce72ac04edbade4c80686772e72903064c",
+    "qsa_select.radix-stop.cu.patch": "694531ccfcfe3da6017540af121bb774bdf0d0896b0112a6e4dcd67a0491d38b",
+    "provenance/cpu-source-proof.json": "1df9a9cdf2133d90880027b9f5f7352549a7834e5daa2284185e4a858c4f683c",
+    "provenance/cpu-dispatch-proof.json": "ce9023f7c3b69f362eaa11db717cc2509b86ab3d7a63fab5113054843b1eef53"
+  },
+  "headers": {
+    "include/strata/core/emulate.hpp": "eb3df4efe89642f069420e0f68ec526b33d4cc66f9a6b26de0583492b5758a77",
+    "include/strata/kernels/gfx_arch.hpp": "ef3e926c0b0e6efa8d17e87e2ccec573e85c63feba30acd3db137b108ef9609d",
+    "include/strata/kernels/qsa.hpp": "87c02222284f842fcecb46a422b119af769c72c3914edc8da5b2ee782456dc74",
+    "include/strata/kernels/qsa_select.hpp": "152dfce28a1f517169542590b32b7bb0b72442cf833446d1beb91cb104922250",
+    "include/strata/platform/hip_compat/cuda_runtime.h": "d054d07dc83186ca4d85491d2a869629add900a7608e56daac5b443a78c418de",
+    "include/strata/platform/hip_compat/strata_hip.h": "e8942b1011979dfd760ea8ca7c7bf11c5767ae3f084299e41f47a83ca6e748b0"
+  },
+  "host_wrapper_byte_identical": true,
+  "compiler_common_flags_byte_identical": true,
+  "no_gpu_mounts": true,
+  "network_none": true,
+  "engineering_lock_unchanged": true
+}

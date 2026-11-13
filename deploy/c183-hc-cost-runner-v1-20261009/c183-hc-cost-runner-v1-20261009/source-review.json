@@ -1,0 +1,56 @@
+{
+  "status": "PASS_COST_OBSERVER_SOURCE_AND_CPU_REVIEW",
+  "passed": true,
+  "source_and_cpu_review_passed": true,
+  "build_provenance_and_device_gate_passed": false,
+  "created_utc": "2026-10-09T23:22:27.956335+00:00",
+  "package": "/home/opencode/ai/c183-hc-cost-observer-20261009",
+  "reviewed_hashes": {
+    "README.md": "495bc69d7f0726813a1f05bab97d30015e2d21a5e2b2a15d3ae30b85c0505d20",
+    "prepare.py": "690a92e8bd3e6e0ce257a40c75ab06e8781c7561aed05d423a64da233ad98a09",
+    "parse_counts.py": "52fa60ed25144a42bb5dcdf588653ceb4518243baa7bad3bafcb634bbf800e2e",
+    "parse_cost.py": "c6fd210519cfaef5be3aa999fdb2eda01f6486f890c5f4f1e3129950b75d14c3",
+    "test_counts.py": "74b68edc7b5820a5ca15e2b754ee0909940134f7e8592ca1645b9ee8968357e3",
+    "test_observer.cpp": "9b061da6f046c1f2485ca579706606b6041166950b87e706a8efff00e261d779",
+    "hc_counts_observer.hpp": "2f545bdcda97cc9511ee71c0996b63855c1394d0f3c0e84525665f6f3c00f1d0",
+    "observer.patch": "d466cc423a68f8137e158291e5ab95f9c111b35ce2579aa7d77031047639fa78",
+    "source-proof.json": "6bfa7af01e60f46a7d40a62c688efbfcf7a1b4c6fc033a6e5e269f5cef100fa1",
+    "probe-plan.json": "87f5ca919a1173bbe9d5da6e574cce30cb9a1b6c5a5dc426abb2291eb526fb69",
+    "prompt-12288.ids.json": "83728e3e3379af3e87a5e10ce39464149f1d3dfe0fbfcb4d894c4059a8d5e5ed",
+    "patched/src/prefill/gemm.cu": "597c3f8dbc618f2c273e5602907a6a7c073710c17ab97de12d2160acab9e35cc",
+    "patched/src/prefill/prefill.cpp": "3deaf1b496010712b00ac58349cbb487c18fb1341010ebd378e95de08bc10b91",
+    "patched/include/strata/prefill/hc_counts_observer.hpp": "2f545bdcda97cc9511ee71c0996b63855c1394d0f3c0e84525665f6f3c00f1d0"
+  },
+  "tests": {
+    "independently_rerun": 10,
+    "passed": true,
+    "isolated_copy": true,
+    "stderr_sha256": "1193b2fd766eda04dd5c71380c1842506f6b85f06387ea20391adadcfd80f176"
+  },
+  "independent_checks": {
+    "gemm.cu_gpu_api_occurrences_unchanged": 70,
+    "prefill.cpp_gpu_api_occurrences_unchanged": 239,
+    "baseline20_ordinals_independently_matched": true,
+    "base_parser_bytes_unchanged": true,
+    "clock_read_count": 2,
+    "clock_placement": true,
+    "first_hit_exclusion": true,
+    "exact_threshold_minus_equal_plus": true
+  },
+  "scope": "Source and ordinary controller CPU fixture review only. No HIP/device/model compilation, MI50 access or model execution.",
+  "semantics": [
+    "Exactly two steady-clock reads before existing reset and after existing sync, second read before observer lock.",
+    "All original GPU API occurrences, 9 device bodies and kernel launch lines unchanged.",
+    "Counts parser byte-identical; nested cost parser additionally requires complete576 raw observations, exact20 baseline W-bad ordinals and mask4, stable visible lifetime.",
+    "Negative signed ns retained with invalid context; overflow explicit. Parser rejects malformed observer diagnostics and exact schema/type/range/order failures without rewriting raw.",
+    "Per-stage screen14*full_repeat+tail, first-hit excluded; exact threshold1003739604ns; below park, equality/above investigation only.",
+    "Stage sum deliberately overlap-double-counting; includes queued predecessor work; no removable-time, model-bound or gain claim."
+  ],
+  "required_next": [
+    "Review cost build/runner package source and tests.",
+    "Actual exact-provenance separate build and all55 complete device payload equality.",
+    "New actual hash-bound independent runtime admission receipt.",
+    "One fresh-binary-keyed12K/1token cold probe only after root authorization; no retry or marker deletion."
+  ],
+  "blockers_to_source_review": []
+}

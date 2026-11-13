@@ -1,0 +1,5 @@
+{
+  "platform_shim": true,
+  "half_wave_ballot": true,
+  "ballot_macro": "#define __ballot_sync(mask,pred) strata_ballot32(pred)"
+}

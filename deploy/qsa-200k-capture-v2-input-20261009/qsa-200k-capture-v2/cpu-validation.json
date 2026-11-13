@@ -1,0 +1,12 @@
+{
+  "passed": true,
+  "python_tests": 39,
+  "patch_roundtrip": "unchanged from v1 pass",
+  "default_build_cli_offline": true,
+  "default_runner_cli_offline": true,
+  "cpp_compiled": false,
+  "gpu_executed": false,
+  "mi50_accessed_by_preparer": false,
+  "package_sha256": "0c9fd8de4db8cd9153474c470197af1c1e3250390290239c5697565fbc8e5614",
+  "test_log_sha256": "feeb0661e030b27792a882df604e6ea658b579ca0ccf91226ac5d840f2d090f6"
+}

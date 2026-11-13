@@ -1,0 +1,23 @@
+diff --git a/serve/server.py b/serve/server.py
+index 9e66982..002c67e 100644
+--- a/serve/server.py
++++ b/serve/server.py
+@@ -1946,6 +1946,8 @@ class Service:
+ 
+     def start_telemetry(self):
+         """The hardware sampler behind GET /metrics (serve/telemetry.py), recording this server's tok/s too."""
++        if os.environ.get("STRATA_DISABLE_TELEMETRY") == "1":
++            return
+         if getattr(self, "telemetry", None) is None:
+             from serve.telemetry import Telemetry
+             self.telemetry = Telemetry(extra=lambda: {"tok_s": self._tok_s(), "tok_s_mean": self._tok_s_mean(),
+@@ -2960,6 +2962,9 @@ def make_handler(svc: Service):
+ 
+         def do_GET(self):
+             path = self.path.split("?")[0].rstrip("/")
++            if os.environ.get("STRATA_API_ONLY") == "1" and (path in ("", "/api-monitor") or path.startswith(("/web/", "/fonts/"))):
++                self._json(404, {"error": {"message": "API-only deployment"}})
++                return
+             if path.startswith("/fonts/"):
+                 # the web app's font (Outfit, OFL: serve/web/fonts); the page falls back to the system font
+                 name = path[len("/fonts/"):]

@@ -1,0 +1,15 @@
+{
+  "binary_sha256": "c18316d678a669c309cb95e2f5de9af03fa5573256fd0e093aafc4b41000d049",
+  "source_sha256": "6f73546e4b654a9cc81f4b333a09530c7425e13f6ce33ac16ecb88a05b07fabd",
+  "object_sha256": "9b0d9fb8cf20c97bb81e43b363e6a6b68d32af0d36234b90ed058ad4433ad048",
+  "device_elf_sha256": "5abe1289b549a9fa4ad7da00398fd81179a6d3b414bd2b3c44b749d5e315f377",
+  "binary_elf_offset": 819200,
+  "binary_elf_occurrences": 1,
+  "kernel": "_ZN6strata7prefill12_GLOBAL__N_120hc_plain_bf16_to_f16ILb0ELb1ELb1EEEvPKtP6__halflPjf",
+  "function_bytes": 428,
+  "complete_opcode_match": true,
+  "body_sha256": "f2387ce571db27651b55936cbc61ab83b1c84af1878bb034fac4403536860fb4",
+  "archive_sha256": "56f94c06db6f505212fb74a5057e9fed77a651ae7279b810c18a90da3c2375ef",
+  "archive_member": "gemm.cu.o",
+  "archive_member_sha256": "9b0d9fb8cf20c97bb81e43b363e6a6b68d32af0d36234b90ed058ad4433ad048"
+}

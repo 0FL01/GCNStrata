@@ -1,0 +1,14 @@
+{
+  "scope": "source review only; no HIP compile or GPU execution",
+  "driver": "host-only HIP module API loads unchanged ELF; separate 5-arg baseline and 4-arg candidate arrays; n=int64(1), grid=1, block=256; 7 exact BF16 patterns x 2 scales, maximum 28 launches, success exactly 14 pairs",
+  "comparisons": "every input word, output half bits and both output guards, all 16 stats words and two exterior stats guards; expected input and guard values checked",
+  "failure_evidence": "raw values flushed after each successful readback before parity check; each HIP call return code flushed; process exit code, stderr and raw hashes persisted on failure",
+  "safety": "same unchanged helper bytes; nonblocking shared flock, both GPUs high/190W checks, <=55C cooldown and critical-10 thermal margins, unique owned container cleanup, API off, GPU0 only, 60s subprocess bound, no power writes/network/model",
+  "tests": "4 CPU-only tests; imports of unchanged helpers and mocked process/safety functions do not launch GPU or Docker",
+  "limitation": "root host compilation is pending; HIP ABI and actual GPU parity unestablished",
+  "v2_hardening": [
+    "exact PCI 0000:05:00.0 assertion before module loads",
+    "per-loop docker ps timeout=2 seconds",
+    "resource gate exact SHA plus overall and both-kernel PASS checks"
+  ]
+}

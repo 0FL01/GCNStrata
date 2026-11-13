@@ -1,0 +1,46 @@
+{
+  "passed": true,
+  "scope": "source and controller CPU only",
+  "created_utc": "2026-10-09T18:49:44.353304+00:00",
+  "no_candidate_edit": true,
+  "source_transform_matches_public_and_private": true,
+  "new_exact_id_cases": 361968,
+  "new_raw_float_cases": 1000014,
+  "sanitized_repeat": {
+    "address_sanitizer": true,
+    "undefined_behavior_sanitizer": true,
+    "exit_code": 0,
+    "cases": 361968,
+    "raw_float_key_cases": 1000014
+  },
+  "host_dispatch_cases": 282,
+  "supplemental_host_dispatch_cases": 108,
+  "device_guard_cpu_cases": 152,
+  "negative_template_cases": 6,
+  "existing_capture_rows": 16,
+  "capture_early_stop_rows": 13,
+  "gpu_executed": false,
+  "device_compiled": false,
+  "performance_qualified": false,
+  "publication_performed": false,
+  "inputs": {
+    "qsa_select.fit17.cu": "5fc5d78c6155fa0987dee751a875ab714516c88209b0938db17699061cc7de1a",
+    "qsa_select.radix-stop.cu": "587c02f9a76916605be595bbf8cdf4ce72ac04edbade4c80686772e72903064c",
+    "qsa_select.radix-stop.production.cu": "0ba4909d7c3661e16f8003d70ce9a4045bc5f05dcce1ae5897d1a0fd2d742946",
+    "qsa_select.radix-stop.cu.patch": "694531ccfcfe3da6017540af121bb774bdf0d0896b0112a6e4dcd67a0491d38b",
+    "cpu-source-proof.json": "1df9a9cdf2133d90880027b9f5f7352549a7834e5daa2284185e4a858c4f683c",
+    "cpu-dispatch-proof.json": "ce9023f7c3b69f362eaa11db717cc2509b86ab3d7a63fab5113054843b1eef53",
+    "extracted-cpu.cpp": "100aef42da26f00efaf59352e35ff3b48c742bbfd1298139c458dfff5f11aa5e"
+  },
+  "evidence": {
+    "independent-source-review.json": "21045b86c46c1bbce86dcaf08be9e6eaa8daa446cb717fa00ace86f7c499063b",
+    "independent-dispatch-edges.json": "4b107d5474ad6e05f706840ef9861c94655e3cc9b7835565000e59b85d5d502a",
+    "independent-cpu-sanitized-test.log": "2da9f96119ee69962f51a1b7181f9a8f42847c7b7000508e9b249e7cca5acbef",
+    "independent-cpu-sanitized-build.log": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "independent-cpu-sanitized": "8d2a943f7b071c02cacfb7d14754a5aafd5cd7509e82f5b21a8b75c7f7a24f5e",
+    "review_radix_stop_cpu.py": "2774540c86edf1d41bb56e90ac9c96924aa9a6ee6c9532e414caf77e8a429d37",
+    "review_dispatch_edges.py": "9b40d56552cae20c35b053484b41d44db7783c4243fb49d6b3f9f43f1b0ee4ae",
+    "cpu-source-proof.json": "1df9a9cdf2133d90880027b9f5f7352549a7834e5daa2284185e4a858c4f683c",
+    "cpu-dispatch-proof.json": "ce9023f7c3b69f362eaa11db717cc2509b86ab3d7a63fab5113054843b1eef53"
+  }
+}

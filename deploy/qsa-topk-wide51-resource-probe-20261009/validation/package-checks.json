@@ -1,0 +1,14 @@
+{
+  "passed": true,
+  "build_not_executed": true,
+  "gpu_executed": false,
+  "common_flags_exact_match": true,
+  "python_syntax": true,
+  "known_good_text_receipt_parser_counts": {
+    "metadata": 13,
+    "remarks": 13,
+    "disassembly": 13
+  },
+  "elf_fixture_hash_and_truncation_checks": true,
+  "existing_baseline_source_unchanged": true
+}

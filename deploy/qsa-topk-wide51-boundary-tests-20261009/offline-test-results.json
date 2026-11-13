@@ -1,0 +1,12 @@
+{
+  "cpu_tests_passed": 8,
+  "gpu_executed": false,
+  "gpu_binary_built": false,
+  "timing_claim": false,
+  "verification": "CPU/source/fixture validation only; adapted HIP driver compile and GPU checks are NOT_RUN",
+  "fixture_count": 15,
+  "cases_checked": 426,
+  "rows_checked": 2496,
+  "unique_rows_weighted_radix_checked": 231,
+  "future_process_count": 21
+}

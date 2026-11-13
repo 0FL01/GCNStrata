@@ -1,0 +1,3045 @@
+{
+  "format": "QSTRAN01",
+  "gpu_executed": false,
+  "timing_claim": false,
+  "oracle": "integer IEEE keys + ascending tie IDs; checked against weighted radix parser",
+  "fixtures": [
+    {
+      "file": "reg33-transition-t1.bin",
+      "sha256": "dc0134440252cdf94eb322e2e704eedf3bbbf48146462aba0ac6f23cf3bd7b2b",
+      "nq": 1,
+      "cases": [
+        {
+          "name": "uniform_00_1",
+          "nkv": [
+            1
+          ],
+          "pattern": 0,
+          "expected_route": "reference",
+          "max_active_blocks": 1,
+          "tails": [
+            1
+          ]
+        },
+        {
+          "name": "uniform_01_2048",
+          "nkv": [
+            2048
+          ],
+          "pattern": 1,
+          "expected_route": "reference",
+          "max_active_blocks": 513,
+          "tails": [
+            0
+          ]
+        },
+        {
+          "name": "uniform_02_2051",
+          "nkv": [
+            2051
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 513,
+          "tails": [
+            3
+          ]
+        },
+        {
+          "name": "uniform_03_24575",
+          "nkv": [
+            24575
+          ],
+          "pattern": 3,
+          "expected_route": "reference",
+          "max_active_blocks": 6144,
+          "tails": [
+            3
+          ]
+        },
+        {
+          "name": "uniform_04_24576",
+          "nkv": [
+            24576
+          ],
+          "pattern": 0,
+          "expected_route": "reference",
+          "max_active_blocks": 6145,
+          "tails": [
+            0
+          ]
+        },
+        {
+          "name": "uniform_05_24577",
+          "nkv": [
+            24577
+          ],
+          "pattern": 1,
+          "expected_route": "middle33",
+          "max_active_blocks": 6145,
+          "tails": [
+            1
+          ]
+        },
+        {
+          "name": "uniform_06_65536",
+          "nkv": [
+            65536
+          ],
+          "pattern": 2,
+          "expected_route": "middle33",
+          "max_active_blocks": 16385,
+          "tails": [
+            0
+          ]
+        },
+        {
+          "name": "uniform_07_135164",
+          "nkv": [
+            135164
+          ],
+          "pattern": 3,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            0
+          ]
+        },
+        {
+          "name": "uniform_08_135165",
+          "nkv": [
+            135165
+          ],
+          "pattern": 0,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            1
+          ]
+        },
+        {
+          "name": "uniform_09_135166",
+          "nkv": [
+            135166
+          ],
+          "pattern": 1,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            2
+          ]
+        },
+        {
+          "name": "uniform_10_135167",
+          "nkv": [
+            135167
+          ],
+          "pattern": 2,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            3
+          ]
+        },
+        {
+          "name": "uniform_11_135168",
+          "nkv": [
+            135168
+          ],
+          "pattern": 3,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            0
+          ]
+        },
+        {
+          "name": "uniform_12_135169",
+          "nkv": [
+            135169
+          ],
+          "pattern": 0,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            1
+          ]
+        },
+        {
+          "name": "uniform_13_135170",
+          "nkv": [
+            135170
+          ],
+          "pattern": 1,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            2
+          ]
+        },
+        {
+          "name": "uniform_14_135171",
+          "nkv": [
+            135171
+          ],
+          "pattern": 2,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            3
+          ]
+        },
+        {
+          "name": "uniform_15_262144",
+          "nkv": [
+            262144
+          ],
+          "pattern": 3,
+          "expected_route": "wide66",
+          "max_active_blocks": 65537,
+          "tails": [
+            0
+          ]
+        },
+        {
+          "name": "uniform_16_135167",
+          "nkv": [
+            135167
+          ],
+          "pattern": 0,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            3
+          ]
+        },
+        {
+          "name": "uniform_17_24576",
+          "nkv": [
+            24576
+          ],
+          "pattern": 1,
+          "expected_route": "reference",
+          "max_active_blocks": 6145,
+          "tails": [
+            0
+          ]
+        },
+        {
+          "name": "uniform_18_17",
+          "nkv": [
+            17
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 5,
+          "tails": [
+            1
+          ]
+        },
+        {
+          "name": "uniform_19_24577",
+          "nkv": [
+            24577
+          ],
+          "pattern": 3,
+          "expected_route": "middle33",
+          "max_active_blocks": 6145,
+          "tails": [
+            1
+          ]
+        },
+        {
+          "name": "uniform_20_135168",
+          "nkv": [
+            135168
+          ],
+          "pattern": 0,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            0
+          ]
+        },
+        {
+          "name": "uniform_21_65539",
+          "nkv": [
+            65539
+          ],
+          "pattern": 1,
+          "expected_route": "middle33",
+          "max_active_blocks": 16385,
+          "tails": [
+            3
+          ]
+        },
+        {
+          "name": "uniform_22_24573",
+          "nkv": [
+            24573
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 6144,
+          "tails": [
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "file": "reg33-transition-t4.bin",
+      "sha256": "ac912f4892281a14bae29318935971275fad29859980d881eebaadc611078a5d",
+      "nq": 4,
+      "cases": [
+        {
+          "name": "uniform_00_1",
+          "nkv": [
+            1,
+            1,
+            1,
+            1
+          ],
+          "pattern": 0,
+          "expected_route": "reference",
+          "max_active_blocks": 1,
+          "tails": [
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_01_2048",
+          "nkv": [
+            2048,
+            2048,
+            2048,
+            2048
+          ],
+          "pattern": 1,
+          "expected_route": "reference",
+          "max_active_blocks": 513,
+          "tails": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_02_2051",
+          "nkv": [
+            2051,
+            2051,
+            2051,
+            2051
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 513,
+          "tails": [
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_03_24575",
+          "nkv": [
+            24575,
+            24575,
+            24575,
+            24575
+          ],
+          "pattern": 3,
+          "expected_route": "reference",
+          "max_active_blocks": 6144,
+          "tails": [
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_04_24576",
+          "nkv": [
+            24576,
+            24576,
+            24576,
+            24576
+          ],
+          "pattern": 0,
+          "expected_route": "reference",
+          "max_active_blocks": 6145,
+          "tails": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_05_24577",
+          "nkv": [
+            24577,
+            24577,
+            24577,
+            24577
+          ],
+          "pattern": 1,
+          "expected_route": "middle33",
+          "max_active_blocks": 6145,
+          "tails": [
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_06_65536",
+          "nkv": [
+            65536,
+            65536,
+            65536,
+            65536
+          ],
+          "pattern": 2,
+          "expected_route": "middle33",
+          "max_active_blocks": 16385,
+          "tails": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_07_135164",
+          "nkv": [
+            135164,
+            135164,
+            135164,
+            135164
+          ],
+          "pattern": 3,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_08_135165",
+          "nkv": [
+            135165,
+            135165,
+            135165,
+            135165
+          ],
+          "pattern": 0,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_09_135166",
+          "nkv": [
+            135166,
+            135166,
+            135166,
+            135166
+          ],
+          "pattern": 1,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            2,
+            2,
+            2,
+            2
+          ]
+        },
+        {
+          "name": "uniform_10_135167",
+          "nkv": [
+            135167,
+            135167,
+            135167,
+            135167
+          ],
+          "pattern": 2,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_11_135168",
+          "nkv": [
+            135168,
+            135168,
+            135168,
+            135168
+          ],
+          "pattern": 3,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_12_135169",
+          "nkv": [
+            135169,
+            135169,
+            135169,
+            135169
+          ],
+          "pattern": 0,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_13_135170",
+          "nkv": [
+            135170,
+            135170,
+            135170,
+            135170
+          ],
+          "pattern": 1,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            2,
+            2,
+            2,
+            2
+          ]
+        },
+        {
+          "name": "uniform_14_135171",
+          "nkv": [
+            135171,
+            135171,
+            135171,
+            135171
+          ],
+          "pattern": 2,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_15_262144",
+          "nkv": [
+            262144,
+            262144,
+            262144,
+            262144
+          ],
+          "pattern": 3,
+          "expected_route": "wide66",
+          "max_active_blocks": 65537,
+          "tails": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_16_135167",
+          "nkv": [
+            135167,
+            135167,
+            135167,
+            135167
+          ],
+          "pattern": 0,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_17_24576",
+          "nkv": [
+            24576,
+            24576,
+            24576,
+            24576
+          ],
+          "pattern": 1,
+          "expected_route": "reference",
+          "max_active_blocks": 6145,
+          "tails": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_18_17",
+          "nkv": [
+            17,
+            17,
+            17,
+            17
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 5,
+          "tails": [
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_19_24577",
+          "nkv": [
+            24577,
+            24577,
+            24577,
+            24577
+          ],
+          "pattern": 3,
+          "expected_route": "middle33",
+          "max_active_blocks": 6145,
+          "tails": [
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_20_135168",
+          "nkv": [
+            135168,
+            135168,
+            135168,
+            135168
+          ],
+          "pattern": 0,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_21_65539",
+          "nkv": [
+            65539,
+            65539,
+            65539,
+            65539
+          ],
+          "pattern": 1,
+          "expected_route": "middle33",
+          "max_active_blocks": 16385,
+          "tails": [
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_22_24573",
+          "nkv": [
+            24573,
+            24573,
+            24573,
+            24573
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 6144,
+          "tails": [
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "straddle_low",
+          "nkv": [
+            24574,
+            24575,
+            24576,
+            24577
+          ],
+          "pattern": 0,
+          "expected_route": "middle33",
+          "max_active_blocks": 6145,
+          "tails": [
+            2,
+            3,
+            0,
+            1
+          ]
+        },
+        {
+          "name": "straddle_middle",
+          "nkv": [
+            135166,
+            135167,
+            135168,
+            135169
+          ],
+          "pattern": 3,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            2,
+            3,
+            0,
+            1
+          ]
+        },
+        {
+          "name": "earlier_long_last_middle",
+          "nkv": [
+            135168,
+            65539,
+            65539,
+            65539
+          ],
+          "pattern": 3,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            0,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "penultimate_long_last_middle",
+          "nkv": [
+            65539,
+            65539,
+            262144,
+            65539
+          ],
+          "pattern": 0,
+          "expected_route": "wide66",
+          "max_active_blocks": 65537,
+          "tails": [
+            3,
+            3,
+            0,
+            3
+          ]
+        },
+        {
+          "name": "earlier_long_last_reference",
+          "nkv": [
+            262144,
+            24576,
+            24576,
+            24576
+          ],
+          "pattern": 0,
+          "expected_route": "reference",
+          "max_active_blocks": 65537,
+          "tails": [
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "shrink_mixed",
+          "nkv": [
+            1,
+            17,
+            2048,
+            2051
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 513,
+          "tails": [
+            1,
+            1,
+            0,
+            3
+          ]
+        }
+      ]
+    },
+    {
+      "file": "reg33-transition-t6.bin",
+      "sha256": "685cef6f7ba4296e97dbbcc4a55827a94052fb39c2fc7b698a18b1e8214c31e5",
+      "nq": 6,
+      "cases": [
+        {
+          "name": "uniform_00_1",
+          "nkv": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "pattern": 0,
+          "expected_route": "reference",
+          "max_active_blocks": 1,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_01_2048",
+          "nkv": [
+            2048,
+            2048,
+            2048,
+            2048,
+            2048,
+            2048
+          ],
+          "pattern": 1,
+          "expected_route": "reference",
+          "max_active_blocks": 513,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_02_2051",
+          "nkv": [
+            2051,
+            2051,
+            2051,
+            2051,
+            2051,
+            2051
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 513,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_03_24575",
+          "nkv": [
+            24575,
+            24575,
+            24575,
+            24575,
+            24575,
+            24575
+          ],
+          "pattern": 3,
+          "expected_route": "reference",
+          "max_active_blocks": 6144,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_04_24576",
+          "nkv": [
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576
+          ],
+          "pattern": 0,
+          "expected_route": "reference",
+          "max_active_blocks": 6145,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_05_24577",
+          "nkv": [
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577
+          ],
+          "pattern": 1,
+          "expected_route": "middle33",
+          "max_active_blocks": 6145,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_06_65536",
+          "nkv": [
+            65536,
+            65536,
+            65536,
+            65536,
+            65536,
+            65536
+          ],
+          "pattern": 2,
+          "expected_route": "middle33",
+          "max_active_blocks": 16385,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_07_135164",
+          "nkv": [
+            135164,
+            135164,
+            135164,
+            135164,
+            135164,
+            135164
+          ],
+          "pattern": 3,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_08_135165",
+          "nkv": [
+            135165,
+            135165,
+            135165,
+            135165,
+            135165,
+            135165
+          ],
+          "pattern": 0,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_09_135166",
+          "nkv": [
+            135166,
+            135166,
+            135166,
+            135166,
+            135166,
+            135166
+          ],
+          "pattern": 1,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2
+          ]
+        },
+        {
+          "name": "uniform_10_135167",
+          "nkv": [
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167
+          ],
+          "pattern": 2,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_11_135168",
+          "nkv": [
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168
+          ],
+          "pattern": 3,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_12_135169",
+          "nkv": [
+            135169,
+            135169,
+            135169,
+            135169,
+            135169,
+            135169
+          ],
+          "pattern": 0,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_13_135170",
+          "nkv": [
+            135170,
+            135170,
+            135170,
+            135170,
+            135170,
+            135170
+          ],
+          "pattern": 1,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2
+          ]
+        },
+        {
+          "name": "uniform_14_135171",
+          "nkv": [
+            135171,
+            135171,
+            135171,
+            135171,
+            135171,
+            135171
+          ],
+          "pattern": 2,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_15_262144",
+          "nkv": [
+            262144,
+            262144,
+            262144,
+            262144,
+            262144,
+            262144
+          ],
+          "pattern": 3,
+          "expected_route": "wide66",
+          "max_active_blocks": 65537,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_16_135167",
+          "nkv": [
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167
+          ],
+          "pattern": 0,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_17_24576",
+          "nkv": [
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576
+          ],
+          "pattern": 1,
+          "expected_route": "reference",
+          "max_active_blocks": 6145,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_18_17",
+          "nkv": [
+            17,
+            17,
+            17,
+            17,
+            17,
+            17
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 5,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_19_24577",
+          "nkv": [
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577
+          ],
+          "pattern": 3,
+          "expected_route": "middle33",
+          "max_active_blocks": 6145,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_20_135168",
+          "nkv": [
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168
+          ],
+          "pattern": 0,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_21_65539",
+          "nkv": [
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539
+          ],
+          "pattern": 1,
+          "expected_route": "middle33",
+          "max_active_blocks": 16385,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_22_24573",
+          "nkv": [
+            24573,
+            24573,
+            24573,
+            24573,
+            24573,
+            24573
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 6144,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "straddle_low",
+          "nkv": [
+            24573,
+            24574,
+            24575,
+            24576,
+            24577,
+            24578
+          ],
+          "pattern": 0,
+          "expected_route": "middle33",
+          "max_active_blocks": 6145,
+          "tails": [
+            1,
+            2,
+            3,
+            0,
+            1,
+            2
+          ]
+        },
+        {
+          "name": "straddle_middle",
+          "nkv": [
+            135165,
+            135166,
+            135167,
+            135168,
+            135169,
+            135170
+          ],
+          "pattern": 3,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            1,
+            2,
+            3,
+            0,
+            1,
+            2
+          ]
+        },
+        {
+          "name": "earlier_long_last_middle",
+          "nkv": [
+            135168,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539
+          ],
+          "pattern": 3,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            0,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "penultimate_long_last_middle",
+          "nkv": [
+            65539,
+            65539,
+            65539,
+            65539,
+            262144,
+            65539
+          ],
+          "pattern": 0,
+          "expected_route": "wide66",
+          "max_active_blocks": 65537,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            0,
+            3
+          ]
+        },
+        {
+          "name": "earlier_long_last_reference",
+          "nkv": [
+            262144,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576
+          ],
+          "pattern": 0,
+          "expected_route": "reference",
+          "max_active_blocks": 65537,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "shrink_mixed",
+          "nkv": [
+            1,
+            17,
+            2048,
+            2051,
+            24575,
+            24576
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 6145,
+          "tails": [
+            1,
+            1,
+            0,
+            3,
+            3,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "file": "reg33-transition-t8.bin",
+      "sha256": "8bd6043b415184eb569be06f00f650fb057ec6e3162e72effcd0076d04f29ded",
+      "nq": 8,
+      "cases": [
+        {
+          "name": "uniform_00_1",
+          "nkv": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "pattern": 0,
+          "expected_route": "reference",
+          "max_active_blocks": 1,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_01_2048",
+          "nkv": [
+            2048,
+            2048,
+            2048,
+            2048,
+            2048,
+            2048,
+            2048,
+            2048
+          ],
+          "pattern": 1,
+          "expected_route": "reference",
+          "max_active_blocks": 513,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_02_2051",
+          "nkv": [
+            2051,
+            2051,
+            2051,
+            2051,
+            2051,
+            2051,
+            2051,
+            2051
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 513,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_03_24575",
+          "nkv": [
+            24575,
+            24575,
+            24575,
+            24575,
+            24575,
+            24575,
+            24575,
+            24575
+          ],
+          "pattern": 3,
+          "expected_route": "reference",
+          "max_active_blocks": 6144,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_04_24576",
+          "nkv": [
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576
+          ],
+          "pattern": 0,
+          "expected_route": "reference",
+          "max_active_blocks": 6145,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_05_24577",
+          "nkv": [
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577
+          ],
+          "pattern": 1,
+          "expected_route": "middle33",
+          "max_active_blocks": 6145,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_06_65536",
+          "nkv": [
+            65536,
+            65536,
+            65536,
+            65536,
+            65536,
+            65536,
+            65536,
+            65536
+          ],
+          "pattern": 2,
+          "expected_route": "middle33",
+          "max_active_blocks": 16385,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_07_135164",
+          "nkv": [
+            135164,
+            135164,
+            135164,
+            135164,
+            135164,
+            135164,
+            135164,
+            135164
+          ],
+          "pattern": 3,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_08_135165",
+          "nkv": [
+            135165,
+            135165,
+            135165,
+            135165,
+            135165,
+            135165,
+            135165,
+            135165
+          ],
+          "pattern": 0,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_09_135166",
+          "nkv": [
+            135166,
+            135166,
+            135166,
+            135166,
+            135166,
+            135166,
+            135166,
+            135166
+          ],
+          "pattern": 1,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2
+          ]
+        },
+        {
+          "name": "uniform_10_135167",
+          "nkv": [
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167
+          ],
+          "pattern": 2,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_11_135168",
+          "nkv": [
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168
+          ],
+          "pattern": 3,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_12_135169",
+          "nkv": [
+            135169,
+            135169,
+            135169,
+            135169,
+            135169,
+            135169,
+            135169,
+            135169
+          ],
+          "pattern": 0,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_13_135170",
+          "nkv": [
+            135170,
+            135170,
+            135170,
+            135170,
+            135170,
+            135170,
+            135170,
+            135170
+          ],
+          "pattern": 1,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2
+          ]
+        },
+        {
+          "name": "uniform_14_135171",
+          "nkv": [
+            135171,
+            135171,
+            135171,
+            135171,
+            135171,
+            135171,
+            135171,
+            135171
+          ],
+          "pattern": 2,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_15_262144",
+          "nkv": [
+            262144,
+            262144,
+            262144,
+            262144,
+            262144,
+            262144,
+            262144,
+            262144
+          ],
+          "pattern": 3,
+          "expected_route": "wide66",
+          "max_active_blocks": 65537,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_16_135167",
+          "nkv": [
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167
+          ],
+          "pattern": 0,
+          "expected_route": "middle33",
+          "max_active_blocks": 33792,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_17_24576",
+          "nkv": [
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576
+          ],
+          "pattern": 1,
+          "expected_route": "reference",
+          "max_active_blocks": 6145,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_18_17",
+          "nkv": [
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 5,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_19_24577",
+          "nkv": [
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577
+          ],
+          "pattern": 3,
+          "expected_route": "middle33",
+          "max_active_blocks": 6145,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_20_135168",
+          "nkv": [
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168
+          ],
+          "pattern": 0,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_21_65539",
+          "nkv": [
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539
+          ],
+          "pattern": 1,
+          "expected_route": "middle33",
+          "max_active_blocks": 16385,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_22_24573",
+          "nkv": [
+            24573,
+            24573,
+            24573,
+            24573,
+            24573,
+            24573,
+            24573,
+            24573
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 6144,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "straddle_low",
+          "nkv": [
+            24572,
+            24573,
+            24574,
+            24575,
+            24576,
+            24577,
+            24578,
+            24579
+          ],
+          "pattern": 0,
+          "expected_route": "middle33",
+          "max_active_blocks": 6145,
+          "tails": [
+            0,
+            1,
+            2,
+            3,
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "name": "straddle_middle",
+          "nkv": [
+            135164,
+            135165,
+            135166,
+            135167,
+            135168,
+            135169,
+            135170,
+            135171
+          ],
+          "pattern": 3,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            0,
+            1,
+            2,
+            3,
+            0,
+            1,
+            2,
+            3
+          ]
+        },
+        {
+          "name": "earlier_long_last_middle",
+          "nkv": [
+            135168,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539
+          ],
+          "pattern": 3,
+          "expected_route": "wide66",
+          "max_active_blocks": 33793,
+          "tails": [
+            0,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "penultimate_long_last_middle",
+          "nkv": [
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            262144,
+            65539
+          ],
+          "pattern": 0,
+          "expected_route": "wide66",
+          "max_active_blocks": 65537,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            0,
+            3
+          ]
+        },
+        {
+          "name": "earlier_long_last_reference",
+          "nkv": [
+            262144,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576
+          ],
+          "pattern": 0,
+          "expected_route": "reference",
+          "max_active_blocks": 65537,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "shrink_mixed",
+          "nkv": [
+            1,
+            17,
+            2048,
+            2051,
+            24575,
+            24576,
+            1,
+            17
+          ],
+          "pattern": 2,
+          "expected_route": "reference",
+          "max_active_blocks": 6145,
+          "tails": [
+            1,
+            1,
+            0,
+            3,
+            3,
+            0,
+            1,
+            1
+          ]
+        }
+      ]
+    },
+    {
+      "file": "reg33-transition-t9.bin",
+      "sha256": "0ae97e3128c52ae022bc184d5fc6c92766c17e60415675b54f405a336c46eef9",
+      "nq": 9,
+      "cases": [
+        {
+          "name": "uniform_00_1",
+          "nkv": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          "pattern": 0,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 1,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_01_2048",
+          "nkv": [
+            2048,
+            2048,
+            2048,
+            2048,
+            2048,
+            2048,
+            2048,
+            2048,
+            2048
+          ],
+          "pattern": 1,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 513,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_02_2051",
+          "nkv": [
+            2051,
+            2051,
+            2051,
+            2051,
+            2051,
+            2051,
+            2051,
+            2051,
+            2051
+          ],
+          "pattern": 2,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 513,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_03_24575",
+          "nkv": [
+            24575,
+            24575,
+            24575,
+            24575,
+            24575,
+            24575,
+            24575,
+            24575,
+            24575
+          ],
+          "pattern": 3,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 6144,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_04_24576",
+          "nkv": [
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576
+          ],
+          "pattern": 0,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 6145,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_05_24577",
+          "nkv": [
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577
+          ],
+          "pattern": 1,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 6145,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_06_65536",
+          "nkv": [
+            65536,
+            65536,
+            65536,
+            65536,
+            65536,
+            65536,
+            65536,
+            65536,
+            65536
+          ],
+          "pattern": 2,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 16385,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_07_135164",
+          "nkv": [
+            135164,
+            135164,
+            135164,
+            135164,
+            135164,
+            135164,
+            135164,
+            135164,
+            135164
+          ],
+          "pattern": 3,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 33792,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_08_135165",
+          "nkv": [
+            135165,
+            135165,
+            135165,
+            135165,
+            135165,
+            135165,
+            135165,
+            135165,
+            135165
+          ],
+          "pattern": 0,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 33792,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_09_135166",
+          "nkv": [
+            135166,
+            135166,
+            135166,
+            135166,
+            135166,
+            135166,
+            135166,
+            135166,
+            135166
+          ],
+          "pattern": 1,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 33792,
+          "tails": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2
+          ]
+        },
+        {
+          "name": "uniform_10_135167",
+          "nkv": [
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167
+          ],
+          "pattern": 2,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 33792,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_11_135168",
+          "nkv": [
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168
+          ],
+          "pattern": 3,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 33793,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_12_135169",
+          "nkv": [
+            135169,
+            135169,
+            135169,
+            135169,
+            135169,
+            135169,
+            135169,
+            135169,
+            135169
+          ],
+          "pattern": 0,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 33793,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_13_135170",
+          "nkv": [
+            135170,
+            135170,
+            135170,
+            135170,
+            135170,
+            135170,
+            135170,
+            135170,
+            135170
+          ],
+          "pattern": 1,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 33793,
+          "tails": [
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2,
+            2
+          ]
+        },
+        {
+          "name": "uniform_14_135171",
+          "nkv": [
+            135171,
+            135171,
+            135171,
+            135171,
+            135171,
+            135171,
+            135171,
+            135171,
+            135171
+          ],
+          "pattern": 2,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 33793,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_15_262144",
+          "nkv": [
+            262144,
+            262144,
+            262144,
+            262144,
+            262144,
+            262144,
+            262144,
+            262144,
+            262144
+          ],
+          "pattern": 3,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 65537,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_16_135167",
+          "nkv": [
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167,
+            135167
+          ],
+          "pattern": 0,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 33792,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_17_24576",
+          "nkv": [
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576
+          ],
+          "pattern": 1,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 6145,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_18_17",
+          "nkv": [
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17,
+            17
+          ],
+          "pattern": 2,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 5,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_19_24577",
+          "nkv": [
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577,
+            24577
+          ],
+          "pattern": 3,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 6145,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "uniform_20_135168",
+          "nkv": [
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168,
+            135168
+          ],
+          "pattern": 0,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 33793,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "uniform_21_65539",
+          "nkv": [
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539
+          ],
+          "pattern": 1,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 16385,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "uniform_22_24573",
+          "nkv": [
+            24573,
+            24573,
+            24573,
+            24573,
+            24573,
+            24573,
+            24573,
+            24573,
+            24573
+          ],
+          "pattern": 2,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 6144,
+          "tails": [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ]
+        },
+        {
+          "name": "straddle_low",
+          "nkv": [
+            24572,
+            24573,
+            24574,
+            24575,
+            24576,
+            24577,
+            24578,
+            24579,
+            24580
+          ],
+          "pattern": 0,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 6146,
+          "tails": [
+            0,
+            1,
+            2,
+            3,
+            0,
+            1,
+            2,
+            3,
+            0
+          ]
+        },
+        {
+          "name": "straddle_middle",
+          "nkv": [
+            135164,
+            135165,
+            135166,
+            135167,
+            135168,
+            135169,
+            135170,
+            135171,
+            135172
+          ],
+          "pattern": 3,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 33794,
+          "tails": [
+            0,
+            1,
+            2,
+            3,
+            0,
+            1,
+            2,
+            3,
+            0
+          ]
+        },
+        {
+          "name": "earlier_long_last_middle",
+          "nkv": [
+            135168,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539
+          ],
+          "pattern": 3,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 33793,
+          "tails": [
+            0,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3
+          ]
+        },
+        {
+          "name": "penultimate_long_last_middle",
+          "nkv": [
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            65539,
+            262144,
+            65539
+          ],
+          "pattern": 0,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 65537,
+          "tails": [
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            3,
+            0,
+            3
+          ]
+        },
+        {
+          "name": "earlier_long_last_reference",
+          "nkv": [
+            262144,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576,
+            24576
+          ],
+          "pattern": 0,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 65537,
+          "tails": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "shrink_mixed",
+          "nkv": [
+            1,
+            17,
+            2048,
+            2051,
+            24575,
+            24576,
+            1,
+            17,
+            2048
+          ],
+          "pattern": 2,
+          "expected_route": "unchanged_fallback",
+          "max_active_blocks": 6145,
+          "tails": [
+            1,
+            1,
+            0,
+            3,
+            3,
+            0,
+            1,
+            1,
+            0
+          ]
+        }
+      ]
+    }
+  ]
+}

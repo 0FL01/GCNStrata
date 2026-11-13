@@ -1,0 +1,173 @@
+qsa_select.fit17.cu:190:84: warning: unused parameter 'c' [-Wunused-parameter]
+  190 | __attribute__((device)) inline __attribute__((always_inline)) void mma_tf32(float* c, const uint32_t* a, const uint32_t* b) {
+      |                                                                                    ^
+qsa_select.fit17.cu:190:103: warning: unused parameter 'a' [-Wunused-parameter]
+  190 | __attribute__((device)) inline __attribute__((always_inline)) void mma_tf32(float* c, const uint32_t* a, const uint32_t* b) {
+      |                                                                                                       ^
+qsa_select.fit17.cu:190:122: warning: unused parameter 'b' [-Wunused-parameter]
+  190 | __attribute__((device)) inline __attribute__((always_inline)) void mma_tf32(float* c, const uint32_t* a, const uint32_t* b) {
+      |                                                                                                                          ^
+qsa_select.fit17.cu:330:94: warning: unused parameter 'a' [-Wunused-parameter]
+  330 | __attribute__((device)) inline __attribute__((always_inline)) sel_f8 wmma_bf16(const sel_s8& a, const sel_s8& b, const sel_f8& c) {
+      |                                                                                              ^
+qsa_select.fit17.cu:330:111: warning: unused parameter 'b' [-Wunused-parameter]
+  330 | __attribute__((device)) inline __attribute__((always_inline)) sel_f8 wmma_bf16(const sel_s8& a, const sel_s8& b, const sel_f8& c) {
+      |                                                                                                               ^
+qsa_select.fit17.cu:452:69: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  452 |     if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) { hipGetLastError(); return false; }
+      |                                                                     ^~~~~~~~~~~~~~~~~
+qsa_select.fit17.cu:459:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  459 |         hipGetLastError();
+      |         ^~~~~~~~~~~~~~~~~
+qsa_select.fit17.cu:851:21: warning: comparison of integers of different signs: 'unsigned int' and 'int' [-Wsign-compare]
+  851 |     if (threadIdx.x < nq) {
+      |         ~~~~~~~~~~~ ^ ~~
+8 warnings generated when compiling for gfx906.
+remark: qsa_select.fit17.cu:34:0: Function Name: _ZN6strata7kernels12_GLOBAL__N_119block_scores_kernelEPKfS3_S3_PKilPf [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:34:0:     TotalSGPRs: 26 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:34:0:     VGPRs: 22 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:34:0:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:34:0:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:34:0:     Occupancy [waves/SIMD]: 10 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:34:0:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:34:0:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:34:0:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:205:0: Function Name: _ZN6strata7kernels12_GLOBAL__N_122block_scores_tc_kernelEPKfS3_PKilllPf [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:205:0:     TotalSGPRs: 21 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:205:0:     VGPRs: 14 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:205:0:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:205:0:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:205:0:     Occupancy [waves/SIMD]: 10 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:205:0:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:205:0:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:205:0:     LDS Size [bytes/block]: 64 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:359:0: Function Name: _ZN6strata7kernels12_GLOBAL__N_124block_scores_wmma_kernelEPKfS3_PKilllPf [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:359:0:     TotalSGPRs: 16 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:359:0:     VGPRs: 15 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:359:0:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:359:0:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:359:0:     Occupancy [waves/SIMD]: 10 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:359:0:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:359:0:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:359:0:     LDS Size [bytes/block]: 64 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:469:0: Function Name: _ZN6strata7kernels12_GLOBAL__N_124block_scores_tail_kernelEPKfS3_PKilPf [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:469:0:     TotalSGPRs: 20 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:469:0:     VGPRs: 19 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:469:0:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:469:0:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:469:0:     Occupancy [waves/SIMD]: 10 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:469:0:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:469:0:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:469:0:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:502:0: Function Name: _ZN6strata7kernels12_GLOBAL__N_124block_scores_simt_kernelEPKfS3_PKilllPf [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:502:0:     TotalSGPRs: 34 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:502:0:     VGPRs: 75 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:502:0:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:502:0:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:502:0:     Occupancy [waves/SIMD]: 2 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:502:0:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:502:0:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:502:0:     LDS Size [bytes/block]: 25600 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:846:0: Function Name: _ZN6strata7kernels12_GLOBAL__N_125block_scores_multi_kernelEPKfS3_S3_PKiilPfb [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:846:0:     TotalSGPRs: 25 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:846:0:     VGPRs: 48 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:846:0:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:846:0:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:846:0:     Occupancy [waves/SIMD]: 3 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:846:0:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:846:0:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:846:0:     LDS Size [bytes/block]: 16512 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0: Function Name: _ZN6strata7kernels12_GLOBAL__N_117block_topk_kernelILb0EEEvPKfPKillPi [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     TotalSGPRs: 47 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     VGPRs: 28 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     Occupancy [waves/SIMD]: 9 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     LDS Size [bytes/block]: 3080 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0: Function Name: _ZN6strata7kernels12_GLOBAL__N_117block_topk_kernelILb1EEEvPKfPKillPi [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     TotalSGPRs: 47 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     VGPRs: 28 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     Occupancy [waves/SIMD]: 9 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:62:0:     LDS Size [bytes/block]: 3080 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0: Function Name: _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi17ELb1ELi1EEEvPKfPKillPi [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     TotalSGPRs: 104 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     VGPRs: 64 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     ScratchSize [bytes/lane]: 56 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     Occupancy [waves/SIMD]: 4 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     SGPRs Spill: 44 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     VGPRs Spill: 25 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     LDS Size [bytes/block]: 32908 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0: Function Name: _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi66ELb1ELi2EEEvPKfPKillPi [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     TotalSGPRs: 104 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     VGPRs: 64 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     ScratchSize [bytes/lane]: 1048 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     Occupancy [waves/SIMD]: 4 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     SGPRs Spill: 539 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     VGPRs Spill: 468 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     LDS Size [bytes/block]: 32908 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0: Function Name: _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi66ELb1ELi0EEEvPKfPKillPi [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     TotalSGPRs: 104 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     VGPRs: 64 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     ScratchSize [bytes/lane]: 1048 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     Occupancy [waves/SIMD]: 4 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     SGPRs Spill: 527 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     VGPRs Spill: 467 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     LDS Size [bytes/block]: 32908 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0: Function Name: _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi33ELb0ELi0EEEvPKfPKillPi [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     TotalSGPRs: 104 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     VGPRs: 64 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     ScratchSize [bytes/lane]: 388 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     Occupancy [waves/SIMD]: 4 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     SGPRs Spill: 203 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     VGPRs Spill: 170 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     LDS Size [bytes/block]: 32908 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0: Function Name: _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi66ELb0ELi0EEEvPKfPKillPi [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     TotalSGPRs: 104 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     VGPRs: 64 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     ScratchSize [bytes/lane]: 1048 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     Occupancy [waves/SIMD]: 4 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     SGPRs Spill: 525 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     VGPRs Spill: 466 [-Rpass-analysis=kernel-resource-usage]
+remark: qsa_select.fit17.cu:605:0:     LDS Size [bytes/block]: 32908 [-Rpass-analysis=kernel-resource-usage]
+qsa_select.fit17.cu:190:84: warning: unused parameter 'c' [-Wunused-parameter]
+  190 | __attribute__((device)) inline __attribute__((always_inline)) void mma_tf32(float* c, const uint32_t* a, const uint32_t* b) {
+      |                                                                                    ^
+qsa_select.fit17.cu:190:103: warning: unused parameter 'a' [-Wunused-parameter]
+  190 | __attribute__((device)) inline __attribute__((always_inline)) void mma_tf32(float* c, const uint32_t* a, const uint32_t* b) {
+      |                                                                                                       ^
+qsa_select.fit17.cu:190:122: warning: unused parameter 'b' [-Wunused-parameter]
+  190 | __attribute__((device)) inline __attribute__((always_inline)) void mma_tf32(float* c, const uint32_t* a, const uint32_t* b) {
+      |                                                                                                                          ^
+qsa_select.fit17.cu:330:94: warning: unused parameter 'a' [-Wunused-parameter]
+  330 | __attribute__((device)) inline __attribute__((always_inline)) sel_f8 wmma_bf16(const sel_s8& a, const sel_s8& b, const sel_f8& c) {
+      |                                                                                              ^
+qsa_select.fit17.cu:330:111: warning: unused parameter 'b' [-Wunused-parameter]
+  330 | __attribute__((device)) inline __attribute__((always_inline)) sel_f8 wmma_bf16(const sel_s8& a, const sel_s8& b, const sel_f8& c) {
+      |                                                                                                               ^
+qsa_select.fit17.cu:452:69: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  452 |     if (hipGetDevice(&dev) != hipSuccess || dev < 0 || dev >= 64) { hipGetLastError(); return false; }
+      |                                                                     ^~~~~~~~~~~~~~~~~
+qsa_select.fit17.cu:459:9: warning: ignoring return value of type 'hipError_t' declared with 'nodiscard' attribute [-Wunused-value]
+  459 |         hipGetLastError();
+      |         ^~~~~~~~~~~~~~~~~
+qsa_select.fit17.cu:851:21: warning: comparison of integers of different signs: 'unsigned int' and 'int' [-Wsign-compare]
+  851 |     if (threadIdx.x < nq) {
+      |         ~~~~~~~~~~~ ^ ~~
+qsa_select.fit17.cu:201:83: warning: unused function 'block_scores_tc_kernel' [-Wunused-function]
+  201 | __attribute__((global)) void __attribute__((amdgpu_flat_work_group_size(1, 128))) block_scores_tc_kernel(const float* __restrict__ pooled,
+      |                                                                                   ^~~~~~~~~~~~~~~~~~~~~~
+qsa_select.fit17.cu:498:83: warning: unused function 'block_scores_simt_kernel' [-Wunused-function]
+  498 | __attribute__((global)) void __attribute__((amdgpu_flat_work_group_size(1, 256))) block_scores_simt_kernel(const float* __restrict__ pooled,
+      |                                                                                   ^~~~~~~~~~~~~~~~~~~~~~~~
+10 warnings generated when compiling for host.

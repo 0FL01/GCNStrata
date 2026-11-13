@@ -1,0 +1,786 @@
+Displaying notes found in: .note
+  Owner                Data size 	Description
+  AMDGPU               0x00003b4b	NT_AMDGPU_METADATA (AMDGPU Metadata)
+    AMDGPU Metadata:
+        ---
+amdhsa.kernels:
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         24
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         32
+        .size:           8
+        .value_kind:     by_value
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         40
+        .size:           8
+        .value_kind:     global_buffer
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 48
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 256
+    .name:           _ZN6strata7kernels12_GLOBAL__N_119block_scores_kernelEPKfS3_S3_PKilPf
+    .private_segment_fixed_size: 0
+    .sgpr_count:     26
+    .sgpr_spill_count: 0
+    .symbol:         _ZN6strata7kernels12_GLOBAL__N_119block_scores_kernelEPKfS3_S3_PKilPf.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     22
+    .vgpr_spill_count: 0
+    .wavefront_size: 64
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         24
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         32
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         40
+        .size:           8
+        .value_kind:     by_value
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         48
+        .size:           8
+        .value_kind:     global_buffer
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 64
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 56
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 128
+    .name:           _ZN6strata7kernels12_GLOBAL__N_122block_scores_tc_kernelEPKfS3_PKilllPf
+    .private_segment_fixed_size: 0
+    .sgpr_count:     21
+    .sgpr_spill_count: 0
+    .symbol:         _ZN6strata7kernels12_GLOBAL__N_122block_scores_tc_kernelEPKfS3_PKilllPf.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     14
+    .vgpr_spill_count: 0
+    .wavefront_size: 64
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         24
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         32
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         40
+        .size:           8
+        .value_kind:     by_value
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         48
+        .size:           8
+        .value_kind:     global_buffer
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 64
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 56
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 128
+    .name:           _ZN6strata7kernels12_GLOBAL__N_124block_scores_wmma_kernelEPKfS3_PKilllPf
+    .private_segment_fixed_size: 0
+    .sgpr_count:     16
+    .sgpr_spill_count: 0
+    .symbol:         _ZN6strata7kernels12_GLOBAL__N_124block_scores_wmma_kernelEPKfS3_PKilllPf.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     15
+    .vgpr_spill_count: 0
+    .wavefront_size: 64
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         24
+        .size:           8
+        .value_kind:     by_value
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 0
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 40
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 32
+    .name:           _ZN6strata7kernels12_GLOBAL__N_124block_scores_tail_kernelEPKfS3_PKilPf
+    .private_segment_fixed_size: 0
+    .sgpr_count:     20
+    .sgpr_spill_count: 0
+    .symbol:         _ZN6strata7kernels12_GLOBAL__N_124block_scores_tail_kernelEPKfS3_PKilPf.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     19
+    .vgpr_spill_count: 0
+    .wavefront_size: 64
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         24
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         32
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         40
+        .size:           8
+        .value_kind:     by_value
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         48
+        .size:           8
+        .value_kind:     global_buffer
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 25600
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 56
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 256
+    .name:           _ZN6strata7kernels12_GLOBAL__N_124block_scores_simt_kernelEPKfS3_PKilllPf
+    .private_segment_fixed_size: 0
+    .sgpr_count:     34
+    .sgpr_spill_count: 0
+    .symbol:         _ZN6strata7kernels12_GLOBAL__N_124block_scores_simt_kernelEPKfS3_PKilllPf.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     75
+    .vgpr_spill_count: 0
+    .wavefront_size: 64
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         16
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         24
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         32
+        .size:           4
+        .value_kind:     by_value
+      - .offset:         40
+        .size:           8
+        .value_kind:     by_value
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         48
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         56
+        .size:           1
+        .value_kind:     by_value
+      - .offset:         64
+        .size:           4
+        .value_kind:     hidden_block_count_x
+      - .offset:         68
+        .size:           4
+        .value_kind:     hidden_block_count_y
+      - .offset:         72
+        .size:           4
+        .value_kind:     hidden_block_count_z
+      - .offset:         76
+        .size:           2
+        .value_kind:     hidden_group_size_x
+      - .offset:         78
+        .size:           2
+        .value_kind:     hidden_group_size_y
+      - .offset:         80
+        .size:           2
+        .value_kind:     hidden_group_size_z
+      - .offset:         82
+        .size:           2
+        .value_kind:     hidden_remainder_x
+      - .offset:         84
+        .size:           2
+        .value_kind:     hidden_remainder_y
+      - .offset:         86
+        .size:           2
+        .value_kind:     hidden_remainder_z
+      - .offset:         104
+        .size:           8
+        .value_kind:     hidden_global_offset_x
+      - .offset:         112
+        .size:           8
+        .value_kind:     hidden_global_offset_y
+      - .offset:         120
+        .size:           8
+        .value_kind:     hidden_global_offset_z
+      - .offset:         128
+        .size:           2
+        .value_kind:     hidden_grid_dims
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 16512
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 320
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 256
+    .name:           _ZN6strata7kernels12_GLOBAL__N_125block_scores_multi_kernelEPKfS3_S3_PKiilPfb
+    .private_segment_fixed_size: 0
+    .sgpr_count:     25
+    .sgpr_spill_count: 0
+    .symbol:         _ZN6strata7kernels12_GLOBAL__N_125block_scores_multi_kernelEPKfS3_S3_PKiilPfb.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     48
+    .vgpr_spill_count: 0
+    .wavefront_size: 64
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         16
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         24
+        .size:           8
+        .value_kind:     by_value
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 3080
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 40
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 256
+    .name:           _ZN6strata7kernels12_GLOBAL__N_117block_topk_kernelILb0EEEvPKfPKillPi
+    .private_segment_fixed_size: 0
+    .sgpr_count:     47
+    .sgpr_spill_count: 0
+    .symbol:         _ZN6strata7kernels12_GLOBAL__N_117block_topk_kernelILb0EEEvPKfPKillPi.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     28
+    .vgpr_spill_count: 0
+    .wavefront_size: 64
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         16
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         24
+        .size:           8
+        .value_kind:     by_value
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         40
+        .size:           4
+        .value_kind:     hidden_block_count_x
+      - .offset:         44
+        .size:           4
+        .value_kind:     hidden_block_count_y
+      - .offset:         48
+        .size:           4
+        .value_kind:     hidden_block_count_z
+      - .offset:         52
+        .size:           2
+        .value_kind:     hidden_group_size_x
+      - .offset:         54
+        .size:           2
+        .value_kind:     hidden_group_size_y
+      - .offset:         56
+        .size:           2
+        .value_kind:     hidden_group_size_z
+      - .offset:         58
+        .size:           2
+        .value_kind:     hidden_remainder_x
+      - .offset:         60
+        .size:           2
+        .value_kind:     hidden_remainder_y
+      - .offset:         62
+        .size:           2
+        .value_kind:     hidden_remainder_z
+      - .offset:         80
+        .size:           8
+        .value_kind:     hidden_global_offset_x
+      - .offset:         88
+        .size:           8
+        .value_kind:     hidden_global_offset_y
+      - .offset:         96
+        .size:           8
+        .value_kind:     hidden_global_offset_z
+      - .offset:         104
+        .size:           2
+        .value_kind:     hidden_grid_dims
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 3080
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 296
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 256
+    .name:           _ZN6strata7kernels12_GLOBAL__N_117block_topk_kernelILb1EEEvPKfPKillPi
+    .private_segment_fixed_size: 0
+    .sgpr_count:     47
+    .sgpr_spill_count: 0
+    .symbol:         _ZN6strata7kernels12_GLOBAL__N_117block_topk_kernelILb1EEEvPKfPKillPi.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     28
+    .vgpr_spill_count: 0
+    .wavefront_size: 64
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         16
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         24
+        .size:           8
+        .value_kind:     by_value
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         40
+        .size:           4
+        .value_kind:     hidden_block_count_x
+      - .offset:         44
+        .size:           4
+        .value_kind:     hidden_block_count_y
+      - .offset:         48
+        .size:           4
+        .value_kind:     hidden_block_count_z
+      - .offset:         52
+        .size:           2
+        .value_kind:     hidden_group_size_x
+      - .offset:         54
+        .size:           2
+        .value_kind:     hidden_group_size_y
+      - .offset:         56
+        .size:           2
+        .value_kind:     hidden_group_size_z
+      - .offset:         58
+        .size:           2
+        .value_kind:     hidden_remainder_x
+      - .offset:         60
+        .size:           2
+        .value_kind:     hidden_remainder_y
+      - .offset:         62
+        .size:           2
+        .value_kind:     hidden_remainder_z
+      - .offset:         80
+        .size:           8
+        .value_kind:     hidden_global_offset_x
+      - .offset:         88
+        .size:           8
+        .value_kind:     hidden_global_offset_y
+      - .offset:         96
+        .size:           8
+        .value_kind:     hidden_global_offset_z
+      - .offset:         104
+        .size:           2
+        .value_kind:     hidden_grid_dims
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 32908
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 296
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 1024
+    .name:           _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi17ELb1ELi1EEEvPKfPKillPi
+    .private_segment_fixed_size: 56
+    .sgpr_count:     104
+    .sgpr_spill_count: 44
+    .symbol:         _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi17ELb1ELi1EEEvPKfPKillPi.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     64
+    .vgpr_spill_count: 25
+    .wavefront_size: 64
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         16
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         24
+        .size:           8
+        .value_kind:     by_value
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         40
+        .size:           4
+        .value_kind:     hidden_block_count_x
+      - .offset:         44
+        .size:           4
+        .value_kind:     hidden_block_count_y
+      - .offset:         48
+        .size:           4
+        .value_kind:     hidden_block_count_z
+      - .offset:         52
+        .size:           2
+        .value_kind:     hidden_group_size_x
+      - .offset:         54
+        .size:           2
+        .value_kind:     hidden_group_size_y
+      - .offset:         56
+        .size:           2
+        .value_kind:     hidden_group_size_z
+      - .offset:         58
+        .size:           2
+        .value_kind:     hidden_remainder_x
+      - .offset:         60
+        .size:           2
+        .value_kind:     hidden_remainder_y
+      - .offset:         62
+        .size:           2
+        .value_kind:     hidden_remainder_z
+      - .offset:         80
+        .size:           8
+        .value_kind:     hidden_global_offset_x
+      - .offset:         88
+        .size:           8
+        .value_kind:     hidden_global_offset_y
+      - .offset:         96
+        .size:           8
+        .value_kind:     hidden_global_offset_z
+      - .offset:         104
+        .size:           2
+        .value_kind:     hidden_grid_dims
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 32908
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 296
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 1024
+    .name:           _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi66ELb1ELi2EEEvPKfPKillPi
+    .private_segment_fixed_size: 1048
+    .sgpr_count:     104
+    .sgpr_spill_count: 539
+    .symbol:         _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi66ELb1ELi2EEEvPKfPKillPi.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     64
+    .vgpr_spill_count: 468
+    .wavefront_size: 64
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         16
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         24
+        .size:           8
+        .value_kind:     by_value
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         40
+        .size:           4
+        .value_kind:     hidden_block_count_x
+      - .offset:         44
+        .size:           4
+        .value_kind:     hidden_block_count_y
+      - .offset:         48
+        .size:           4
+        .value_kind:     hidden_block_count_z
+      - .offset:         52
+        .size:           2
+        .value_kind:     hidden_group_size_x
+      - .offset:         54
+        .size:           2
+        .value_kind:     hidden_group_size_y
+      - .offset:         56
+        .size:           2
+        .value_kind:     hidden_group_size_z
+      - .offset:         58
+        .size:           2
+        .value_kind:     hidden_remainder_x
+      - .offset:         60
+        .size:           2
+        .value_kind:     hidden_remainder_y
+      - .offset:         62
+        .size:           2
+        .value_kind:     hidden_remainder_z
+      - .offset:         80
+        .size:           8
+        .value_kind:     hidden_global_offset_x
+      - .offset:         88
+        .size:           8
+        .value_kind:     hidden_global_offset_y
+      - .offset:         96
+        .size:           8
+        .value_kind:     hidden_global_offset_z
+      - .offset:         104
+        .size:           2
+        .value_kind:     hidden_grid_dims
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 32908
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 296
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 1024
+    .name:           _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi66ELb1ELi0EEEvPKfPKillPi
+    .private_segment_fixed_size: 1048
+    .sgpr_count:     104
+    .sgpr_spill_count: 527
+    .symbol:         _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi66ELb1ELi0EEEvPKfPKillPi.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     64
+    .vgpr_spill_count: 467
+    .wavefront_size: 64
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         16
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         24
+        .size:           8
+        .value_kind:     by_value
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 32908
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 40
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 1024
+    .name:           _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi33ELb0ELi0EEEvPKfPKillPi
+    .private_segment_fixed_size: 388
+    .sgpr_count:     104
+    .sgpr_spill_count: 203
+    .symbol:         _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi33ELb0ELi0EEEvPKfPKillPi.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     64
+    .vgpr_spill_count: 170
+    .wavefront_size: 64
+  - .args:
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         0
+        .size:           8
+        .value_kind:     global_buffer
+      - .actual_access:  read_only
+        .address_space:  global
+        .offset:         8
+        .size:           8
+        .value_kind:     global_buffer
+      - .offset:         16
+        .size:           8
+        .value_kind:     by_value
+      - .offset:         24
+        .size:           8
+        .value_kind:     by_value
+      - .actual_access:  write_only
+        .address_space:  global
+        .offset:         32
+        .size:           8
+        .value_kind:     global_buffer
+    .gfx1250_revision: B0
+    .group_segment_fixed_size: 32908
+    .kernarg_segment_align: 8
+    .kernarg_segment_size: 40
+    .language:       OpenCL C
+    .language_version:
+      - 2
+      - 0
+    .max_flat_workgroup_size: 1024
+    .name:           _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi66ELb0ELi0EEEvPKfPKillPi
+    .private_segment_fixed_size: 1048
+    .sgpr_count:     104
+    .sgpr_spill_count: 525
+    .symbol:         _ZN6strata7kernels12_GLOBAL__N_121block_topk_reg_kernelILi66ELb0ELi0EEEvPKfPKillPi.kd
+    .uniform_work_group_size: 1
+    .uses_dynamic_stack: false
+    .vgpr_count:     64
+    .vgpr_spill_count: 466
+    .wavefront_size: 64
+amdhsa.target:   amdgcn-amd-amdhsa--gfx906
+amdhsa.version:
+  - 1
+  - 2
+...
+

@@ -1,0 +1,10 @@
+{
+  "passed": true,
+  "build_inside_sha256": "1bec71089d75694a5bf68559551ddf53b438b6eed63dd83477afef8b2c63129b",
+  "patched_sources": {
+    "include/strata/prefill/hc_negative_cache.hpp": "973aa1dd196c578d52bb2107e2826f2aae271400a036abefda3c8ca3135e59a2",
+    "src/prefill/gemm.cu": "34d9eebdb4a43691bec0af73512dd1104c62be2a3586a435f007bba2dc18d774",
+    "src/prefill/prefill.cpp": "6993ea906198364e8bca514bcb8df42bfe8fe3f7531fff96522903e00197b6cb"
+  },
+  "unchanged_gemm_header": "a46c76cad934f4c4114a0f984aee2a7145c8549fc7b1efee16b09d62aab2cfaf"
+}

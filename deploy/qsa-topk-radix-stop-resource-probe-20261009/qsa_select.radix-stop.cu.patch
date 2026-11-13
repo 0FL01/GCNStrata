@@ -1,0 +1,126 @@
+--- a/src/kernels/cuda/qsa_select.cu
++++ b/src/kernels/cuda/qsa_select.cu
+@@ -603,18 +603,23 @@
+ __global__ void __launch_bounds__(TK_T) block_topk_reg_kernel(const float* __restrict__ scores,
+                                                               const int32_t* __restrict__ steps, int64_t max_blocks,
+                                                               int64_t cap, int32_t* __restrict__ ids) {
++    // Modes 3/4 are opt-in radix-stop specializations of existing guards 1/2.
++    // Keep original template signatures and modes 0/1/2 for the unchanged-ISA gate.
++    constexpr bool RADIX_STOP = WINDOW_GUARD == 3 || WINDOW_GUARD == 4;
++    constexpr int GUARD = RADIX_STOP ? WINDOW_GUARD - 2 : WINDOW_GUARD;
+     __shared__ int hist[TK_T / 32][256];
+     __shared__ int s_warp[33];
+-    __shared__ int s_digit, s_above;
++    __shared__ uint32_t s_digit;
++    __shared__ int s_above;
+     const int64_t qi = blockIdx.x;
+     const int32_t* st = steps + qi * kStepCount;
+     const int64_t n_kv = st[kStepNKv], n_bid = st[kStepNBid], width = st[kStepWidth];
+     if constexpr (LONG_ONLY) {
+         if (steps[((int64_t) gridDim.x - 1) * kStepCount + kStepNKv] <= GFX906_TOPK_SHORT_CELLS) return;
+     }
+-    if constexpr (WINDOW_GUARD != 0) {
+-        static_assert(LONG_ONLY && (WINDOW_GUARD == 1 || WINDOW_GUARD == 2), "fit17/wide need LONG_ONLY");
+-        static_assert((WINDOW_GUARD == 1 && PER == 17) || (WINDOW_GUARD == 2 && PER == TK_PER_MAX), "guard/PER mismatch");
++    if constexpr (GUARD != 0) {
++        static_assert(LONG_ONLY && (GUARD == 1 || GUARD == 2), "fit17/wide need LONG_ONLY");
++        static_assert((GUARD == 1 && PER == 17) || (GUARD == 2 && PER == TK_PER_MAX), "guard/PER mismatch");
+         // Exact actual-capacity specialization: max(n_bid)+1 <= 1024*17.
+         // Device rows may be unsorted. This CTA-uniform guard precedes barriers.
+         int32_t max_bid = 0;
+@@ -626,7 +631,7 @@
+             }
+         }
+         const bool fits17 = (int64_t) max_bid + 1 <= (int64_t) TK_T * 17;
+-        if constexpr (WINDOW_GUARD == 1) { if (!fits17) return; }
++        if constexpr (GUARD == 1) { if (!fits17) return; }
+         else { if (fits17) return; }
+     }
+     int32_t* out = ids + qi * cap;
+@@ -645,6 +650,7 @@
+     auto weight = [&](int64_t b) -> int { return b < n_bid ? R : (int) (n_kv - n_bid * R); };
+     uint32_t prefix = 0;
+     int above = 0;
++    bool recover_key = false;
+     for (int shift = 24; shift >= 0; shift -= 8) {
+         for (int i = lane; i < 256; i += 32) hist[warp][i] = 0;
+         __syncwarp();
+@@ -671,14 +677,27 @@
+                 cum += hist[0][d];
+             }
+             s_digit = d;
++            if constexpr (RADIX_STOP) {
++                // Cell mass, not a block count: full blocks weigh R and there
++                // is at most one positive partial tail. Mass 1..R is singleton.
++                if (shift == 8 && hist[0][d] > 0 && hist[0][d] <= R) s_digit |= 256;
++            }
+             s_above = cum;
+         }
+         __syncthreads();
+-        prefix |= (uint32_t) s_digit << shift;
++        if constexpr (RADIX_STOP) {
++            const int digit = s_digit;
++            prefix |= (uint32_t) (digit & 255) << shift;
++            recover_key = (digit & 256) != 0;
++        } else {
++            prefix |= (uint32_t) s_digit << shift;
++        }
+         above = s_above;
+-        __syncthreads();
+-    }
+-    const uint32_t thr = prefix;
++        __syncthreads(); // All digit reads finish before reuse or next-pass writes.
++        if constexpr (RADIX_STOP) { if (recover_key) break; } // CTA-uniform.
++    }
++    uint32_t thr = prefix;
++    const uint32_t upper = prefix | (recover_key ? 255u : 0u);
+     const int64_t eq_budget = width - above;
+     int gt = 0, eq = 0;
+ #pragma unroll
+@@ -687,11 +706,24 @@
+         if (b >= b1) break;
+         const int w = weight(b);
+         if (w == 0) continue;
+-        if (key[j] > thr) gt += w;
+-        else if (key[j] == thr) eq += w;
++        if constexpr (RADIX_STOP) {
++            // Only the unique positive-weight boundary block lies in this
++            // interval. No extra key scan, mask, atomic, reduction, or barrier.
++            if (key[j] > upper) gt += w;
++            else if (key[j] >= thr) {
++                eq += w;
++                if (recover_key) s_digit = key[j];
++            }
++        } else {
++            if (key[j] > thr) gt += w;
++            else if (key[j] == thr) eq += w;
++        }
+     }
+     int tot;
+     const int eq_before = block_excl_scan(eq, s_warp, tot);
++    // The existing scan's first barrier publishes the one full-key write;
++    // its remaining barriers complete before any thread reads it here.
++    if constexpr (RADIX_STOP) { if (recover_key) thr = (uint32_t) s_digit; }
+     int64_t my_eq = eq_budget - eq_before;
+     if (my_eq < 0) my_eq = 0;
+     if (my_eq > eq) my_eq = eq;
+@@ -1402,8 +1434,17 @@
+                                      "(device steps select the per-window arm)\n",
+                              (long long) nq, (long long) max_blocks, (long long) cap);
+             }
+-            block_topk_reg_kernel<17, true, 1><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+-            block_topk_reg_kernel<TK_PER_MAX, true, 2><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
++            static const bool radix_stop = [] {
++                const char* v = std::getenv("STRATA_GFX906_TOPK_RADIX_STOP");
++                return v && std::strcmp(v, "1") == 0;
++            }();
++            if (radix_stop) {
++                block_topk_reg_kernel<17, true, 3><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
++                block_topk_reg_kernel<TK_PER_MAX, true, 4><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
++            } else {
++                block_topk_reg_kernel<17, true, 1><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
++                block_topk_reg_kernel<TK_PER_MAX, true, 2><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
++            }
+         } else {
+             block_topk_reg_kernel<TK_PER_MAX, true><<<(unsigned) nq, TK_T, 0, (cudaStream_t) stream>>>(scores, steps, max_blocks, cap, ids);
+         }

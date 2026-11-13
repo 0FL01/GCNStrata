@@ -1,0 +1,16 @@
+{
+  "passed": true,
+  "nominal_mV": [
+    925,
+    925,
+    925,
+    950
+  ],
+  "target_sha256": [
+    "face662c087e324da09bac5353775f6df1228b0a5527ab774d9691ad4799ed67",
+    "face662c087e324da09bac5353775f6df1228b0a5527ab774d9691ad4799ed67",
+    "d992d0f944198306701402f9243fe69e8efcbb0ca79f9eb9060ac5855ddd2a10",
+    "8c3d8af0362d2c41251478cd7948aef8d32a0ea812424b6f3dad3851063a888e"
+  ],
+  "clock_settings_unchanged": true
+}

@@ -1,0 +1,45 @@
+{
+  "experiment": "exact default-off radix-stop CPU-only resource probe",
+  "baseline": "current qualified FIT17",
+  "baseline_sha256": "5fc5d78c6155fa0987dee751a875ab714516c88209b0938db17699061cc7de1a",
+  "candidate_sha256": "587c02f9a76916605be595bbf8cdf4ce72ac04edbade4c80686772e72903064c",
+  "patch_sha256": "694531ccfcfe3da6017540af121bb774bdf0d0896b0112a6e4dcd67a0491d38b",
+  "image": "sha256:bccb7ee7e7a78274519db9a43ba63c34ddd2e74bb60f8764a8f50aaee1f2c646",
+  "arch": "gfx906",
+  "wavefront_size": 64,
+  "threads": 1024,
+  "new_option": "STRATA_GFX906_TOPK_RADIX_STOP",
+  "enabled_value": "1",
+  "default_off": true,
+  "existing_kernel_count": 13,
+  "new_specializations": [
+    [
+      17,
+      true,
+      3
+    ],
+    [
+      66,
+      true,
+      4
+    ]
+  ],
+  "reference_specializations": [
+    [
+      17,
+      true,
+      1
+    ],
+    [
+      66,
+      true,
+      2
+    ]
+  ],
+  "resource_policy": "All existing machine bytes, full metadata and remarks identical; new kernels no scratch, spill, SGPR, VGPR or occupancy regression; LDS32908, wave64,1024 threads.",
+  "gpu_work_included": false,
+  "performance_claim": false,
+  "resource_build_status": "not run; root must execute after inspection",
+  "prior_source_cpu_proof_sha256": "1df9a9cdf2133d90880027b9f5f7352549a7834e5daa2284185e4a858c4f683c",
+  "prior_dispatch_proof_sha256": "ce9023f7c3b69f362eaa11db717cc2509b86ab3d7a63fab5113054843b1eef53"
+}

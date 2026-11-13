@@ -1,0 +1,9 @@
+test_fixed_scope (test_sanity.Tests.test_fixed_scope) ... ok
+test_mock_failure_preserves_raw (test_sanity.Tests.test_mock_failure_preserves_raw) ... ok
+test_mock_success (test_sanity.Tests.test_mock_success) ... ok
+test_validate (test_sanity.Tests.test_validate) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.007s
+
+OK

@@ -1,0 +1,16 @@
+{
+  "approved_delete": [
+    "/home/radneon/models-nvme/model-coder-iq1-deploy-20261028/pack-input/Qwen3.8-Flash-Next-GSQ-RCO-Coder-Uncen-IQ1_M-00001-of-00002.gguf",
+    "/home/radneon/models-nvme/qwen38-flash-next-IQ1_M",
+    "/home/radneon/strata/retired/dflash2-20261020T1013Z"
+  ],
+  "preserved_engram": "/home/radneon/models-nvme/shared-engram/qwen38-engram-iq4_nl-2of2.gguf",
+  "preserved_inode": 453,
+  "views": [
+    "2of2",
+    "3of3",
+    "4of4"
+  ],
+  "views_created_with": "cp --reflink=always; only split.no/count changed in new views",
+  "time": 1794347712.903977
+}
