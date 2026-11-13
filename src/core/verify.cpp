@@ -2380,7 +2380,9 @@ bool Verifier::capture(int T, std::string& err) {
             if (ty == cudaGraphNodeTypeKernel) {
                 cudaKernelNodeParams kp{};
                 if (cudaGraphKernelNodeGetParams(nd, &kp) == cudaSuccess) {
-#if CUDART_VERSION >= 12030   // cudaFuncGetName arrived in CUDA 12.3
+#if defined(STRATA_HIP_GFX906)   // the compat build: HIP names the kernel; STRATA_VERIFY_NODES=2 lists the nodes in graph order
+                    if (kp.func != nullptr) { const char* fn = hipKernelNameRefByPtr(kp.func, nullptr); if (fn) name = fn; }
+#elif CUDART_VERSION >= 12030   // cudaFuncGetName arrived in CUDA 12.3
                     const char* fn = nullptr;
                     if (cudaFuncGetName(&fn, kp.func) == cudaSuccess && fn) name = fn;
 #endif
@@ -2388,12 +2390,15 @@ bool Verifier::capture(int T, std::string& err) {
             } else if (ty == cudaGraphNodeTypeMemcpy) name = "memcpy";
             else if (ty == cudaGraphNodeTypeMemset) name = "memset";
             ++kinds[name];
+#if defined(STRATA_HIP_GFX906)
+            if (std::atoi(std::getenv("STRATA_VERIFY_NODES")) >= 2) std::fprintf(stderr, "strata verify node T=%d: %.150s\n", T, name.c_str());
+#endif
         }
         std::vector<std::pair<int, std::string>> v;
         for (auto& [k2, c] : kinds) v.push_back({c, k2});
         std::sort(v.rbegin(), v.rend());
         std::fprintf(stderr, "strata verify: the %d-token window graph has %zu nodes:", T, nn);
-        for (size_t i = 0; i < v.size() && i < 40; ++i) std::fprintf(stderr, " %d x %.60s;", v[i].first, v[i].second.c_str());
+        for (size_t i = 0; i < v.size() && i < 120; ++i) std::fprintf(stderr, " %d x %.150s;", v[i].first, v[i].second.c_str());
         std::fprintf(stderr, "\n");
 #if CUDART_VERSION >= 12030   // the programmatic (PDL) edges: CUDA allows them only from a kernel node to a kernel node
         size_t ne = 0;

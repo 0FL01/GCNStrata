@@ -1167,6 +1167,10 @@ bool norm_fast_on() {
 #if defined(__HIPCC__)
     static const int env = [] { const char* e = std::getenv("STRATA_GR_NORM_FAST"); return e != nullptr ? (std::atoi(e) != 0 ? 1 : 0) : -1; }();
     if (env >= 0) return env != 0;
+#if defined(STRATA_HIP_GFX906)
+    // gfx906 (4x MI50, fused_gr_bench cold, staged read): the norm 12.3 -> 8.6 us, the read 64.6 -> 60.8 us at T 2, bitwise
+    return true;
+#endif
     static int per_dev[64];   // 0 unknown, 1 no, 2 yes
     int dev = 0;
     if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) return false;

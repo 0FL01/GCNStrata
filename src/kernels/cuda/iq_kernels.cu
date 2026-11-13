@@ -3572,7 +3572,9 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
 #if defined(STRATA_HIP_GFX906)
 constexpr int kExpModeDefault = 7;
 constexpr int kExpFallback = 2;   // modes 5-8 on a format without an LDS kernel: R2
-constexpr bool kExpLds16 = false; // IQ2_XXS gate/up: R2 as measured on gfx906
+// IQ2_XXS gate/up in LDS too: MI50, native_expert_bench on Flash-Next UD-Q2_K_XL layer 0, 16 experts x 1 entry,
+// bitwise equal: R2 132.5 us -> LDS (mode 7) 78.8 -> fused (mode 8) 70.2
+constexpr bool kExpLds16 = true;
 #else
 constexpr int kExpModeDefault = 0;
 constexpr int kExpFallback = 0;   // ... the CUDA layout (V100, IQ2_XXS gate/up: R2 183 us vs 113)
@@ -4512,14 +4514,30 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const int q2_mode = 0;
 #endif
     const int em0 = q2_mode ? 7 : requested_mode;
+    // gfx906 per-format table (default; STRATA_GFX906_EXP_TABLE=0 or any STRATA_EXP_MODE / bench mode keeps one mode for
+    // every format).  MI50 at 1400 MHz, native_expert_bench on Flash-Next UD-Q2_K_XL rows, bitwise equal to mode 7 at
+    // every shape tried (8..32 experts x 1..3 entries); 16 experts x 1 entry:
+    //   IQ2_XXS gate/up  mode 7 78.8 us -> fused (mode 8) 70.2      IQ3_XXS gate/up  88.3 -> 80.7
+    //   IQ2_S gate/up    83.8 -> 88.2 (stays mode 7)                Q2_0 down        55.1 -> 44.4 (mode 16's kernel)
+    //   IQ4_NL down      mode 7 stays (R2 wins only with one entry per expert)
+#if defined(__HIPCC__)
+    static const bool table_env = [] { const char* v = std::getenv("STRATA_GFX906_EXP_TABLE"); return v == nullptr || std::atoi(v) != 0; }();
+    const bool table = table_env && g_exp_mode < 0 && q2_env == nullptr && em0 == 7 && q2_modes_current_device_is_gfx906();
 #else
+    const bool table = false;
+#endif
+    const int em_gu = table && (L.gu_type == 16 || L.gu_type == 18) ? 8 : em0;
+#else
+    const bool table = false;
     // CUDA: the AMD layouts launch a block row per possible group, so a call that strides (a verify window's PCIe
     // call, grid_groups 1..cap) keeps the CUDA layout: V100, 0 groups 11.3 vs 6.5 us, 1 group of 2 29.6 vs 21.3
     const int em0 = (grid_groups > 0 && grid_groups < cap_groups) ? 0 : exp_mode();
+    const int em_gu = em0;
 #endif
+    (void) table;
 #endif
 #if STRATA_EXP_LAYOUTS
-    const bool fused_gu = em0 == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
+    const bool fused_gu = em_gu == 8 && ((kExpLds16 && L.gu_type == 16) || L.gu_type == 18 || L.gu_type == 21 || L.gu_type == 22 || L.gu_type == 23) &&
                           L.n_ff % 32 == 0;
     if (fused_gu && g_exp_phase != 2) {
         const dim3 gl((unsigned) (L.n_ff / 32), (unsigned) cap_groups);
@@ -4621,7 +4639,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
 #if STRATA_EXP_LAYOUTS
 #if defined(STRATA_HIP_GFX906) && defined(__HIPCC__)
-    if (q2_mode == 16 && L.d_type == 42 && L.n_embd == 2560 && L.n_ff == 640) {
+    if ((q2_mode == 16 || table) && L.d_type == 42 && L.n_embd == 2560 && L.n_ff == 640) {
         const dim3 gl((unsigned) ((L.n_embd + LDS_RB - 1) / LDS_RB), (unsigned) cap_groups);
         const size_t sh = (size_t) LDS_NT * (size_t) (L.n_ff / 32) * sizeof(block_q8_1);
         native_down_q2_fast_kernel<<<gl, 256, sh, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out);
