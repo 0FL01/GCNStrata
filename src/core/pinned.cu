@@ -413,12 +413,15 @@ uint64_t lock_registered(void* p, uint64_t bytes, std::string& note) {
                "; raise ulimit -l): its pages stay movable and every one moved stops the GPUs (#267); " + note;
         return 0;
     }
+    // khugepaged collapses 4 KiB pages of a MADV_HUGEPAGE range into a huge page: a migration, the same stop of every
+    // queue (seen right after a start with free RAM, when the arena had asked for transparent huge pages).
+    (void) madvise(p, (size_t) bytes, MADV_NOHUGEPAGE);
     int allowed = -1;
     if (std::FILE* f = std::fopen("/proc/sys/vm/compact_unevictable_allowed", "r")) {
         if (std::fscanf(f, "%d", &allowed) != 1) allowed = -1;
         std::fclose(f);
     }
-    note = std::string("mlocked against reclaim (#267)") +
+    note = std::string("mlocked against reclaim (#267), no khugepaged collapse") +
            (allowed == 0 ? " and compaction" : "; vm.compact_unevictable_allowed is not 0: compaction can still move its pages") +
            "; " + note;
     return bytes;
