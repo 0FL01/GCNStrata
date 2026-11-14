@@ -2895,6 +2895,19 @@ int main(int argc, char** argv) {
             return 2;
         }
     }
+#if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
+    // #267: the HIP runtime's own host buffers the GPUs map (staging, kernel arguments, graph uploads) are mlocked
+    // within half a second of their creation, from the load on: an unlocked one moved by compaction stops every queue
+    // of the process on every card.  STRATA_LOCK_GPU_HOST=0 turns the scan off (the A/B arm).
+    if (const char* e = std::getenv("STRATA_LOCK_GPU_HOST"); e == nullptr || std::string(e) != "0")
+        std::thread([] {
+            strata::aux_cpus::pin_current_thread();
+            for (;;) {
+                (void) strata::platform::lock_gpu_shared_mappings();
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            }
+        }).detach();
+#endif
     strata::core::set_peer_portable(o.peer_device >= 1);   // multi-GPU: the Portable flag on mapped host buffers only with a peer device (before any allocation)
     {   // the RAM guard (parking, session save/restore): --memory-limit-mib, else STRATA_MEMORY_LIMIT_MIB, else none
         int64_t mib = o.memory_limit_mib;
@@ -6873,6 +6886,11 @@ int main(int argc, char** argv) {
     }
 
     mem_mark("the expert cache and the graphs");
+#if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
+    // #267: one scan here as well, so the log shows the lock is on (the thread started in main does the rest)
+    std::fprintf(stderr, "strata generate: GPU-mapped host buffers mlocked (#267), %.0f MiB since the last scan\n",
+                 (double) strata::platform::lock_gpu_shared_mappings() / 1048576.0);
+#endif
     std::fprintf(stderr, "strata generate: session is up (engine %s)\n", STRATA_VERSION);
     auto run_head = [&](void* stream) -> bool {
         if (!native_head.loaded())
