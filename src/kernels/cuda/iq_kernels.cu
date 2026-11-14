@@ -4514,7 +4514,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     const int q2_mode = 0;
 #endif
     const int em0 = q2_mode ? 7 : requested_mode;
-    // gfx906 per-format table (default; STRATA_GFX906_EXP_TABLE=0 or any STRATA_EXP_MODE / bench mode keeps one mode for
+    // gfx906 per-format table (default; STRATA_GFX906_EXP_TABLE=0, a bench mode or a STRATA_EXP_MODE other than 16 keeps one mode for
     // every format).  MI50 at 1400 MHz, native_expert_bench on Flash-Next UD-Q2_K_XL rows, bitwise equal to mode 7 at
     // every shape tried (8..32 experts x 1..3 entries); 16 experts x 1 entry:
     //   IQ2_XXS gate/up  mode 7 78.8 us -> fused (mode 8) 70.2      IQ3_XXS gate/up  88.3 -> 80.7
@@ -4522,7 +4522,9 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     //   IQ4_NL down      mode 7 stays (R2 wins only with one entry per expert)
 #if defined(__HIPCC__)
     static const bool table_env = [] { const char* v = std::getenv("STRATA_GFX906_EXP_TABLE"); return v == nullptr || std::atoi(v) != 0; }();
-    const bool table = table_env && g_exp_mode < 0 && q2_env == nullptr && em0 == 7 && q2_modes_current_device_is_gfx906();
+    // (STRATA_EXP_MODE=16, the deployed setting, is mode 7 plus the Q2_0 kernels: the table's gate/up rows apply to it too)
+    const bool table = table_env && g_exp_mode < 0 && (q2_env == nullptr || q2_mode == 16) && em0 == 7 &&
+                       q2_modes_current_device_is_gfx906();
 #else
     const bool table = false;
 #endif
