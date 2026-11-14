@@ -2436,6 +2436,9 @@ bool Verifier::capture(int T, std::string& err) {
     const cudaError_t us = cudaStreamSynchronize(cs_);
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
                  cudaGetErrorString(ue), cudaGetErrorString(us));
+    // First-request pipeline preparation captures every shape on each stage/parity.
+    // Completed graphs are progress; a single stalled capture still has the ordinary watchdog deadline.
+    if (ue == cudaSuccess && us == cudaSuccess) progress_beat();
     return true;
 }
 
