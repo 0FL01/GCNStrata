@@ -191,8 +191,11 @@ void unlock_resident(void* p, uint64_t bytes) {
 }
 
 uint64_t lock_gpu_shared_mappings() {
-    static std::mutex mu;
-    static std::set<std::pair<uintptr_t, uintptr_t>> done;   // ranges already locked (an unmapped one drops its lock)
+    // leaked on purpose: the scan thread is detached and may run while static objects are destroyed at exit
+    static std::mutex& mu = *new std::mutex;
+    // shared mappings already locked, by start and inode: a buffer freed and made again at the same address is a new
+    // shmem object (a new inode) and is locked again
+    static std::set<std::pair<uintptr_t, unsigned long>>& done = *new std::set<std::pair<uintptr_t, unsigned long>>;
     const std::lock_guard<std::mutex> lock(mu);
     std::FILE* f = std::fopen("/proc/self/maps", "r");
     if (f == nullptr) return 0;
@@ -200,14 +203,16 @@ uint64_t lock_gpu_shared_mappings() {
     int failed = 0;
     char line[512];
     while (std::fgets(line, sizeof line, f) != nullptr) {
-        unsigned long a = 0, e = 0;
-        char perms[8] = {0};
-        if (std::sscanf(line, "%lx-%lx %7s", &a, &e, perms) != 3 || std::strcmp(perms, "rw-s") != 0) continue;
+        unsigned long a = 0, e = 0, off = 0, inode = 0;
+        char perms[8] = {0}, dev[16] = {0};
+        if (std::sscanf(line, "%lx-%lx %7s %lx %15s %lu", &a, &e, perms, &off, dev, &inode) != 6 ||
+            std::strcmp(perms, "rw-s") != 0)
+            continue;
         if (std::strstr(line, " /dev/zero (deleted)") == nullptr) continue;
-        if (!done.insert({(uintptr_t) a, (uintptr_t) e}).second) continue;
+        if (!done.insert({(uintptr_t) a, inode}).second) continue;
         // MLOCK_ONFAULT: the pages the GPU maps are resident already; nothing else is touched
         if (mlock2((void*) a, (size_t) (e - a), MLOCK_ONFAULT) != 0 && mlock((void*) a, (size_t) (e - a)) != 0) {
-            done.erase({(uintptr_t) a, (uintptr_t) e});
+            done.erase({(uintptr_t) a, inode});
             ++failed;
             continue;
         }
