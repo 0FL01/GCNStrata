@@ -3572,7 +3572,11 @@ size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
 #if defined(STRATA_HIP_GFX906)
 constexpr int kExpModeDefault = 7;
 constexpr int kExpFallback = 2;   // modes 5-8 on a format without an LDS kernel: R2
-constexpr bool kExpLds16 = false; // IQ2_XXS gate/up: R2 as measured on gfx906
+// IQ2_XXS gate/up in LDS too.  MI50 (1400 MHz), native_expert_bench on Flash-Next UD-Q2_K_XL layer 0, bitwise equal:
+// 16 experts x 1 entry R2 132.5 us -> 78.8, 8 x 2 128.2 -> 56.5; in the engine the first card's expert phase of a
+// verify window 1.68 -> 1.33 ms (its five IQ2_XXS layers).  The fused gate/up (mode 8) is another 8-10% in the bench
+// but was not adopted: no change in the window, and 6% slower prompts when it also took the prompt path's small groups.
+constexpr bool kExpLds16 = true;
 #else
 constexpr int kExpModeDefault = 0;
 constexpr int kExpFallback = 0;   // ... the CUDA layout (V100, IQ2_XXS gate/up: R2 183 us vs 113)
