@@ -391,42 +391,6 @@ std::vector<uint64_t> uniform_bounds(uint64_t bytes, uint64_t slice) {
     if (!b.empty()) b.push_back(b.back() + slice);
     return b;
 }
-
-#if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
-// #267: hipHostRegister does NOT pin, whatever cudaHostRegister does.  KFD maps the range through SVM and follows its
-// pages with an MMU notifier; on a card without retry faults (xnack-: gfx906) the kernel then stops EVERY queue of
-// the process on EVERY card when one page of the range is migrated or reclaimed (kcompactd, kswapd), and validates
-// the whole range again before the queues run: measured on 4x MI50, one 4 KiB page of the 46 GiB arena moved by
-// kcompactd0 = all four cards stopped for 380 ms (/sys/class/kfd/kfd/proc/<pid>/stats_*/evicted_ms), and a page
-// that went to swap is read back first.  A burst of those is the window that "never finished" in 20 s and the 60 s
-// stall right after a load.  So the registered arena is locked as well: reclaim leaves mlocked pages alone, and
-// compaction does with vm.compact_unevictable_allowed=0 (the host's setting; said when it is not).  MLOCK_ONFAULT:
-// no page is touched yet and the load fills them as before.  STRATA_ARENA_LOCK=0 is the A/B arm.
-uint64_t lock_registered(void* p, uint64_t bytes, std::string& note) {
-    const char* env = std::getenv("STRATA_ARENA_LOCK");
-    if (env != nullptr && std::string(env) == "0") {
-        note = "arena lock disabled (STRATA_ARENA_LOCK=0): the registered pages stay movable (#267); " + note;
-        return 0;
-    }
-    if (mlock2(p, (size_t) bytes, MLOCK_ONFAULT) != 0 && mlock(p, (size_t) bytes) != 0) {
-        note = std::string("mlock of the registered arena FAILED (") + std::strerror(errno) +
-               "; raise ulimit -l): its pages stay movable and every one moved stops the GPUs (#267); " + note;
-        return 0;
-    }
-    // khugepaged collapses 4 KiB pages of a MADV_HUGEPAGE range into a huge page: a migration, the same stop of every
-    // queue (seen right after a start with free RAM, when the arena had asked for transparent huge pages).
-    (void) madvise(p, (size_t) bytes, MADV_NOHUGEPAGE);
-    int allowed = -1;
-    if (std::FILE* f = std::fopen("/proc/sys/vm/compact_unevictable_allowed", "r")) {
-        if (std::fscanf(f, "%d", &allowed) != 1) allowed = -1;
-        std::fclose(f);
-    }
-    note = std::string("mlocked against reclaim (#267), no khugepaged collapse") +
-           (allowed == 0 ? " and compaction" : "; vm.compact_unevictable_allowed is not 0: compaction can still move its pages") +
-           "; " + note;
-    return bytes;
-}
-#endif
 }  // namespace
 
 PinnedArena::PinnedArena(uint64_t bytes, uint64_t slice) : PinnedArena(bytes, uniform_bounds(bytes, slice)) {
@@ -460,9 +424,6 @@ PinnedArena::PinnedArena(uint64_t bytes, const std::vector<uint64_t>& bounds,
         if (!capped && e == cudaSuccess) {
             note = "cudaHostRegister PORTABLE ok; " + note;
             registered_bytes = bytes;
-#if (defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)) && !defined(_WIN32)
-            if (backing != PageBacking::LargePages) locked_bytes = lock_registered(base, bytes, note);
-#endif
         } else if (bounds.size() >= 2 && (capped || clear_error())) {
             // Plan v0.3 P5: the whole range is refused, so pin it slice by slice from the start.  The rest stays
             // resident through the working-set lock below.  (P6: slices may differ in size, one per layer.)

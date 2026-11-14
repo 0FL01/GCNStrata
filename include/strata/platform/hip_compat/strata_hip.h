@@ -20,10 +20,6 @@
 
 #include <cstdint>
 #include <cstdlib>
-#if !defined(_WIN32)
-#include <cstdio>
-#include <sys/mman.h>
-#endif
 
 #define STRATA_HIP_GFX906 1
 
@@ -119,36 +115,15 @@ inline hipError_t strata_device_get_attribute(int* v, hipDeviceAttribute_t a, in
 // results, the verify flags): a kernel spins on a word the CPU writes, and the CPU on a word the kernel writes.
 // On AMD that needs FINE-GRAINED (coherent) memory - coarse-grained host memory may sit in the GPU's L2 for the
 // whole kernel and the spin never sees the other side.  So every mapped allocation is made coherent here.
-//
-// #267: and it is mlocked.  hipHostMalloc's pages are not pinned: the thunk maps shared anonymous memory and registers
-// it with KFD as a userptr, which follows the pages through an MMU notifier.  When compaction or reclaim moves one
-// page, KFD stops every queue of the process on every card until it has mapped the range again (seconds under memory
-// pressure: a verify window "never finished").  Locked pages are left alone by reclaim, and by compaction with
-// vm.compact_unevictable_allowed=0.  Unmapping the memory drops the lock, so hipHostFree needs nothing.
-inline void strata_host_lock(void* p, size_t bytes) {
-#if !defined(_WIN32)
-    if (p == nullptr || bytes == 0) return;
-    const uintptr_t a = (uintptr_t) p & ~(uintptr_t) 4095, e = ((uintptr_t) p + bytes + 4095) & ~(uintptr_t) 4095;
-    if (mlock((void*) a, (size_t) (e - a)) != 0) {
-        static bool said = false;
-        if (!said) std::fprintf(stderr, "strata: mlock of pinned host memory failed (raise ulimit -l): a moved page stops the GPUs (#267)\n");
-        said = true;
-    }
-#else
-    (void) p; (void) bytes;
-#endif
-}
 inline hipError_t strata_host_alloc(void** p, size_t bytes, unsigned int flags) {
     if (flags & hipHostMallocMapped) flags |= hipHostMallocCoherent;
-    const hipError_t e = hipHostMalloc(p, bytes, flags);
-    if (e == hipSuccess) strata_host_lock(*p, bytes);
-    return e;
+    return hipHostMalloc(p, bytes, flags);
 }
 template <typename T> inline hipError_t strata_host_alloc(T** p, size_t bytes, unsigned int flags) {
     return strata_host_alloc(reinterpret_cast<void**>(p), bytes, flags);
 }
 #define cudaHostAlloc strata_host_alloc
-#define cudaMallocHost(ptr, size) strata_host_alloc(ptr, size, hipHostMallocDefault)
+#define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
 #define cudaFreeHost hipHostFree
 #define cudaHostRegister hipHostRegister
 #define cudaHostUnregister hipHostUnregister

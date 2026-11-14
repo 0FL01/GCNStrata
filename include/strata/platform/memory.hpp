@@ -30,6 +30,12 @@ LockResult lock_resident_ranges(const std::vector<std::pair<void*, uint64_t>>& r
 /// Undo lock_resident for the same region (best effort).
 void unlock_resident(void* p, uint64_t bytes);
 
+/// #267 (Linux): mlock every shared anonymous mapping of this process ("/dev/zero (deleted)", rw-s) not locked by an
+/// earlier call.  That is how the ROCm thunk allocates host memory the GPUs map - hipHostMalloc, and the runtime's own
+/// staging and kernel-argument buffers that no wrapper of ours sees.  KFD does not pin those pages; when compaction or
+/// reclaim moves one, every queue of the process stops on every card.  Returns the bytes newly locked (0 elsewhere).
+uint64_t lock_gpu_shared_mappings();
+
 /// #243, Windows: the GPU's shared (non-local) memory budget and this process's use of it, from DXGI
 /// (IDXGIAdapter3::QueryVideoMemoryInfo, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL) for the adapter whose LUID is the
 /// 8 bytes at `luid` (cudaDeviceProp::luid).  Page-locked host memory the GPU maps is charged there.  False (and

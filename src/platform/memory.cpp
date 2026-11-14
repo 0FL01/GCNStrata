@@ -13,6 +13,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <mutex>
+#include <set>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -160,6 +162,7 @@ uint64_t total_physical_memory() {
 bool read_ahead_enabled() { return false; }
 void advise_willneed(const void*, uint64_t) {}
 void advise_willneed(int, uint64_t, uint64_t) {}
+uint64_t lock_gpu_shared_mappings() { return 0; }
 #else
 LockResult lock_resident(void* p, uint64_t bytes) {
     LockResult r;
@@ -185,6 +188,38 @@ LockResult lock_resident_ranges(const std::vector<std::pair<void*, uint64_t>>& r
 
 void unlock_resident(void* p, uint64_t bytes) {
     if (p != nullptr && bytes != 0) munlock(p, bytes);
+}
+
+uint64_t lock_gpu_shared_mappings() {
+    static std::mutex mu;
+    static std::set<std::pair<uintptr_t, uintptr_t>> done;   // ranges already locked (an unmapped one drops its lock)
+    const std::lock_guard<std::mutex> lock(mu);
+    std::FILE* f = std::fopen("/proc/self/maps", "r");
+    if (f == nullptr) return 0;
+    uint64_t newly = 0;
+    int failed = 0;
+    char line[512];
+    while (std::fgets(line, sizeof line, f) != nullptr) {
+        unsigned long a = 0, e = 0;
+        char perms[8] = {0};
+        if (std::sscanf(line, "%lx-%lx %7s", &a, &e, perms) != 3 || std::strcmp(perms, "rw-s") != 0) continue;
+        if (std::strstr(line, " /dev/zero (deleted)") == nullptr) continue;
+        if (!done.insert({(uintptr_t) a, (uintptr_t) e}).second) continue;
+        // MLOCK_ONFAULT: the pages the GPU maps are resident already; nothing else is touched
+        if (mlock2((void*) a, (size_t) (e - a), MLOCK_ONFAULT) != 0 && mlock((void*) a, (size_t) (e - a)) != 0) {
+            done.erase({(uintptr_t) a, (uintptr_t) e});
+            ++failed;
+            continue;
+        }
+        newly += e - a;
+    }
+    std::fclose(f);
+    static bool said = false;
+    if (failed > 0 && !said) {
+        std::fprintf(stderr, "strata: mlock of %d GPU-mapped host buffers failed (raise ulimit -l): a moved page stops the GPUs (#267)\n", failed);
+        said = true;
+    }
+    return newly;
 }
 
 bool gpu_shared_memory_budget(const void*, uint64_t& budget, uint64_t& usage, std::string& why) {
