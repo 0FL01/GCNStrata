@@ -24,6 +24,7 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/program/split26_fixed.hpp"
 #include "strata/core/conversation_snapshot.hpp"
+#include "strata/core/serve_stop_bound.hpp"
 #include "strata/core/conversation_file.hpp"
 #include "strata/core/session_save_reclaim.hpp"
 #include "strata/core/conversation_memory.hpp"
@@ -15007,8 +15008,12 @@ int main(int argc, char** argv) {
                     chain_kind = 0;
                     int a = 0;
                     while (a < A.T - 1 && A.tok[a + 1] == outp[(size_t) a]) ++a;
-                    if (!V1(A).pl_commit_async(a + 1, err)) return die(err);
-                    for (int i = 0; i <= a; ++i) consumed.push_back(A.tok[i]);
+                    // Keep the verifier's verdict for policy/statistics, but never cache unexposed input rows.
+                    const int kept_rows = strata::core::serve_stop_bound(a + 1, max_new - produced_n, outp.data(), [&](int32_t y) {
+                        return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                    });
+                    if (!V1(A).pl_commit_async(kept_rows, err)) return die(err);
+                    for (int i = 0; i < kept_rows; ++i) consumed.push_back(A.tok[i]);
                     draft_offered += A.T - 1;
                     draft_accepted += a;
                     ++rounds;
@@ -15017,7 +15022,7 @@ int main(int argc, char** argv) {
                     dec_T += A.T;
                     const bool nf = nonfinite_hit(V1(A), "decode");   // #879: none of its tokens goes out
                     bool eos = false;
-                    for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
+                    for (int i = 0; !nf && i < kept_rows && produced_n < max_new && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
                         strata::core::progress_beat();
                         ++produced_n;
@@ -15055,8 +15060,8 @@ int main(int argc, char** argv) {
                         for (int i = 0; i <= a; ++i) std::fprintf(stderr, " %d", (int) outp[(size_t) i]);
                         std::fprintf(stderr, "\n");
                     }
-                    x = outp[(size_t) a];
-                    p = A.p + a + 1;
+                    x = outp[(size_t) kept_rows - 1];
+                    p = A.p + kept_rows;
                     pcie_auto_step(req_pcie_frac);   // 0.1.44: the measured share in the pipelined loop too (STRATA_PCIE_AUTO_SPLIT=1 on a split)
                     if (!last && !ajob && !pl_adapt()) return die("an adaptive refill failed");
                     if (on && !last) {
@@ -15080,12 +15085,12 @@ int main(int argc, char** argv) {
                         // the front stages B never ran on take A's real commit now; those it did run on are undone
                         // (snapshot restored, the commit replayed) once it has stopped
                         for (int st = 0; st < pl_nf; ++st)
-                            if ((A.com & (1u << st)) == 0 && !VF(st, A).pl_commit_async(a + 1, err)) return die(err);
+                            if ((A.com & (1u << st)) == 0 && !VF(st, A).pl_commit_async(kept_rows, err)) return die(err);
                         if (B.launched) {   // a wrong guess (or the end): undo once it has stopped
                             doomed = true;
                             D = B;
                             undo_w = A;
-                            undo_keep = a + 1;
+                            undo_keep = kept_rows;
                         }
                         // B is D now (or dropped): never pump it twice (whichever copy saw the window complete first
                         // would finish it, and the other would wait for it forever)
@@ -15328,6 +15333,10 @@ int main(int argc, char** argv) {
                 }
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+                // Merged windows contain prompt rows: all must be committed. Keep raw acceptance for the policy.
+                const int kept_rows = merged ? T : strata::core::serve_stop_bound(a + 1, max_new - produced_n, outv.data(), [&](int32_t y) {
+                    return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                });
                 if (from_sfx) { ++sfx_windows; sfx_drafts += T - 1; sfx_ok += a; }
                 if (chain_n > 0) { ++chain_windows; chain_drafts += chain_n; chain_ok += std::max(0, a - (T_mtp - 1)); }
                 if (!from_sfx && !first_window)
@@ -15345,7 +15354,7 @@ int main(int argc, char** argv) {
                 // Merged prompt/decode windows are new in main and stay on the original commit path.
                 const bool defer_primary_commit = primary_commit_eligible && !merged;
                 PrimaryCommitScope primary_scope{ver, defer_primary_commit, defer_primary_commit ? &adapt_thr : nullptr};
-                if (!ver.commit(a + 1, err, defer_primary_commit ? &primary_context : nullptr)) {
+                if (!ver.commit(kept_rows, err, defer_primary_commit ? &primary_context : nullptr)) {
                     if (defer_primary_commit) { std::string drain_err; primary_scope.active = !ver.wait_commit(drain_err); }
                     if (adapt_thr.joinable()) adapt_thr.join();
                     std::printf("ERR %s\n", err.c_str());
@@ -15369,15 +15378,15 @@ int main(int argc, char** argv) {
                     std::printf("ERR %s\n", err.c_str());
                     return 1;
                 }
-                // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
-                for (int i = 0; i <= a; ++i) consumed.push_back(window[(size_t) i]);
+                // The kept input rows are in the session now; the last emitted output is still pending.
+                for (int i = 0; i < kept_rows; ++i) consumed.push_back(window[(size_t) i]);
                 if (!merged) {   // (a merged window's rows are prompt tokens, not drafts)
                     draft_offered += T - 1;
                     draft_accepted += a;
                 }
                 first_window = false;
                 bool eos = false;
-                for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
+                for (int i = merged ? a : 0; i < kept_rows && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
                     std::printf("T %d\n", (int) outv[(size_t) i]);
                     strata::core::progress_beat();
                     ++produced_n;
@@ -15431,8 +15440,8 @@ int main(int argc, char** argv) {
                                          std::chrono::duration<double, std::milli>(Clock::now() - round0).count());
                 if (eos) { finish = "stop"; break; }
                 if (stop_req.load()) { finish = "cancel"; break; }
-                x = outv[(size_t) a];
-                p += a + 1;
+                x = outv[(size_t) kept_rows - 1];
+                p += kept_rows;
             }
             const double decode_ms = std::chrono::duration<double, std::milli>(Clock::now() - d0).count();
             // the last commit (set_commit_async): the session is complete before anything reads or copies it

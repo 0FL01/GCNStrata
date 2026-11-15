@@ -1,0 +1,44 @@
+{
+  "passed": true,
+  "baseline_bad_L": 60,
+  "candidate_L": 59,
+  "baseline_continuation_reused_read": [
+    58,
+    2
+  ],
+  "candidate_continuation_reused_read": [
+    59,
+    1
+  ],
+  "all_stage_bounded_replay": [
+    0,
+    1,
+    2
+  ],
+  "state_reference": "same-binary pipeline with theta=2 (no speculative B)",
+  "state_keys": [
+    "gdn",
+    "ple",
+    "tail",
+    "dead",
+    "pooled",
+    "kv",
+    "stage0 ple_prev",
+    "draft KV [0,L-1)"
+  ],
+  "excluded_stale_state": [
+    "KV beyond L",
+    "idx_pooled spare row",
+    "non-owner stage1/2/3 ple_prev"
+  ],
+  "runs": {
+    "baseline-sweep": 11,
+    "candidate-sweep": 11,
+    "candidate-no-b": 11,
+    "candidate-serial-matched": 4,
+    "candidate-eos-first": 4,
+    "candidate-eos-last": 4,
+    "release-smoke": 4
+  },
+  "scope": "short synthetic Q3/gfx906 native length/EOS and continuation; not a quality or performance benchmark"
+}

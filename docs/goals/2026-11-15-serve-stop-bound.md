@@ -20,20 +20,20 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
   - Source: approved plan, sections "What changes" and phase 2; upstream `243fdb213c270ffd0be76c17c7d1cc3d4a2361dd` and `13eedf552417a6a791a7d13c6597e24300ee3a09`.
   - Acceptance: emitted native IDs are unchanged under matched conditions; committed input rows stop at the output budget/first EOS, last output stays pending; merged prompt rows are not truncated; no zero-row verifier commit.
   - Primary evidence: ported host policy regression and an old-fails/new-passes native boundary reproduction.
-  - Status: in_progress
-  - Evidence: current `c723df72` commits before emission truncation at `generate.cpp:15008` and `:15329`; upstream-only host test passed 2736 cases in a temporary directory, not yet a test of this fork's candidate.
+  - Status: verified
+  - Evidence: ported host2736+zero and actual-source consumer regression pass (baseline fails); GPU baseline overcommits while candidate passes native budget/EOS, prefix and output checks. Published proof: `bench/results/2026-11-15-serve-stop-bound/evidence/qualification-summary.json`.
 - R2: Preserve existing verdict consumers and correctly settle all affected GPU stages before reuse.
   - Source: approved plan and its three independent reviews.
   - Acceptance: raw accepted drafts still feed policy/calibration/acceptance diagnostics; bounded input-row count feeds commit/consumed/position/pending/rollback. A launched speculative B is drained and affected front stages restored/replayed; valid state and direct-live/parked continuation agree with a justified prefix reference.
   - Primary evidence: targeted host consumer regression plus trace-backed four-GPU state/continuation qualification, including a sampled request.
-  - Status: pending
-  - Evidence: planned; existing `STRATA_STATE_HASH` alone covers only the primary stage and is insufficient.
+  - Status: verified
+  - Evidence: raw verdict consumers preserved; trace proves bounded replay on all three front stages; four-stage valid state and draft KV match no-B reference. Matched-layout serial and both EOS positions pass. Direct-live/parked continuation and uninstrumented smoke pass;49 requests in seven required runs.
 - R3: Publish the verified focused change, tests, provenance and limitations to `0FL01/Strata/main`.
   - Source: user: "коммит пуши делай (в main)"; approved plan phase 3.
   - Acceptance: required builds/checks and independent implementation review are complete (or an explicit user exception is recorded); uninstrumented candidate passes boundary/continuation smoke; remote main SHA matches the published commit, no force push.
   - Primary evidence: build/test/review artifacts, commit and `git ls-remote origin refs/heads/main`.
-  - Status: pending
-  - Evidence: planning-only commits may precede runtime publication; no candidate is qualified yet.
+  - Status: in_progress
+  - Evidence: gfx906 build and qualification passed, independent implementation/checker reviews have no remaining blockers. Runtime fix and evidence are ready for main publication; binary2c3da126 is uninstrumented and smoke-qualified.
 - R4: Deploy the qualified uninstrumented fix and leave production on Q3_K_XL + IQ4_NL.
   - Source: subsequent user approval: "прод отключить, что бы упростить разработку, после тестов и исправлений, развернуть прод с исправлениями версиями бинарей, продолжай".
   - Acceptance: after qualification, manually select the new binary with compose backed up; production is healthy on the same Q3 config, running binary SHA verified, authenticated text/continuation smoke passes.
@@ -88,10 +88,10 @@ After the required builds and checks, independently review the actual diff, fix 
 
 ## Current Checkpoint
 
-- Closes: GPU portions of R1/R2.
-- Smallest next action: run isolated baseline/candidate native boundary fixtures and inspect per-stage diagnostics.
-- Expected evidence: baseline violates the commit bound; candidate preserves output and prefix, with proven speculative rollback and continuation routes.
-- Stop/replan if: a branch/reference is not actually exercised or state differs; identify the in-scope cause rather than broadening the fix.
+- Closes: R3/R4.
+- Smallest next action: publish the qualified fix, then manually select/deploy that exact release binary and verify production.
+- Expected evidence: remote main SHA, uninstrumented release hash, healthy Q3 and authenticated text/continuation checks.
+- Stop/replan if: source/binary identity differs, GPU holders remain, or deployment verification fails; no automatic rollback/model switch.
 
 ## Current State
 
@@ -101,6 +101,11 @@ After the required builds and checks, independently review the actual diff, fix 
 - Build image: `sha256:bccb7ee7e7a78274519db9a43ba63c34ddd2e74bb60f8764a8f50aaee1f2c646`. gfx906 build and ported host CTest passed; uninstrumented candidate SHA256 `2c3da12662846c07fb50bb7aa0f4a3f49fb7cba32917d118c92fc044fb7345bd`. Supplemental native HIP/gfx1100 build and host CTest also passed, without GPU execution on that backend. No native CUDA build; explicitly outside user scope.
 - Lab: `/home/radneon/strata-rd/serve-stop-bound-20261115/`; `src`, `gfx906-build`, `hip-build`, separate `diagnostic-{baseline,candidate}` sources/builds, `artifacts/`. Compose backup: `compose.before.yaml`. All 398 baseline source/include/CMake/cmake files matched `c723df72` before copying the lab seed.
 - Host checks: actual-source serial regression passed (raw policy verdict, bounded input prefix, merged bypass); baseline source compiled and failed `committed INPUT rows must equal emitted outputs`. Pure helper passed 2736 cases plus zero remaining. CMake/CTest passed with `STRATA_BUILD_CONVERSATION_TESTS=ON STRATA_NATIVE_EXPERTS=OFF` (header-only check; no dependency download required).
+- GPU negative control: `artifacts/baseline-sweep/results.json`, diagnostic baseline SHA256 `393c0e3a6925685d9f5c1ce7ab0a9e5ae0f5f75d41fbe640646dfe6186ca8cf6`. Sampled A-2 emitted `[24,11]`, but all four stages reported L=60 instead of59; continuation reused58/read2 instead of59/read1. Trace proves T2 accepted2, remaining1, B launched, early full commits on stages0/1/2 (`com=7`), then replay keep2. Budget4/8 and greedy-control also overshot.
+- Candidate pipeline sweep passed: diagnostic SHA256 `42018a8a25a7bf45cf89d2bcc30bdb2a70fec46938c928587e6121ade89dcbfb`, artifacts `candidate-sweep`. All11 corresponding output-ID sequences and raw accepted-draft counts match baseline; all consumed histories and four-stage lengths are correct. A-2 now L59, replay keep1 on all three front stages, live continuation reused59/read1; park/restore passed.
+- State reference `candidate-no-b` passed: same diagnostic binary, theta2, no early speculative commit. All11 requests' valid GDN/PLE/KV/index and conservative draft-KV fingerprints match the normal pipeline on all four stages. Uncut baseline windows A-1/A-3/A-5/A-7 also match candidate valid state.
+- Sequential GPU job `1794736607165-73` completed: EOSfirst11, EOSlast220, startup-serial and uninstrumented release smoke passed IDs/bounds/reuse. Aggregate checker correctly stopped on an unmatched serial/pipeline state comparison (different expert placement; see decision below).
+- GPU job `1794738527499-74` completed successfully. `candidate-serial-matched` retains pipeline2 startup args/capacities and its valid state matches pipeline. Aggregate checker passed all seven required runs; release smoke also passed. Recheck empty KFD holders before production start. Source runtime/release binary unchanged.
 
 ## Material Decisions / Checkpoints
 
@@ -108,7 +113,9 @@ After the required builds and checks, independently review the actual diff, fix 
 - 2026-11-15: user approved iterative implementation and main publication; saved this contract before runtime edits. Source reference is the supplied audit plus inspected upstream commits; the linked sandbox archive was not available locally.
 - 2026-11-15: published the goal as `fcc2146f`; user subsequently authorized stopping production for development and deploying corrected binaries after tests. Added R4 from that explicit instruction, not from test/review scope expansion.
 - 2026-11-15: user explicitly narrowed hardware scope: "наш форк только под gfx906" and requested this rule in `AGENTS.md`. Replaced the inherited all-backend build requirement; no NVIDIA toolchain download or CUDA gate. Native implementation and host checks are complete; GPU evidence, review, fix publication and deployment remain.
+- 2026-11-15: EOS-first comparison exposed only unused `ple_prev` metadata on non-owner stages1/2/3 (cold=-1,-1, checkpoint restore reconstructs old token IDs). Verified `Verifier::ple_stage()` and actual split K=11,23,36: only stage0 owns layer1. Checker now requires stage0 history to equal consumed tail and retains all-stage payload comparisons; it excludes non-owner history only. Independent reviewer confirmed the source/actual artifacts and corrected EOS comparison passed. No runtime edit or tolerance relaxation.
+- 2026-11-15: startup `--pipeline-windows 1` produced23023 expert slots versus pipeline2's22698; comparing their state hashes is not a matched-math oracle (CPU/GPU expert placement differs). Kept those artifacts as `candidate-serial`, added only a runner option for existing per-request `STRATA_PIPELINE_SWITCH pw=1`, and require identical startup args and expert capacities for `candidate-serial-matched`. Strict payload equality remains; no runtime change or widened tolerance.
 
 ## Completion
 
-Not complete. Candidate implementation, backend builds, GPU qualification, implementation review and fix publication remain outstanding.
+Not complete: R1/R2 verified; qualified fix publication and production deployment/verification remain outstanding.
