@@ -1,7 +1,7 @@
 # AGENTS.md
 
-Strata runs the Qwen3.8-Flash-Next mixture-of-experts model (and its Coder, Swift 1.5 and Unsloth variants) on a
-normal PC: one NVIDIA or AMD graphics card plus system RAM, on Windows or Linux. It has a C++/CUDA/HIP engine
+This fork targets **AMD gfx906 only** (MI50 / Radeon Pro VII). Other upstream backend sources are retained,
+but NVIDIA CUDA, other AMD architectures and SYCL are not supported qualification targets. It has a C++/HIP engine
 (`src/`, `include/`), a Python server with an OpenAI- and Anthropic-compatible API and a web app (`serve/`), and a
 one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
 
@@ -16,7 +16,8 @@ offers the same steps as tools.
 
 - How the engine works, every measured number, the API and all settings: [docs/DETAILS.md](docs/DETAILS.md) and
   the [paper](docs/paper/Strata-Paper.pdf).
-- AMD (HIP) build and validation: [docs/AMD_HIP.md](docs/AMD_HIP.md); multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
+- gfx906 builds use `-DSTRATA_HIP_GFX906=ON -DCMAKE_HIP_ARCHITECTURES=gfx906` (CUDA-source HIP compatibility),
+  not the separate wave32 `STRATA_ENABLE_HIP` backend. Multi-GPU: [docs/MULTI_GPU.md](docs/MULTI_GPU.md).
 - Setup's own tests run without a GPU or downloads: `python tools/test_setup_<name>.py` (for example
   `tools/test_setup_amd.py`, `tools/test_setup_choices.py`).
 - Keep the docs' style: plain words, measured numbers with what they were measured on, no claims without a
@@ -28,7 +29,8 @@ offers the same steps as tools.
 - Open an issue with the form that fits (bug report, feature request or question).
 - One change per pull request. Say what it changes and what it leaves alone.
 - A new feature is opt-in, and the default path stays byte-identical to the last release. Say how you checked.
-- Build every backend a file touches (CUDA, HIP, SYCL) before asking for review.
+- Build and qualify the changed runtime on gfx906 before review. Do not require or download other-backend
+  toolchains because a shared file also serves upstream targets; expand hardware scope only on explicit user request.
 - Change a default only where you measured it faster, and show the numbers with what they were measured on.
 - A report from hardware the maintainers do not have is welcome. Follow
   [docs/COMMUNITY_BENCHMARKS.md](docs/COMMUNITY_BENCHMARKS.md), compare against a same-day run of the build you are

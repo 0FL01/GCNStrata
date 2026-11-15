@@ -34,13 +34,19 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
   - Primary evidence: build/test/review artifacts, commit and `git ls-remote origin refs/heads/main`.
   - Status: pending
   - Evidence: planning-only commits may precede runtime publication; no candidate is qualified yet.
+- R4: Deploy the qualified uninstrumented fix and leave production on Q3_K_XL + IQ4_NL.
+  - Source: subsequent user approval: "прод отключить, что бы упростить разработку, после тестов и исправлений, развернуть прод с исправлениями версиями бинарей, продолжай".
+  - Acceptance: after qualification, manually select the new binary with compose backed up; production is healthy on the same Q3 config, running binary SHA verified, authenticated text/continuation smoke passes.
+  - Primary evidence: deployment backup/provenance and `stratactl status` plus authorized smoke results.
+  - Status: pending
+  - Evidence: downtime and deployment now authorized; preflight required before stopping.
 
 ### Constraints
 
 - Preserve the deployed Q5 correction (`c723df72`), FP16, INT8 KV, MTP, #267 memory locks and `vm.compact_unevictable_allowed=0`. Do not tune clocks or model parameters as part of the fix.
-- Production remains Q3_K_XL + IQ4_NL. Deployment is a separate approval, not implied by code publication. Never promote an instrumented audit binary.
+- Production remains Q3_K_XL + IQ4_NL. Downtime and eventual deployment were explicitly approved after the plan; never promote an instrumented audit binary.
 - GPU experiments require an explicitly approved downtime window: pause clients, check requests/open API connections, running test jobs, GPU use and KFD holders before lifecycle changes. Before resuming production, confirm test processes have released the GPUs. Idle checks are not an atomic drain.
-- Build every affected backend consumer before implementation review, or stop for an explicit exception/toolchain decision. A missing build is not a pass.
+- Build/qualify gfx906 before implementation review. User clarified that this fork targets gfx906 only; native CUDA/NVIDIA is not a gate. Do not download its toolchain. A supplemental native HIP build is not gfx906 GPU qualification.
 - Never expose API secrets, Docker environment contents or private request bodies. Preserve the dirty remote deployment checkout; work in an isolated R&D tree.
 
 ### Non-goals
@@ -68,7 +74,7 @@ Use `c723df72`, not the older Q5-buggy binary. Freeze prompt IDs and sampling. C
 - Port both upstream changes' meaning without `STRATA_USE_HIP` gating: gfx906 uses CUDA-compatible HIP. Do not cherry-pick unrelated upstream code or the restricted pending-prefix experiment.
 - Keep raw accepted **drafts** separate from kept **input rows** (different units). Do not train `policy.observe*()` or rejection statistics on an artificial budget cut. Preserve EOS policy exclusion and merged prompt commits.
 - Run the ported host test, a focused verdict-consumer regression, and actual-callsite merged exclusion check. No generic simulator/test framework.
-- Build common CUDA and native HIP consumers, including the production gfx906 compatibility configuration. Missing toolchains require an explicit decision before code review/publication.
+- Build the production gfx906 compatibility configuration. The original broader build gate was superseded by the user's explicit gfx906-only scope; native CUDA and other architectures are not publication requirements.
 - On four GPUs after approval, use the unchanged Q3 profile: pipeline2, spec6, mtp-max-t2, no coupled draft, suffix0, PCIe0, adapt0, PIPED_CONCURRENT0. Ordinary windows are at most two rows. PIPE_SHAPE_PREP=1 is configured but its two-stage eligibility does not hold for four stages.
 - Short budget sweep 1/2/3/4/5/7/8; EOS at each actual two-row output position; both modified decode paths. No Cartesian product. If a test EOS ID is selected from observed outputs, exclude earlier occurrences and prove the actual stop position and original acceptance from diagnostics.
 - Exercise no-B and one actual B-launched case. Prove early full A commit on each reached front stage, B launch, restore, bounded replay and post-drain state. Matching output or a configured pipeline alone is insufficient. Record a real rejected draft as a control where reached.
@@ -82,23 +88,26 @@ After the required builds and checks, independently review the actual diff, fix 
 
 ## Current Checkpoint
 
-- Closes: R1 and host portion of R2.
-- Smallest next action: implement the pure bound and separate raw verdict from committed rows; add the nearest host regressions.
-- Expected evidence: policy and actual-consumer tests pass; the old unbounded callsite fails the regression; source diff contains no unrelated change.
-- Stop/replan if: tests reveal a direct induced state-consumer defect; do not add adjacent fixes.
+- Closes: GPU portions of R1/R2.
+- Smallest next action: run isolated baseline/candidate native boundary fixtures and inspect per-stage diagnostics.
+- Expected evidence: baseline violates the commit bound; candidate preserves output and prefix, with proven speculative rollback and continuation routes.
+- Stop/replan if: a branch/reference is not actually exercised or state differs; identify the in-scope cause rather than broadening the fix.
 
 ## Current State
 
 - Baseline: local and remote fork main `c723df72f54b21d54db073710981163a435d1573`.
-- Production: Q3_K_XL + IQ4_NL, healthy, engine SHA256 `fbc52b5228c32709e86b009fe690db5c3edd9f83f0d2433fdc72fffc87f775b2`; no lifecycle changes during RECON.
+- Production: stopped with explicit user approval through `stratactl stop`; preflight found zero inflight, all four GPUs idle and only the production KFD holder. After stop no GPU holders remained. Q3 config unchanged; previous qualified engine SHA256 `fbc52b5228c32709e86b009fe690db5c3edd9f83f0d2433fdc72fffc87f775b2`.
 - Scope evidence: PCIe/adaptation disabled in live argv. No penalties in config, but actual client sampling is unknown (`api_monitor=false`); do not claim penalties universally off.
-- Build availability: pinned image `sha256:bccb7ee7e7a78274519db9a43ba63c34ddd2e74bb60f8764a8f50aaee1f2c646` provides HIP; `nvcc` is absent on local host, remote host and the only available remote image. Native CUDA build remains an external-toolchain gate.
-- GPU window: not yet approved. Continue host/source work without stopping production.
+- Build image: `sha256:bccb7ee7e7a78274519db9a43ba63c34ddd2e74bb60f8764a8f50aaee1f2c646`. gfx906 build and ported host CTest passed; uninstrumented candidate SHA256 `2c3da12662846c07fb50bb7aa0f4a3f49fb7cba32917d118c92fc044fb7345bd`. Supplemental native HIP/gfx1100 build and host CTest also passed, without GPU execution on that backend. No native CUDA build; explicitly outside user scope.
+- Lab: `/home/radneon/strata-rd/serve-stop-bound-20261115/`; `src`, `gfx906-build`, `hip-build`, separate `diagnostic-{baseline,candidate}` sources/builds, `artifacts/`. Compose backup: `compose.before.yaml`. All 398 baseline source/include/CMake/cmake files matched `c723df72` before copying the lab seed.
+- Host checks: actual-source serial regression passed (raw policy verdict, bounded input prefix, merged bypass); baseline source compiled and failed `committed INPUT rows must equal emitted outputs`. Pure helper passed 2736 cases plus zero remaining. CMake/CTest passed with `STRATA_BUILD_CONVERSATION_TESTS=ON STRATA_NATIVE_EXPERTS=OFF` (header-only check; no dependency download required).
 
 ## Material Decisions / Checkpoints
 
 - 2026-11-15: two RECON agents and three independent plan reviewers; final plan has no blocking review findings. Incorporated raw-verdict separation, all-stage rollback evidence, valid draft-KV interval, backend scope and operational gates. Plan review is not implementation qualification.
 - 2026-11-15: user approved iterative implementation and main publication; saved this contract before runtime edits. Source reference is the supplied audit plus inspected upstream commits; the linked sandbox archive was not available locally.
+- 2026-11-15: published the goal as `fcc2146f`; user subsequently authorized stopping production for development and deploying corrected binaries after tests. Added R4 from that explicit instruction, not from test/review scope expansion.
+- 2026-11-15: user explicitly narrowed hardware scope: "наш форк только под gfx906" and requested this rule in `AGENTS.md`. Replaced the inherited all-backend build requirement; no NVIDIA toolchain download or CUDA gate. Native implementation and host checks are complete; GPU evidence, review, fix publication and deployment remain.
 
 ## Completion
 
