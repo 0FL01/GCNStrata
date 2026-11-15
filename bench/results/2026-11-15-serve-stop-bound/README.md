@@ -54,6 +54,10 @@ python3 bench/results/2026-11-15-serve-stop-bound/check.py \
 
 ## Build, review and limits
 
+- Published as `de499eacfa63db1697c80f74766a0432828f4161` and deployed on2026-11-15;
+  `evidence/deployment.json` confirms healthy Q3, the running-process hash, auth,
+  text and two-turn continuation. Only the binary mount changed; model/JSON stayed
+  unchanged. Explicit rollback remains operator-controlled.
 - Qualified uninstrumented binary SHA256:
   `2c3da12662846c07fb50bb7aa0f4a3f49fb7cba32917d118c92fc044fb7345bd`.
 - `evidence/build-identity.json` records exact source hashes, unchanged baseline

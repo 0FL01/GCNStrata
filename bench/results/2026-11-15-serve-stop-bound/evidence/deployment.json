@@ -1,0 +1,48 @@
+{
+  "passed": true,
+  "runtime_commit": "de499eacfa63db1697c80f74766a0432828f4161",
+  "live": {
+    "model": "Qwen3.8-Flash-Next-Unsloth-UD-Q3_K_XL-IQ4_NL-PLE",
+    "loaded": true,
+    "in_flight": 0,
+    "engine_sha256": "2c3da12662846c07fb50bb7aa0f4a3f49fb7cba32917d118c92fc044fb7345bd"
+  },
+  "health": "healthy",
+  "restart_count": 0,
+  "change": "only binary mount; Q3 JSON/model/settings unchanged",
+  "config_sha256": "0a67728bf26672823945510da5565d5a4a1bd373111e5d578567313d1224b692",
+  "release": "/home/radneon/strata/releases/gfx906-stop-bound-de499eac-20261115/strata",
+  "compose_backup": "/home/radneon/strata/deploy/serve-stop-bound-20261115/compose.before.yaml",
+  "auth_and_text_smoke": "passed by stratactl start",
+  "continuation": {
+    "passed": true,
+    "turns": [
+      {
+        "finish": "stop",
+        "usage": {
+          "prompt_tokens": 24,
+          "completion_tokens": 2,
+          "total_tokens": 26,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "content_chars": 2
+      },
+      {
+        "finish": "stop",
+        "usage": {
+          "prompt_tokens": 51,
+          "completion_tokens": 3,
+          "total_tokens": 54,
+          "prompt_tokens_details": {
+            "cached_tokens": 25
+          }
+        },
+        "content_chars": 5
+      }
+    ]
+  },
+  "vm_compact_unevictable_allowed": 0,
+  "logs_sh_unchanged": true
+}

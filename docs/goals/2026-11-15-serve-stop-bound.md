@@ -1,6 +1,6 @@
 # Goal: bound speculative serve commits to native output
 
-Status: active
+Status: complete
 Source: user-approved RECON/plan of 2026-11-15; subsequent request to save the plan, implement iteratively, and commit/push to `0FL01/Strata/main`.
 Last updated: 2026-11-15
 
@@ -32,14 +32,14 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
   - Source: user: "коммит пуши делай (в main)"; approved plan phase 3.
   - Acceptance: required builds/checks and independent implementation review are complete (or an explicit user exception is recorded); uninstrumented candidate passes boundary/continuation smoke; remote main SHA matches the published commit, no force push.
   - Primary evidence: build/test/review artifacts, commit and `git ls-remote origin refs/heads/main`.
-  - Status: in_progress
-  - Evidence: gfx906 build and qualification passed, independent implementation/checker reviews have no remaining blockers. Runtime fix and evidence are ready for main publication; binary2c3da126 is uninstrumented and smoke-qualified.
+  - Status: verified
+  - Evidence: runtime fix/evidence published as `de499eacfa63db1697c80f74766a0432828f4161`, remote main SHA verified. Gfx906 build/qualification passed and independent implementation/checker reviews have no remaining blockers. Binary2c3da126 is uninstrumented and smoke-qualified.
 - R4: Deploy the qualified uninstrumented fix and leave production on Q3_K_XL + IQ4_NL.
   - Source: subsequent user approval: "прод отключить, что бы упростить разработку, после тестов и исправлений, развернуть прод с исправлениями версиями бинарей, продолжай".
   - Acceptance: after qualification, manually select the new binary with compose backed up; production is healthy on the same Q3 config, running binary SHA verified, authenticated text/continuation smoke passes.
   - Primary evidence: deployment backup/provenance and `stratactl status` plus authorized smoke results.
-  - Status: pending
-  - Evidence: downtime and deployment now authorized; preflight required before stopping.
+  - Status: verified
+  - Evidence: `evidence/deployment.json`: healthy loaded Q3, running-process SHA2c3da126 matches the qualified release, restart0, auth/text smoke and two-turn continuation pass (second request cached25 tokens). Only binary mount changed; Q3 JSON hash unchanged. Startup job1794739318176-83 completed successfully.
 
 ### Constraints
 
@@ -61,6 +61,7 @@ Complete the frozen Required Outcomes using the listed Change Envelope and Prima
 - Runtime: `include/strata/core/serve_stop_bound.hpp`, the pipeline and non-merged serial callsites in `src/program/generate.cpp`. Keep verifier APIs/kernels unchanged unless a direct induced blocker is proved.
 - Tests: upstream `tests/core/serve_stop_bound_test.cpp`, CMake registration, minimal actual-callsite/consumer regression using the existing source-binding convention if needed.
 - Evidence: a focused `bench/results/2026-11-15-serve-stop-bound/` report, reproducible runner/fixtures and audit-only instrumentation patch. Diagnostics must not enter the deployed binary.
+- R4 deployment metadata: update the control repository's authoritative `docs/RUNBOOK.md` with the new binary and explicit rollback; the old current-binary entry becomes stale because of this deployment.
 - Direct consumers: final-stage commit, every front-stage commit/rollback replay, `consumed`, pending token/position, raw-verdict policy/calibration/statistics, live conversation and parked snapshots.
 
 ## Approved Plan
@@ -88,15 +89,13 @@ After the required builds and checks, independently review the actual diff, fix 
 
 ## Current Checkpoint
 
-- Closes: R3/R4.
-- Smallest next action: publish the qualified fix, then manually select/deploy that exact release binary and verify production.
-- Expected evidence: remote main SHA, uninstrumented release hash, healthy Q3 and authenticated text/continuation checks.
-- Stop/replan if: source/binary identity differs, GPU holders remain, or deployment verification fails; no automatic rollback/model switch.
+None. Frozen outcomes are resolved; production is running the qualified fix on Q3. Do not start adjacent fixes or additional audits under this goal.
 
 ## Current State
 
-- Baseline: local and remote fork main `c723df72f54b21d54db073710981163a435d1573`.
-- Production: stopped with explicit user approval through `stratactl stop`; preflight found zero inflight, all four GPUs idle and only the production KFD holder. After stop no GPU holders remained. Q3 config unchanged; previous qualified engine SHA256 `fbc52b5228c32709e86b009fe690db5c3edd9f83f0d2433fdc72fffc87f775b2`.
+- Implementation baseline: `c723df72f54b21d54db073710981163a435d1573`; runtime fix published as `de499eacfa63db1697c80f74766a0432828f4161`.
+- Production: `stratactl start` job1794739318176-83 completed after tests released GPUs and a fresh idle check passed. Running binary: `releases/gfx906-stop-bound-de499eac-20261115/strata`, SHA2c3da126, healthy/loaded, restart0. Q3 JSON unchanged (SHA256 `0a67728bf26672823945510da5565d5a4a1bd373111e5d578567313d1224b692`). Authenticated text and two-turn continuation pass; unauthorized API rejected.
+- Deployment backup: `/home/radneon/strata/deploy/serve-stop-bound-20261115/compose.before.yaml` restores Q3 with the Q5-fixed binaryfbc52b52 (without stop-bound). New release has `BUILD.md`; no diagnostic binary was selected.
 - Scope evidence: PCIe/adaptation disabled in live argv. No penalties in config, but actual client sampling is unknown (`api_monitor=false`); do not claim penalties universally off.
 - Build image: `sha256:bccb7ee7e7a78274519db9a43ba63c34ddd2e74bb60f8764a8f50aaee1f2c646`. gfx906 build and ported host CTest passed; uninstrumented candidate SHA256 `2c3da12662846c07fb50bb7aa0f4a3f49fb7cba32917d118c92fc044fb7345bd`. Supplemental native HIP/gfx1100 build and host CTest also passed, without GPU execution on that backend. No native CUDA build; explicitly outside user scope.
 - Lab: `/home/radneon/strata-rd/serve-stop-bound-20261115/`; `src`, `gfx906-build`, `hip-build`, separate `diagnostic-{baseline,candidate}` sources/builds, `artifacts/`. Compose backup: `compose.before.yaml`. All 398 baseline source/include/CMake/cmake files matched `c723df72` before copying the lab seed.
@@ -105,7 +104,7 @@ After the required builds and checks, independently review the actual diff, fix 
 - Candidate pipeline sweep passed: diagnostic SHA256 `42018a8a25a7bf45cf89d2bcc30bdb2a70fec46938c928587e6121ade89dcbfb`, artifacts `candidate-sweep`. All11 corresponding output-ID sequences and raw accepted-draft counts match baseline; all consumed histories and four-stage lengths are correct. A-2 now L59, replay keep1 on all three front stages, live continuation reused59/read1; park/restore passed.
 - State reference `candidate-no-b` passed: same diagnostic binary, theta2, no early speculative commit. All11 requests' valid GDN/PLE/KV/index and conservative draft-KV fingerprints match the normal pipeline on all four stages. Uncut baseline windows A-1/A-3/A-5/A-7 also match candidate valid state.
 - Sequential GPU job `1794736607165-73` completed: EOSfirst11, EOSlast220, startup-serial and uninstrumented release smoke passed IDs/bounds/reuse. Aggregate checker correctly stopped on an unmatched serial/pipeline state comparison (different expert placement; see decision below).
-- GPU job `1794738527499-74` completed successfully. `candidate-serial-matched` retains pipeline2 startup args/capacities and its valid state matches pipeline. Aggregate checker passed all seven required runs; release smoke also passed. Recheck empty KFD holders before production start. Source runtime/release binary unchanged.
+- GPU job `1794738527499-74` completed successfully. `candidate-serial-matched` retains pipeline2 startup args/capacities and its valid state matches pipeline. Aggregate checker passed all seven required runs; release smoke passed. Empty KFD holders were confirmed before production start. Source runtime/release binary unchanged.
 
 ## Material Decisions / Checkpoints
 
@@ -118,4 +117,8 @@ After the required builds and checks, independently review the actual diff, fix 
 
 ## Completion
 
-Not complete: R1/R2 verified; qualified fix publication and production deployment/verification remain outstanding.
+- Resolved: R1/R2/R3/R4 verified. Runtime fix `de499eacfa63db1697c80f74766a0432828f4161` published and deployed; gfx906-only policy published in `8472661d`.
+- Evidence: `bench/results/2026-11-15-serve-stop-bound/evidence/{qualification-summary,build-identity,deployment}.json` and the per-run artifacts. Host helper2736+zero, actual-source regression/negative control, gfx906 build,49 required native requests, independent reviews and production verification passed.
+- Constraints: Q3 model/JSON, Q5 arithmetic, FP16/INT8 KV/MTP, clocks and memory locks preserved; production uses an uninstrumented binary. Runtime diff is confined to the two serve callsites and pure bound helper; no adjacent fixes or dependencies.
+- Remaining qualification limits are in the evidence README, not unfinished scope: no full256K/vision/performance or live cancellation-timing audit, no other-hardware support claim.
+- Final status: complete. Stop.
