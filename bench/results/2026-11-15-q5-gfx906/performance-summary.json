@@ -1,0 +1,62 @@
+{
+  "clock_mhz": 1350,
+  "excluded": {
+    "A1": "diagnostic build-copy I/O overlapped request start"
+  },
+  "included_order": [
+    "B1",
+    "B2",
+    "A2",
+    "A3"
+  ],
+  "variants": {
+    "baseline": {
+      "PP": 1153.1423030942346,
+      "TG": 55.63129683376344,
+      "MTP_acceptance": 0.7703703703703704,
+      "repeated_output_identical": true
+    },
+    "candidate": {
+      "PP": 1150.9741948893247,
+      "TG": 66.59084252534377,
+      "MTP_acceptance": 0.9049429657794676,
+      "repeated_output_identical": true
+    }
+  },
+  "runs": {
+    "A2": {
+      "PP": 1152.5447574830291,
+      "TG": 55.81233103688846,
+      "drafts_accepted": 208,
+      "drafts_offered": 270,
+      "prompt_tokens": 65536,
+      "output_tokens": 512
+    },
+    "A3": {
+      "PP": 1153.7398487054404,
+      "TG": 55.450262630638434,
+      "drafts_accepted": 208,
+      "drafts_offered": 270,
+      "prompt_tokens": 65536,
+      "output_tokens": 512
+    },
+    "B1": {
+      "PP": 1155.444443073169,
+      "TG": 65.9309527795305,
+      "drafts_accepted": 238,
+      "drafts_offered": 263,
+      "prompt_tokens": 65536,
+      "output_tokens": 512
+    },
+    "B2": {
+      "PP": 1146.5039467054805,
+      "TG": 67.25073227115705,
+      "drafts_accepted": 238,
+      "drafts_offered": 263,
+      "prompt_tokens": 65536,
+      "output_tokens": 512
+    }
+  },
+  "TG_change_percent": 19.700323945942632,
+  "PP_change_percent": -0.18801740245694143
+}

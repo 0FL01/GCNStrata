@@ -1,0 +1,62 @@
+{
+  "positions": 635,
+  "vocab": 248320,
+  "kl_direction": "P_baseline || P_candidate",
+  "kl_mean": 0.02137260673909726,
+  "kl_p99": 0.15959979139361333,
+  "p99_definition": "sorted[floor(0.99*(N-1))], matching quant_quality.py",
+  "top1_agreement": 0.9307086614173228,
+  "first_nonidentical_logits": {
+    "index": 0,
+    "label": "code:0",
+    "prefix_tokens": 1,
+    "target_id": 85286,
+    "baseline_top1": 198,
+    "candidate_top1": 198,
+    "kl_baseline_candidate": 0.0003104603820560917,
+    "max_abs_logit_delta": 0.14771109819412231
+  },
+  "first_top1_disagreement": {
+    "index": 29,
+    "label": "code:29",
+    "prefix_tokens": 30,
+    "target_id": 4021,
+    "baseline_top1": 318,
+    "candidate_top1": 31950,
+    "kl_baseline_candidate": 0.014023787320430183,
+    "max_abs_logit_delta": 0.9536739587783813,
+    "logits": [
+      {
+        "id": 318,
+        "baseline": 18.363346099853516,
+        "candidate": 18.019874572753906
+      },
+      {
+        "id": 321,
+        "baseline": 16.953353881835938,
+        "candidate": 16.731740951538086
+      },
+      {
+        "id": 1305,
+        "baseline": 18.145401000976562,
+        "candidate": 17.930919647216797
+      },
+      {
+        "id": 2503,
+        "baseline": 16.947978973388672,
+        "candidate": 16.942615509033203
+      },
+      {
+        "id": 14760,
+        "baseline": 16.814647674560547,
+        "candidate": 16.793670654296875
+      },
+      {
+        "id": 31950,
+        "baseline": 18.273672103881836,
+        "candidate": 18.242704391479492
+      }
+    ]
+  },
+  "scope": "all-vocabulary logits after fixed prefixes; no sampled token is fed back"
+}

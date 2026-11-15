@@ -4,6 +4,7 @@
 //
 //     build/native_grouped_parity           the checks (a ctest; needs the GPU)
 //     build/native_grouped_parity --bench   the checks, then v1/new timings of 48 calls in a graph (a window's layers)
+//     build/native_grouped_parity --q5_0    IQ2_S/IQ3_XXS/IQ4_XS + Q5_0, group lengths 1,2,3,4,6 at 2560/640
 //
 // Every gate/up format with every down format; calls of 0..cap groups of 1..T entries each (an empty call is what the
 // verify window's PCIe call usually is), entries from 0 and from past 0 (the PCIe call's follow the VRAM call's),
@@ -63,11 +64,12 @@ const char* name_of(int t) {
         case 13: return "Q5_K";
         case 14: return "Q6_K";
         case 7: return "Q5_1";
+        case 6: return "Q5_0";
         case 8: return "Q8_0";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 || t == 7 || t == 8 ? 32 : t == 42 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 6 || t == 7 || t == 8 ? 32 : t == 42 ? 64 : 256; }
 
 // `rows` rows of `n` values of format t: random bytes, then a finite fp16 scale in every block
 std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& rng) {
@@ -104,6 +106,7 @@ struct Setup {
     k::NativeExpertLayout L;
     int T = 0, K = 0, cap = 0, n_blobs = 0;
     int active_lo = 0, active_hi = 0;
+    std::vector<int32_t> active_dst;
     size_t slot = 0;
     uint8_t* blobs = nullptr;
     uint8_t* xq = nullptr;
@@ -183,6 +186,7 @@ struct Setup {
         active_hi = st.back();
         std::iota(ds.begin(), ds.end(), 0);
         std::shuffle(ds.begin(), ds.end(), rng);                  // scattered rows of `out`
+        active_dst.assign(ds.begin() + active_lo, ds.begin() + active_hi);
         for (int e = 0; e < cap; ++e) tk_v.push_back(tk(rng));
         if (ng) ck(cudaMemcpy(ptr, p.data(), p.size() * 8, cudaMemcpyHostToDevice), "ptr");
         ck(cudaMemcpy(start, st.data(), st.size() * 4, cudaMemcpyHostToDevice), "start");
@@ -217,19 +221,51 @@ struct Setup {
     }
 };
 
-void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng) {
+// Numerical metrics cover only planned output rows. Untouched NaN sentinels and hq bytes still take the
+// original bitwise comparison; an active NaN, even one matching the sentinel, is a failure.
+struct OutputError {
+    double l1 = 0, l2 = 0, r1 = 0, r2 = 0, maxabs = 0;
+    size_t gn = 0, gi = 0, rn = 0, ri = 0;
+    void add(const Setup& S, const std::vector<uint32_t>& got, const std::vector<uint32_t>& ref) {
+        for (int row : S.active_dst)
+            for (int64_t col = 0; col < S.L.n_embd; ++col) {
+                const size_t i = (size_t) row * S.L.n_embd + col;
+                float g, r;
+                std::memcpy(&g, &got[i], sizeof(float)); std::memcpy(&r, &ref[i], sizeof(float));
+                gn += std::isnan(g); gi += std::isinf(g); rn += std::isnan(r); ri += std::isinf(r);
+                if (!std::isfinite(g) || !std::isfinite(r)) continue;
+                const double d = (double) g - r;
+                l1 += std::fabs(d); l2 += d * d;
+                r1 += std::fabs((double) r); r2 += (double) r * r;
+                maxabs = std::max(maxabs, std::fabs(d));
+            }
+    }
+    bool finite() const { return gn + gi + rn + ri == 0; }
+    void print() const {
+        std::printf("L1 %.9g L2 %.9g relL1 %.9g relL2 %.9g maxabs %.9g "
+                    "nonfinite(got/ref) %zu/%zu NaN %zu/%zu Inf %zu/%zu\n",
+                    l1, std::sqrt(l2), l1 / (r1 + 1e-30), std::sqrt(l2 / (r2 + 1e-30)), maxabs,
+                    gn + gi, rn + ri, gn, rn, gi, ri);
+    }
+};
+
+void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& rng, bool exact_sizes = false) {
     Setup S(gu, dt, H, FF, 6, 4, 9, rng, s);   // 6 tokens x 4 experts: cap 24 entries
     int calls = 0, bad = 0;
     size_t written = 0;
+    OutputError total;
     for (const int base : {0, 7}) {
-        for (const int groups : {0, 1, 2, 3, 5, 8, 24}) {
-            const int ng = S.plan(groups, base, rng);
+        for (const int count : (exact_sizes ? std::vector<int>{1, 2, 3, 4, 6} : std::vector<int>{0, 1, 2, 3, 5, 8, 24})) {
+            const int ng = exact_sizes ? S.plan_sizes({count}, base, rng) : S.plan(count, base, rng);
             const auto ref = S.result(true, 0, 0x00, s);
+            OutputError group;
             size_t w = 0;
             for (size_t i = 0; i < S.out_floats; ++i) w += ref[i] != 0xFFFFFFFFu;
             written += w;
             for (const int64_t gy : {(int64_t) 0, (int64_t) 1, (int64_t) 2, (int64_t) 3, (int64_t) 4, (int64_t) S.cap + 3}) {
                 const auto got = S.result(false, gy, (calls & 1) ? 0x7F : 0x00, s);
+                total.add(S, got, ref);
+                group.add(S, got, ref);
                 ++calls;
                 size_t diff = 0;
                 for (size_t i = 0; i < ref.size(); ++i) diff += ref[i] != got[i];
@@ -239,10 +275,18 @@ void check(int gu, int dt, int64_t H, int64_t FF, cudaStream_t s, std::mt19937& 
                     ++bad;
                 }
             }
+            if (!group.finite()) ++bad;
+            if (exact_sizes) {
+                std::printf("  %s/%s window_tokens=%d group_entries=%d base=%d v1/new (all grid_groups): ",
+                            name_of(gu), name_of(dt), S.T, count, base);
+                group.print();
+            }
         }
     }
     std::printf("%-8s/%-7s %5lld x %4lld  %d calls: %s (%zu output floats written in all)\n", name_of(gu), name_of(dt),
                 (long long) H, (long long) FF, calls, bad ? "FAIL" : "bitwise equal to v1", written);
+    std::printf("  v1/new active outputs (all calls): ");
+    total.print();
     if (written == 0) { std::printf("  nothing was written: the check checked nothing  FAIL\n"); ++bad; }
     g_fail += bad;
 }
@@ -410,6 +454,14 @@ void bench(cudaStream_t s, std::mt19937& rng) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--q5_0") {
+        cudaStream_t s; ck(cudaStreamCreate(&s), "stream");
+        std::mt19937 rng(316);
+        for (int gu : {22, 18, 23}) check(gu, 6, 2560, 640, s, rng, true);
+        std::printf("native_grouped_parity Q5_0: %d failures\n", g_fail);
+        ck(cudaStreamDestroy(s), "stream destroy");
+        return g_fail ? 1 : 0;
+    }
     if (argc > 1 && std::string(argv[1]) == "--q2-modes") {
         if (argc == 4 && std::string(argv[2]) == "--device") {
             char* end = nullptr;
@@ -440,7 +492,7 @@ int main(int argc, char** argv) {
                    14,
 #endif
                    8})        // STRATA_GU_FMTS
-        for (int dt : {20, 23, 42, 7, 8}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS; IQ4_XS: n_ff % 256
+        for (int dt : {20, 23, 42, 6, 7, 8}) check(gu, dt, 512, 256, s, rng);   // STRATA_D_FMTS; IQ4_XS: n_ff % 256
     check(42, 42, 2560, 640, s, rng);
     check(21, 20, 2560, 640, s, rng);                                   // a model's shapes
     check(21, 23, 2560, 768, s, rng);

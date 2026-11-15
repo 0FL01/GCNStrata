@@ -3,6 +3,8 @@
 //     build/native_expert_parity <shard.gguf> [layer ...]     real rows (a split model's shards are found by name)
 //     build/native_expert_parity --synthetic GU/DOWN ...      random weights quantized by ggml (e.g. q4_K/q5_1)
 //     build/native_expert_parity --q5_1-min                   the Q5_1 min term on crafted activations
+//     build/native_expert_parity --q5_0-dot                   signed Q5_0 dot on the GPU's exact q8_1 blocks
+// Prefix --tokens 1|2|3|4|6 to select the one group's entry count (default 3).
 //
 // (a) float reference: ggml's own dequantizer (`to_float`) and a float SwiGLU expert, (b) the CPU path
 // (ggml-cpu vec_dot with its quantized activations), (c) the GPU path (`native_expert_grouped`, q8_1
@@ -45,12 +47,67 @@ static double rel(const std::vector<float>& a, const std::vector<float>& b) {
 
 
 namespace {
-constexpr int NT = 3, E = 7;
+constexpr int MAX_NT = 6, E = 7;
 constexpr int64_t H = 2560, FF = 640;
+
+// Norms are over finite pairs; NaN/Inf counts are separate and never count as a passing comparison.
+bool metrics(const char* label, const std::vector<float>& got, const std::vector<float>& ref) {
+    double l1 = 0, l2 = 0, r1 = 0, r2 = 0, maxabs = 0;
+    size_t gn = 0, gi = 0, rn = 0, ri = 0;
+    for (size_t i = 0; i < got.size(); ++i) {
+        gn += std::isnan(got[i]); gi += std::isinf(got[i]);
+        rn += std::isnan(ref[i]); ri += std::isinf(ref[i]);
+        if (!std::isfinite(got[i]) || !std::isfinite(ref[i])) continue;
+        const double d = (double) got[i] - ref[i];
+        l1 += std::fabs(d); l2 += d * d;
+        r1 += std::fabs((double) ref[i]); r2 += (double) ref[i] * ref[i];
+        maxabs = std::max(maxabs, std::fabs(d));
+    }
+    std::printf("          %s: L1 %.9g L2 %.9g relL1 %.9g relL2 %.9g maxabs %.9g "
+                "nonfinite(got/ref) %zu/%zu NaN %zu/%zu Inf %zu/%zu\n", label,
+                l1, std::sqrt(l2), l1 / (r1 + 1e-30), std::sqrt(l2 / (r2 + 1e-30)), maxabs,
+                gn + gi, rn + ri, gn, rn, gi, ri);
+    return gn + gi + rn + ri == 0;
+}
+
+struct Q81 { ggml_fp16_t d, s; int8_t qs[32]; };
+static_assert(sizeof(Q81) == 36, "block_q8_1 layout");
+
+// Independent scalar decoding: each Q5_0 value is d5 * (code - 16). No GPU dot/dequantizer or CPU
+// vec_dot participates. Both references consume the SAME GPU-produced Q8_1 codes and fp16 scales.
+// `stored` is the old mixed arithmetic, retained only to identify that defect, never as the oracle.
+void q5_0_reference(const uint8_t* w, const Q81* x, int n, int rows, int tokens,
+                    std::vector<float>& want, std::vector<float>& stored) {
+    const int nb = n / 32;
+    want.resize((size_t) tokens * rows); stored.resize(want.size());
+    for (int t = 0; t < tokens; ++t)
+        for (int r = 0; r < rows; ++r) {
+            double dot = 0, old = 0;
+            for (int b = 0; b < nb; ++b) {
+                const uint8_t* p = w + ((size_t) r * nb + b) * 22; // d[2], qh[4], qs[16]
+                ggml_fp16_t dh;
+                std::memcpy(&dh, p, 2);
+                const double d5 = ggml_fp16_to_fp32(dh);
+                const Q81& a = x[t * nb + b];
+                const double d8 = ggml_fp16_to_fp32(a.d);
+                int signed_dot = 0, unsigned_dot = 0;
+                for (int j = 0; j < 32; ++j) {
+                    const int lo = (p[6 + j % 16] >> (j < 16 ? 0 : 4)) & 15;
+                    const int code = lo | (((p[2 + j / 8] >> (j % 8)) & 1) << 4);
+                    signed_dot += (code - 16) * a.qs[j];
+                    unsigned_dot += code * a.qs[j];
+                }
+                dot += d5 * d8 * signed_dot;
+                old += d5 * (d8 * unsigned_dot - 16.0 * ggml_fp16_to_fp32(a.s));
+            }
+            want[(size_t) t * rows + r] = (float) dot;
+            stored[(size_t) t * rows + r] = (float) old;
+        }
+}
 
 // The three ways and the dequantizers for one expert blob; returns the number of failed checks.
 int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label,
-               cudaStream_t s) {
+               cudaStream_t s, int NT) {
     int failures = 0;
     // (a) the float reference
     const auto* tg = ggml_get_type_traits((ggml_type) f.gu_type);
@@ -91,10 +148,10 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         std::vector<std::vector<uint8_t>> act(NT, std::vector<uint8_t>(cpu::kNativeActBytes));
         std::vector<std::vector<uint8_t>> hq(NT, std::vector<uint8_t>(cpu::kNativeHBytes));
         std::vector<std::vector<float>> ff(NT, std::vector<float>(FF));
-        const void* a[NT];
-        float* ffp[NT];
-        const void* hp[NT];
-        float* op[NT];
+        const void* a[MAX_NT];
+        float* ffp[MAX_NT];
+        const void* hp[MAX_NT];
+        float* op[MAX_NT];
         for (int k = 0; k < NT; ++k) {
             cpu::native_quant_act(f, x.data() + k * H, act[k].data());
             a[k] = act[k].data();
@@ -146,7 +203,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             // one multi-token kernel: parity against ggml's vec_dot, then one-token and NT-token throughput
             auto check = [&](const char* tag, bool is512) {
                 std::vector<float> g((size_t) NT * FF);
-                float* gp[NT];
+                float* gp[MAX_NT];
                 for (int k = 0; k < NT; ++k) gp[k] = g.data() + k * FF;
                 (is512 ? cpu::iq512_rows : cpu::iq256_rows)(f.gu_type, blob.data(), f.gu_row, (int) H, a, NT, gp, 0, (int) FF);
                 const double rg = rel(g, gref);
@@ -254,9 +311,9 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             // where the CPU has it, the AVX-2 one (q2_avx2.cpp) where it does not.  Calling the AVX-512
             // kernel unconditionally faults on a Zen 2/3 CPU.
             std::vector<cpu::ActQ> a2(NT);
-            const cpu::ActQ* ap[NT];
+            const cpu::ActQ* ap[MAX_NT];
             std::vector<float> alt((size_t) NT * H);
-            float* altp[NT];
+            float* altp[MAX_NT];
             for (int k = 0; k < NT; ++k) {
                 cpu::act_quant_any(ff[k].data(), (int) FF, a2[k]);   // gated: AVX-512 or AVX-2 per CPU
                 ap[k] = &a2[k];
@@ -270,7 +327,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
             // (b3) the IQ4_NL multi-token AVX-2 kernel the pool now uses for IQ4_NL down projections,
             // against ggml-cpu's single-token vec_dot on the SAME Q8_0 activations (h), plus timing.
             std::vector<float> alt((size_t) NT * H), refd((size_t) NT * H);
-            float* altp[NT];
+            float* altp[MAX_NT];
             for (int k = 0; k < NT; ++k) altp[k] = alt.data() + k * H;
             cpu::iq4nl256_down_rows(blob.data() + f.down_off, f.d_row, (int) FF, hp, NT, altp, 0, (int) H);
             const auto* tdc = ggml_get_type_traits_cpu((ggml_type) f.d_type);
@@ -322,7 +379,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         cudaMemcpy(dblob, blob.data(), blob.size(), cudaMemcpyHostToDevice);
         cudaMemcpy(dx, x.data(), x.size() * 4, cudaMemcpyHostToDevice);
         const unsigned long long p = (unsigned long long) dblob;
-        const int32_t st[2] = {0, NT}, one = 1, idx[NT] = {0, 1, 2};
+        const int32_t st[2] = {0, NT}, one = 1, idx[MAX_NT] = {0, 1, 2, 3, 4, 5};
         cudaMemcpy(dptr, &p, 8, cudaMemcpyHostToDevice);
         cudaMemcpy(dstart, st, 8, cudaMemcpyHostToDevice);
         cudaMemcpy(dn, &one, 4, cudaMemcpyHostToDevice);
@@ -332,6 +389,25 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
         cudaStreamSynchronize(s);
         cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
+        if (f.d_type == GGML_TYPE_Q5_0) {
+            // Same scratch offset already inspected by native_grouped_parity; hq is written by both SwiGLU paths.
+            const size_t fa = ((size_t) NT * FF * sizeof(float) + 255) & ~(size_t) 255;
+            std::vector<Q81> hq((size_t) NT * FF / 32);
+            cudaMemcpy(hq.data(), (const uint8_t*) dscr + 3 * fa, hq.size() * sizeof(Q81), cudaMemcpyDeviceToHost);
+            std::vector<float> want, stored;
+            q5_0_reference(blob.data() + f.down_off, hq.data(), (int) FF, (int) H, NT, want, stored);
+            if (f.tail_off) {
+                float scale;
+                std::memcpy(&scale, blob.data() + f.tail_off + 2 * sizeof(float), sizeof(float));
+                for (auto& v : want) v *= scale;
+                for (auto& v : stored) v *= scale;
+            }
+            const bool finite = metrics("Q5_0 down vs signed-code oracle (identical hq)", got_g, want);
+            metrics("Q5_0 down vs old ds.y formula (diagnostic)", got_g, stored);
+            const bool ok = finite && rel(got_g, want) < 1e-5;
+            std::printf("          Q5_0 same-block implementation check: %s (relL1 limit 1e-5)\n", ok ? "ok" : "FAIL");
+            if (!ok) ++failures;
+        }
         {   // the kernels that decode a weight part once for the NT entries, bitwise vs the per-entry ones (#242;
             // the formats without a decode-once split take the per-entry kernels either way)
             std::vector<float> old_g(got_g.size());
@@ -393,7 +469,13 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         cudaFree(dstart); cudaFree(dn); cudaFree(ddst); cudaFree(dtok);
     }
     const double ec = rel(got_c, ref), eg = rel(got_g, ref), ecg = rel(got_c, got_g);
-    const bool ok = ec < 3e-2 && eg < 3e-2 && std::isfinite(ec) && std::isfinite(eg);
+    // Upstream aa678f10: Q5_0 down no longer mixes quantized codes with the original activation sum.
+    const double gpu_limit = f.d_type == GGML_TYPE_Q5_0 ? 1.8e-2 : 3e-2;
+    const bool ok = ec < 3e-2 && eg < gpu_limit && std::isfinite(ec) && std::isfinite(eg);
+    std::printf("          %s expert %d window_tokens=%d group_entries=%d seed=%d\n", label.c_str(), E, NT, NT, seed);
+    metrics("cpu vs float (activation quantization included)", got_c, ref);
+    metrics("gpu vs float (activation quantization included)", got_g, ref);
+    metrics("cpu vs gpu (different activation quantizers)", got_c, got_g);
     std::printf("%-9s %-8s/%-7s blob %8zu  cpu rel %.2e  gpu rel %.2e  cpu-gpu %.2e  %s\n", label.c_str(),
                 ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), f.bytes, ec, eg, ecg,
                 ok ? "ok" : "FAIL");
@@ -436,6 +518,63 @@ std::vector<uint8_t> synthetic_blob(const cpu::NativeFmt& f, int seed) {
         std::memcpy(blob.data() + f.tail_off, tail, sizeof tail);
     }
     return blob;
+}
+
+// Positive-biased, asymmetric activations with a small negative tail, like a nonzero-mean SwiGLU output.
+// Each block's 127*d anchor fixes d8 exactly; the other values have a deliberate 0.45-code rounding residual.
+// Row zero has signed Q5 codes all zero: any output there is an offset bug, not activation quantization error.
+int check_q5_0_dot(cudaStream_t s, int tokens) {
+    constexpr int n = 640, rows = 64, nb = n / 32;
+    ggml_cpu_init();
+    std::vector<uint8_t> w((size_t) rows * nb * 22, 0);
+    for (int r = 0; r < rows; ++r)
+        for (int b = 0; b < nb; ++b) {
+            uint8_t* p = w.data() + ((size_t) r * nb + b) * 22;
+            const ggml_fp16_t d = ggml_fp32_to_fp16((r % 2 ? -1.f : 1.f) * (1 + r % 5) / 128.f);
+            std::memcpy(p, &d, 2);
+            for (int j = 0; j < 32; ++j) {
+                const int q = r == 0 ? 16 : (r * 7 + b * 3 + j) % 32;
+                p[6 + j % 16] |= (uint8_t) ((q & 15) << (j < 16 ? 0 : 4));
+                p[2 + j / 8] |= (uint8_t) ((q >> 4) << (j % 8));
+            }
+        }
+    std::vector<float> x((size_t) tokens * n);
+    double mean = 0;
+    for (int t = 0; t < tokens; ++t)
+        for (int i = 0; i < n; ++i) {
+            const float v = i % 32 == 31 ? 127.f / 128.f : ((i * 13 + t * 17) % 113 - 16 + 0.45f) / 128.f;
+            mean += v;
+            x[(size_t) t * n + i] = v;
+        }
+    void *dw, *dx, *dxq;
+    float* dy;
+    cudaMalloc(&dw, w.size());
+    cudaMalloc(&dx, x.size() * sizeof(float));
+    cudaMalloc(&dxq, (size_t) tokens * nb * sizeof(Q81));
+    cudaMalloc((void**) &dy, (size_t) tokens * rows * sizeof(float));
+    cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice);
+    cudaMemcpy(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice);
+    strata::kernels::quantize_q8_1_rows((const float*) dx, tokens, n, dxq, s);
+    strata::kernels::iq_mmvq(GGML_TYPE_Q5_0, dw, dxq, dy, n, rows, tokens, s);
+    cudaStreamSynchronize(s);
+    std::vector<Q81> xq((size_t) tokens * nb);
+    std::vector<float> gpu((size_t) tokens * rows), want, stored;
+    cudaMemcpy(gpu.data(), dy, gpu.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaMemcpy(xq.data(), dxq, xq.size() * sizeof(Q81), cudaMemcpyDeviceToHost);
+    cudaFree(dw); cudaFree(dx); cudaFree(dxq); cudaFree(dy);
+    q5_0_reference(w.data(), xq.data(), n, rows, tokens, want, stored);
+    std::printf("q5_0 dot: tokens=%d mean(x)=%.9g zero-code row: GPU %.9g signed %.9g old-ds.y %.9g\n",
+                tokens, mean / x.size(), gpu[0], want[0], stored[0]);
+    const bool finite = metrics("Q5_0 dot vs signed-code oracle (identical xq)", gpu, want);
+    metrics("Q5_0 dot vs old ds.y formula (diagnostic)", gpu, stored);
+    const double error = rel(gpu, want), separation = rel(stored, want);
+    // The old expression must be demonstrably different on this fixture; this is not a whole-expert 3% test.
+    bool zero = true;
+    for (int t = 0; t < tokens; ++t) zero = zero && std::fabs(gpu[(size_t) t * rows]) < 1e-6;
+    const bool ok = finite && zero && error < 1e-5 && separation > 1e-3 && separation > 100 * error;
+    std::printf("q5_0 dot: old/signed relL1 separation %.9g; implementation limit 1e-5: %s\n",
+                separation, ok ? "ok" : "FAIL");
+    return ok ? 0 : 1;
 }
 
 // The Q5_1 min term.  Activations x = d * (q + 0.45) round to q, so each q8_1 block's sum of the ORIGINAL values
@@ -558,9 +697,20 @@ int check_bf16_embd(cudaStream_t s) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);   // keep the trail on a crash
-    if (argc < 2) {
-        std::fprintf(stderr, "usage: native_expert_parity <shard.gguf> [layer ...]\n"
+    int tokens = 3, mode_arg = 1;
+    if (argc > 1 && std::string(argv[mode_arg]) == "--tokens") {
+        if (argc < 3) { std::fprintf(stderr, "--tokens needs a count\n"); return 2; }
+        const std::string n = argv[++mode_arg];
+        if (n != "1" && n != "2" && n != "3" && n != "4" && n != "6") {
+            std::fprintf(stderr, "--tokens must be 1, 2, 3, 4 or 6\n"); return 2;
+        }
+        tokens = std::atoi(n.c_str());
+        ++mode_arg;
+    }
+    if (argc <= mode_arg) {
+        std::fprintf(stderr, "usage: native_expert_parity [--tokens 1|2|3|4|6] <shard.gguf> [layer ...]\n"
                              "       native_expert_parity --synthetic GU/DOWN ...   (ggml type names, e.g. q4_K/q5_1)\n"
+                             "       native_expert_parity --q5_0-dot\n"
                              "       native_expert_parity --q5_1-min\n"
                              "       native_expert_parity --bf16-embd\n");
         return 2;
@@ -576,13 +726,15 @@ int main(int argc, char** argv) {
     int failures = 0;
     cudaStream_t s;
     cudaStreamCreate(&s);
-    const std::string mode = argv[1];
-    if (mode == "--q5_1-min") {
+    const std::string mode = argv[mode_arg];
+    if (mode == "--q5_0-dot") {
+        failures += check_q5_0_dot(s, tokens);
+    } else if (mode == "--q5_1-min") {
         failures += check_q5_1_min(s);
     } else if (mode == "--bf16-embd") {
         failures += check_bf16_embd(s);
     } else if (mode == "--synthetic") {
-        for (int i = 2; i < argc; ++i) {
+        for (int i = mode_arg + 1; i < argc; ++i) {
             const std::string arg = argv[i];
             const size_t slash = arg.find('/');
             const int gu = slash == std::string::npos ? -1 : type_of(arg.substr(0, slash));
@@ -595,12 +747,13 @@ int main(int argc, char** argv) {
                 ++failures;
                 continue;
             }
-            failures += check_blob(f, synthetic_blob(f, i), i, "synthetic", s);
+            const int seed = i - mode_arg + 1;   // preserve the default seeds with or without --tokens
+            failures += check_blob(f, synthetic_blob(f, seed), seed, "synthetic", s, tokens);
         }
     } else {
-        const strata::GgufModel model(strata::gguf_split_paths(argv[1]));
+        const strata::GgufModel model(strata::gguf_split_paths(argv[mode_arg]));
         std::vector<int> layers;
-        for (int i = 2; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
+        for (int i = mode_arg + 1; i < argc; ++i) layers.push_back(std::atoi(argv[i]));
         if (layers.empty()) layers = {0, 1, 2, 3, 20, 47};
         for (int l : layers) {
             const strata::TensorInfo* t[3] = {};
@@ -622,7 +775,7 @@ int main(int argc, char** argv) {
             std::memcpy(blob.data() + f.up_off, data[1] + (size_t) E * f.up_off, f.up_off);
             std::memcpy(blob.data() + f.down_off, data[2] + (size_t) E * (f.bytes - f.down_off),
                         f.bytes - f.down_off);
-            failures += check_blob(f, blob, l, "layer " + std::to_string(l), s);
+            failures += check_blob(f, blob, l, "layer " + std::to_string(l), s, tokens);
         }
     }
     std::printf("native_expert_parity: %d failures\n", failures);

@@ -1,0 +1,57 @@
+diff --git a/src/program/generate.cpp b/src/program/generate.cpp
+--- a/src/program/generate.cpp
++++ b/src/program/generate.cpp
+@@ -14464,6 +14464,7 @@
+                 extra_sources_reset();
+                 for (int64_t t : ids) { const int32_t t32 = (int32_t) t; extra_sources_append(&t32, 1); }
+             }
++            static int first_logits_n = 0;   // one dump sequence across serial and pipelined requests
+             bool first_window = true;
+             int64_t produced_n = 0, sfx_windows = 0, sfx_drafts = 0, sfx_ok = 0;
+             int64_t chain_windows = 0, chain_drafts = 0, chain_ok = 0;   // --lookup-chain's own counts
+@@ -14825,6 +14826,33 @@
+                         if (v.service(&drive_pool_split, SDf(A), err) < 0) return die(err);
+                         if (v.done(err)) {
+                             if (!v.pl_finish(outp.data(), err)) return die(err);
++                            // Q5 audit only: completed last-stage head, before commit or parity-buffer reuse.
++                            // The initial pipeline window is T=1 at n-1; no generated token has been fed back.
++                            if (A.seq == 0) {
++                                static const char* fl = std::getenv("STRATA_DUMP_FIRST_LOGITS");
++                                if (fl != nullptr) {
++                                    if (max_new != 1 || A.T != 1 || A.p != n - 1 || produced_n != 0 ||
++                                        A.tok[0] != (int32_t) ids[(size_t) (n - 1)])
++                                        return die("Q5 audit first logits: expected GEN 1, first window T=1 at prompt end");
++                                    const strata::core::OnDevice on(v.device());
++                                    std::vector<float> row((size_t) v.vocab());
++                                    if (!v.copy_logits(0, row.data()))
++                                        return die("Q5 audit first logits: last-stage row copy failed");
++                                    const std::string path = std::string(fl) + "." + std::to_string(first_logits_n++);
++                                    std::FILE* f = std::fopen(path.c_str(), "wb");
++                                    if (f == nullptr) return die("Q5 audit first logits: cannot open " + path);
++                                    const bool written = std::fwrite(row.data(), sizeof(float), row.size(), f) == row.size();
++                                    const int closed = std::fclose(f);
++                                    if (!written || closed != 0)
++                                        return die("Q5 audit first logits: cannot finish " + path);
++                                    std::fprintf(stderr,
++                                                 "strata q5 audit: first logits pipeline=2 seq=0 p=%lld input=%d "
++                                                 "T=1 row=0 vocab=%lld device=%d path=%s\n",
++                                                 (long long) A.p, (int) A.tok[0], (long long) v.vocab(),
++                                                 v.device(), path.c_str());
++                                    std::fflush(stderr);
++                                }
++                            }
+                             A.s1_done = true;
+                             tre("F1", A.seq, A.T);
+                         } else if (!err.empty()) return die(err);
+@@ -15316,10 +15344,9 @@
+                 // window to <path>.<n>, so the prompt paths (a peer card's share, a split) can be compared by KL
+                 if (first_window) {
+                     static const char* fl = std::getenv("STRATA_DUMP_FIRST_LOGITS");
+-                    static int fl_n = 0;
+                     if (fl != nullptr) {
+                         std::vector<float> row((size_t) ver.vocab());
+-                        const std::string path = std::string(fl) + "." + std::to_string(fl_n++);
++                        const std::string path = std::string(fl) + "." + std::to_string(first_logits_n++);
+                         std::FILE* f = ver.copy_logits(merged ? T - 1 : 0, row.data()) ? std::fopen(path.c_str(), "wb") : nullptr;
+                         if (f == nullptr || std::fwrite(row.data(), sizeof(float), row.size(), f) != row.size())
+                             std::fprintf(stderr, "strata serve: STRATA_DUMP_FIRST_LOGITS: cannot write %s\n", path.c_str());
