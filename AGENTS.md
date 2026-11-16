@@ -5,6 +5,10 @@ but NVIDIA CUDA, other AMD architectures and SYCL are not supported qualificatio
 (`src/`, `include/`), a Python server with an OpenAI- and Anthropic-compatible API and a web app (`serve/`), and a
 one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
 
+Base model on the four-MI50 rig (since 2026-11-16): bartowski Qwen3.8-Flash-Next **Q4_1** with the shared IQ4_NL PLE,
+`--prefill 8192 --aux-cpus 16-31`; Q4_1 experts run on the grouped MMQ prompt path. Unsloth UD-Q3_K_XL is deferred.
+Measurements, accuracy checks and limits: [bench/results/2026-11-16-q4-1/README.md](bench/results/2026-11-16-q4-1/README.md).
+
 ## Installing Strata for a user
 
 Follow **[docs/AI_SETUP.md](docs/AI_SETUP.md)**: check the PC, pick the model by RAM, run setup non-interactively,

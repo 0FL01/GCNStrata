@@ -1,0 +1,23 @@
+{
+  "date": "2026-11-16",
+  "host": "amude (4x MI50 32GB, PCIe 3.0 x8 each, Xeon E5-2698B v3, 124 GiB RAM)",
+  "model": "bartowski/Qwen3.8-Flash-Next-GGUF Q4_1 @ db3a185731e162be9ffa4d52d20d7509939e60e8 + shared IQ4_NL PLE",
+  "model_name": "Qwen3.8-Flash-Next-bartowski-Q4_1-IQ4_NL-PLE",
+  "fork_commit": "7cc69bd5",
+  "binary": "releases/gfx906-q4-1-mmq-7cc69bd5-20261116/strata",
+  "binary_sha256": "cc2d87d45289952398ac41341d520d6ab9b3f8b79c511b4adebdcb5314d08d2f",
+  "config": "configs/bartowski-q4-1-4gpu-iq4-ple-20261116.json",
+  "config_sha256": "25ccf1639cd32a47e4105586e9d9bd8ec7211c404cc91c1f300c9317164f2e7b",
+  "image": "sha256:bccb7ee7e7a78274519db9a43ba63c34ddd2e74bb60f8764a8f50aaee1f2c646",
+  "compose_changes": ["--config -> bartowski-q4-1-4gpu-iq4-ple-20261116.json", "/qualified-strata mount -> gfx906-q4-1-mmq-7cc69bd5-20261116/strata"],
+  "rollback_compose": "deploy/bartowski-q4-1-20261116/compose.before.yaml (Unsloth Q3_K_XL, release de499eac)",
+  "verification": {
+    "health": "healthy", "restart_policy": "unless-stopped", "restarts": 0,
+    "running_engine_sha256": "cc2d87d45289952398ac41341d520d6ab9b3f8b79c511b4adebdcb5314d08d2f",
+    "auth_smoke": "Authenticated text smoke passed; unauthenticated API rejected",
+    "engine_log": ["--prefill 8192", "aux cpus 16-31 on", "17174 resident experts"],
+    "vm.compact_unevictable_allowed": 0,
+    "idle_after_smoke": {"MemAvailable_GiB": 6.3, "engine_rss_GiB": 105.3, "mlocked_GiB": 104.5, "vision_rss_GiB": 0.92}
+  },
+  "deferred": "Unsloth UD-Q3_K_XL weights, pack, config and release stay on disk"
+}

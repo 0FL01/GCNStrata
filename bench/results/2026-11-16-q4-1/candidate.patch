@@ -1,0 +1,228 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 5ec0174a..def8204a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1979,7 +1979,7 @@ if(STRATA_NATIVE_EXPERTS)
+       # q4_0/q4_0 and q4_0/q4_1: a plain llama-quantize Q4_0 file (bartowski's Qwen3.8-Flash-Next-Q4_0: gate/up Q4_0,
+       # down Q4_0 on 42 layers and Q4_1 on 6)
+       # q6_K/q8_0: Unsloth UD-Q6_K_XL gate/up Q6_K with Q8_0 down (docs/UNSLOTH_Q6.md). Layer 2 is q8_0/q8_0, already listed.
+-      set(_strata_parity_pairs q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 q5_0/q8_0 q4_0/q4_0 q4_0/q4_1)
++      set(_strata_parity_pairs q4_K/q5_1 q4_K/q8_0 q5_K/q8_0 q8_0/q8_0 q4_K/q5_0 q5_0/q8_0 q4_0/q4_0 q4_0/q4_1 q4_1/q4_1)
+       if(STRATA_Q6K_EXPERTS)
+         list(APPEND _strata_parity_pairs q6_K/q8_0)
+       else()   # a pair without GPU kernels (Q6_K gate/up) is refused by native_expert_supported, not run
+diff --git a/include/strata/kernels/ngram.hpp b/include/strata/kernels/ngram.hpp
+index 207707d0..5e3b9dbd 100644
+--- a/include/strata/kernels/ngram.hpp
++++ b/include/strata/kernels/ngram.hpp
+@@ -55,7 +55,7 @@ inline constexpr int PLE_ROW_BYTES_MAX = PLE_ROW_BYTES_BF16;             // the
+ /// 160-value row, how to turn a row into floats) and nothing else: `PleTable::open`, `format()`, the reader's row size,
+ /// the error string and the buffers' size all read this list, so a new format cannot be in one switch and missing from
+ /// another. A row is always `PLE_HEAD_DIM` = 160 values = 5 blocks of 32 for the block formats.
+-enum class PleFormat : uint8_t { IQ4_NL, Q5_0, F8_E4M3, Q5_1, Q8_0, Q4_0, BF16 };
++enum class PleFormat : uint8_t { IQ4_NL, Q5_0, F8_E4M3, Q5_1, Q8_0, Q4_0, BF16, Q4_1 };
+ 
+ struct PleFormatInfo {
+     PleFormat id;
+diff --git a/src/kernels/cuda/dequant_bf16.cu b/src/kernels/cuda/dequant_bf16.cu
+index f0aaa925..b112681e 100644
+--- a/src/kernels/cuda/dequant_bf16.cu
++++ b/src/kernels/cuda/dequant_bf16.cu
+@@ -59,6 +59,13 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
+             put(out, j, (float) ((b[2 + j] & 0x0F) - 8) * d);
+             put(out, j + 16, (float) ((b[2 + j] >> 4) - 8) * d);
+         }
++    } else if constexpr (TYPE == 3) {                              // Q4_1
++        const uint8_t* b = row_blocks + (size_t) gi_in_row * 20;
++        const float d = h2f(b), m = h2f(b + 2);
++        for (int j = 0; j < 16; ++j) {
++            put(out, j, (float) (b[4 + j] & 15) * d + m);
++            put(out, j + 16, (float) (b[4 + j] >> 4) * d + m);
++        }
+     } else if constexpr (TYPE == 6) {                              // Q5_0
+         const uint8_t* b = row_blocks + (size_t) gi_in_row * 22;
+         const float d = h2f(b);
+@@ -324,6 +331,7 @@ __global__ void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, int64_t
+ bool geometry(int type, int& block_elems, int& block_bytes) {
+     switch (type) {
+     case 2: block_elems = 32; block_bytes = 18; return true;
++    case 3: block_elems = 32; block_bytes = 20; return true;
+     case 6: block_elems = 32; block_bytes = 22; return true;
+     case 7: block_elems = 32; block_bytes = 24; return true;
+     case 8: block_elems = 32; block_bytes = 34; return true;
+@@ -390,6 +398,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
+     break
+     switch (type) {
+     case 2: STRATA_DQ(2);
++    case 3: STRATA_DQ(3);
+     case 6: STRATA_DQ(6);
+     case 7: STRATA_DQ(7);
+     case 8: STRATA_DQ(8);
+diff --git a/src/kernels/cuda/native_mmvq.cu b/src/kernels/cuda/native_mmvq.cu
+index 8d571ffc..f22e36a5 100644
+--- a/src/kernels/cuda/native_mmvq.cu
++++ b/src/kernels/cuda/native_mmvq.cu
+@@ -2916,7 +2916,7 @@ void native_iq4_nl_f32(const void* weights, const float* x, void* scratch_q8_1,
+ }
+ 
+ bool native_mmvq_supported(int ggml_type) noexcept {
+-    return ggml_type == 2 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
++    return ggml_type == 2 || ggml_type == 3 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
+            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
+            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
+            ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
+@@ -2926,6 +2926,7 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
+     int block_elems, block_bytes;
+     switch (ggml_type) {
+     case 2: block_elems = 32; block_bytes = 18; break;
++    case 3: block_elems = 32; block_bytes = 20; break;
+     case 6: block_elems = 32; block_bytes = 22; break;
+     case 7: block_elems = 32; block_bytes = 24; break;
+     case 8: block_elems = 32; block_bytes = 34; break;
+@@ -2954,7 +2955,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float*
+     switch (ggml_type) {
+     case 2: native_q4_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+     case 6: native_q5_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+-    case 7: iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
++    case 3: case 7: iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+     case 8: native_q8_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+     case 20: native_iq4_nl_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+     case 11: native_q3_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+diff --git a/src/kernels/iq_parity.cpp b/src/kernels/iq_parity.cpp
+index 4bc74f64..08df4e09 100644
+--- a/src/kernels/iq_parity.cpp
++++ b/src/kernels/iq_parity.cpp
+@@ -26,7 +26,7 @@
+ 
+ int main(int argc, char** argv) {
+     const std::string dir = argc > 1 ? argv[1] : "logs/iq_fixture";
+-    const char* names[] = {"IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_M", "IQ4_NL", "IQ4_XS", "Q2_0", "Q3_K"};
++    const char* names[] = {"IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S", "IQ1_M", "IQ4_NL", "IQ4_XS", "Q2_0", "Q3_K", "Q4_1"};
+     int failures = 0, missing = 0;
+     cudaStream_t s;
+     cudaStreamCreate(&s);
+diff --git a/src/kernels/ngram.cpp b/src/kernels/ngram.cpp
+index 2892e059..bef84259 100644
+--- a/src/kernels/ngram.cpp
++++ b/src/kernels/ngram.cpp
+@@ -163,6 +163,17 @@ void dequant_blocks(const uint8_t* row, float /*scale*/, float* out160) {
+ void dequant_iq4_nl(const uint8_t* row, float, float* out160) { iq4nl_dequant_row(row, out160); }
+ void dequant_fp8(const uint8_t* row, float scale, float* out160) { fp8_e4m3_dequant_row(row, scale, out160); }
+ void dequant_bf16(const uint8_t* row, float, float* out160) { bf16_dequant_row(row, out160); }
++void dequant_q4_1(const uint8_t* row, float, float* out160) {
++    for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) {
++        const uint8_t* block = row + b * 20;
++        const float d = strata::fp16_to_fp32(strata::read_u16(block));
++        const float m = strata::fp16_to_fp32(strata::read_u16(block + 2));
++        for (int j = 0; j < 16; ++j) {
++            out160[b * 32 + j] = d * (block[4 + j] & 15) + m;
++            out160[b * 32 + j + 16] = d * (block[4 + j] >> 4) + m;
++        }
++    }
++}
+ 
+ const PleFormatInfo kPleFormats[] = {
+     {PleFormat::IQ4_NL, "IQ4_NL", "IQ4_NL", PLE_ROW_BYTES, false, dequant_iq4_nl},
+@@ -176,6 +187,7 @@ const PleFormatInfo kPleFormats[] = {
+     // BF16 (#586): the checkpoint's own table at full precision, 320-byte rows; self-describing, so no scale and no
+     // metadata to trust (tools/ple_fp8_pack.py writes the FP8 form of the same table)
+     {PleFormat::BF16, "BF16", "BF16", PLE_ROW_BYTES_BF16, false, dequant_bf16},
++    {PleFormat::Q4_1, "Q4_1", "Q4_1", (PLE_HEAD_DIM / 32) * 20, false, dequant_q4_1},
+ };
+ constexpr int kPleFormatCount = (int) (sizeof kPleFormats / sizeof kPleFormats[0]);
+ }  // namespace
+diff --git a/src/kernels/ple_q5_parity.cpp b/src/kernels/ple_q5_parity.cpp
+index 29dc47e9..eb228d9c 100644
+--- a/src/kernels/ple_q5_parity.cpp
++++ b/src/kernels/ple_q5_parity.cpp
+@@ -1,4 +1,4 @@
+-// Real-artifact Q5_0 / Q5_1 / Q8_0 PLE rows against ggml's reference dequantizer, through both readers (the mapped
++// Real-artifact Q4_1 / Q5_0 / Q5_1 / Q8_0 PLE rows against ggml's reference dequantizer, through both readers (the mapped
+ // one and the direct SSD reader).
+ #define NOMINMAX
+ #include "strata/artifact/gguf_reader.hpp"
+@@ -63,13 +63,13 @@ int main(int argc, char** argv) {
+     const auto* tensor = gguf.find("per_layer_token_embd.weight");
+     // Q5_0 (#296: OrcaRouter's Q4_K_S), Q5_1 (a Q5_K_M GGUF), Q8_0 (UD-Q6_K_XL, Swift-1.5 Q4_K_L): 5 blocks of
+     // 32 per row
+-    if (!tensor || (tensor->type != GGML_TYPE_Q5_0 && tensor->type != GGML_TYPE_Q5_1 && tensor->type != GGML_TYPE_Q8_0) ||
++    if (!tensor || (tensor->type != GGML_TYPE_Q4_1 && tensor->type != GGML_TYPE_Q5_0 && tensor->type != GGML_TYPE_Q5_1 && tensor->type != GGML_TYPE_Q8_0) ||
+         tensor->shape.size() != 2 || tensor->shape[0] != 160) {
+-        std::fprintf(stderr, "expected a Q5_0, Q5_1 or Q8_0 PLE [160, N]\n");
++        std::fprintf(stderr, "expected a Q4_1, Q5_0, Q5_1 or Q8_0 PLE [160, N]\n");
+         return 2;
+     }
+     const auto type = (ggml_type) tensor->type;
+-    const size_t row_bytes = type == GGML_TYPE_Q5_0 ? 110 : type == GGML_TYPE_Q5_1 ? 120 : 170;
++    const size_t row_bytes = type == GGML_TYPE_Q4_1 ? 100 : type == GGML_TYPE_Q5_0 ? 110 : type == GGML_TYPE_Q5_1 ? 120 : 170;
+     const auto* traits = ggml_get_type_traits(type);
+     const uint8_t* bytes = gguf.tensor_data(*tensor);
+     bool ok = true;
+diff --git a/src/ngram/ple_reader_test.cpp b/src/ngram/ple_reader_test.cpp
+index 670b29cc..74c95cbc 100644
+--- a/src/ngram/ple_reader_test.cpp
++++ b/src/ngram/ple_reader_test.cpp
+@@ -99,6 +99,25 @@ void bf16_widening_is_exact() {
+     }
+ }
+ 
++// Q4_1 has a per-block minimum as well as a scale; the two nibbles address opposite halves.
++void q4_1_row_values() {
++    const auto* f = k::ple_format_for_type("Q4_1");
++    CHECK(f && f->row_bytes == 100, "Q4_1 row format/size");
++    if (!f || f->row_bytes != 100) return;
++    uint8_t row[100] = {};
++    for (int b = 0; b < 5; ++b) {
++        row[20 * b + 1] = 0x38;     // d = 0.5
++        row[20 * b + 3] = 0xc0;     // m = -2
++        for (int j = 0; j < 16; ++j) row[20 * b + 4 + j] = (uint8_t) (((15 - j) << 4) | j);
++    }
++    float out[160];
++    f->dequant(row, 1.0f, out);
++    for (int b = 0; b < 5; ++b) for (int j = 0; j < 16; ++j) {
++        CHECK(out[32 * b + j] == 0.5f * j - 2.0f, "Q4_1 low block %d index %d", b, j);
++        CHECK(out[32 * b + j + 16] == 0.5f * (15 - j) - 2.0f, "Q4_1 high block %d index %d", b, j);
++    }
++}
++
+ /// EVERY FORMAT OF THE TABLE, END TO END (table-driven: one entry in `k::ple_formats()` is one run here). A minimal
+ /// PLE-only GGUF holds `rows` rows of that format's row size, each filled with bytes that encode the row, and both I/O
+ /// modes must return exactly what the format's own dequantizer makes of those bytes - so the row width, the offset
+@@ -554,6 +573,7 @@ int main(int argc, char** argv) {
+         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"); return 2; }
+     }
+     if (self) {
++        q4_1_row_values();
+         // ng::ROW_BYTES (90, IQ4_NL, production default) and 110 (#296, OrcaRouter's Q5_0 PLE rows) through the
+         // same generic row_bytes path -- see the comment on selftest().
+         all_formats_round_trip(dir);               // every format of k::ple_formats(), both readers, vs its dequantizer
+diff --git a/tools/iq_fixture.py b/tools/iq_fixture.py
+index 8cfcf921..667d1955 100644
+--- a/tools/iq_fixture.py
++++ b/tools/iq_fixture.py
+@@ -60,6 +60,7 @@ LAYOUT = {   # (block values, block bytes) == the vendored gguf-py's GGML_QUANT_
+     "IQ1_M":   (256,  56),
+     "IQ4_NL":   (32,  18),
+     "IQ4_XS":  (256, 136),
++    "Q4_1":     (32,  20),
+     "Q3_K":    (256, 110),
+ }
+ HALF_ONE = struct.pack("<e", 1.0)      # fp16 1.0 = 0x3c00: a tame, exactly-representable scale
+@@ -75,6 +76,8 @@ def repair_scales(name: str, raw: np.ndarray) -> None:
+     if name == "Q3_K":
+         raw[:, 108:110] = np.frombuffer(HALF_ONE, dtype=np.uint8)
+         return
++    if name == "Q4_1":
++        raw[:, 2:4] = np.frombuffer(struct.pack("<e", -2.0), dtype=np.uint8)
+     if name == "IQ1_M":
+         raw[:, 48:56] &= np.uint8(0x0F)            # clear the four scale nibbles
+         for byte, nib in ((49, 0x30), (51, 0xC0), (54, 0x00), (55, 0x00)):
+@@ -83,7 +86,7 @@ def repair_scales(name: str, raw: np.ndarray) -> None:
+     raw[:, 0:2] = np.frombuffer(HALF_ONE, dtype=np.uint8)
+ # name -> (the KERNEL type id written into the .bin header, identical to the gguf-py enum id)
+ KERNEL_IDS = {"IQ2_XXS": 16, "IQ2_XS": 17, "IQ2_S": 22, "IQ3_XXS": 18, "IQ3_S": 21,
+-              "IQ1_M": 29, "IQ4_NL": 20, "IQ4_XS": 23, "Q2_0": 42, "Q3_K": 11}
++              "IQ1_M": 29, "IQ4_NL": 20, "IQ4_XS": 23, "Q2_0": 42, "Q3_K": 11, "Q4_1": 3}
+ 
+ 
+ def build(name: str, rows: int, cols: int, seed: int):
