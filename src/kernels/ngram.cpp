@@ -163,6 +163,17 @@ void dequant_blocks(const uint8_t* row, float /*scale*/, float* out160) {
 void dequant_iq4_nl(const uint8_t* row, float, float* out160) { iq4nl_dequant_row(row, out160); }
 void dequant_fp8(const uint8_t* row, float scale, float* out160) { fp8_e4m3_dequant_row(row, scale, out160); }
 void dequant_bf16(const uint8_t* row, float, float* out160) { bf16_dequant_row(row, out160); }
+void dequant_q4_1(const uint8_t* row, float, float* out160) {
+    for (int b = 0; b < PLE_HEAD_DIM / 32; ++b) {
+        const uint8_t* block = row + b * 20;
+        const float d = strata::fp16_to_fp32(strata::read_u16(block));
+        const float m = strata::fp16_to_fp32(strata::read_u16(block + 2));
+        for (int j = 0; j < 16; ++j) {
+            out160[b * 32 + j] = d * (block[4 + j] & 15) + m;
+            out160[b * 32 + j + 16] = d * (block[4 + j] >> 4) + m;
+        }
+    }
+}
 
 const PleFormatInfo kPleFormats[] = {
     {PleFormat::IQ4_NL, "IQ4_NL", "IQ4_NL", PLE_ROW_BYTES, false, dequant_iq4_nl},
@@ -176,6 +187,7 @@ const PleFormatInfo kPleFormats[] = {
     // BF16 (#586): the checkpoint's own table at full precision, 320-byte rows; self-describing, so no scale and no
     // metadata to trust (tools/ple_fp8_pack.py writes the FP8 form of the same table)
     {PleFormat::BF16, "BF16", "BF16", PLE_ROW_BYTES_BF16, false, dequant_bf16},
+    {PleFormat::Q4_1, "Q4_1", "Q4_1", (PLE_HEAD_DIM / 32) * 20, false, dequant_q4_1},
 };
 constexpr int kPleFormatCount = (int) (sizeof kPleFormats / sizeof kPleFormats[0]);
 }  // namespace

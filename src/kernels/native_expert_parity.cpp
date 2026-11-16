@@ -105,6 +105,28 @@ void q5_0_reference(const uint8_t* w, const Q81* x, int n, int rows, int tokens,
         }
 }
 
+// Q4_1 dot against the exact Q8_1 codes and scales used by the expert, independently of its GPU kernel.
+void q4_1_reference(const uint8_t* w, const Q81* x, int n, int rows, int tokens, std::vector<float>& want) {
+    const int nb = n / 32;
+    want.resize((size_t) tokens * rows);
+    for (int t = 0; t < tokens; ++t) for (int r = 0; r < rows; ++r) {
+        double dot = 0;
+        for (int b = 0; b < nb; ++b) {
+            const uint8_t* p = w + ((size_t) r * nb + b) * 20;
+            ggml_fp16_t dh, mh;
+            std::memcpy(&dh, p, 2); std::memcpy(&mh, p + 2, 2);
+            const double d = ggml_fp16_to_fp32(dh), m = ggml_fp16_to_fp32(mh);
+            const Q81& a = x[t * nb + b];
+            const double ad = ggml_fp16_to_fp32(a.d);
+            for (int j = 0; j < 32; ++j) {
+                const int code = (p[4 + j % 16] >> (j < 16 ? 0 : 4)) & 15;
+                dot += (d * code + m) * ad * a.qs[j];
+            }
+        }
+        want[(size_t) t * rows + r] = (float) dot;
+    }
+}
+
 // The three ways and the dequantizers for one expert blob; returns the number of failed checks.
 int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label,
                cudaStream_t s, int NT) {
@@ -389,6 +411,21 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
         strata::kernels::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, 1, NT, dxq, dscr, dout, s);
         cudaStreamSynchronize(s);
         cudaMemcpy(got_g.data(), dout, got_g.size() * 4, cudaMemcpyDeviceToHost);
+        if (f.d_type == GGML_TYPE_Q4_1) {
+            const size_t fa = ((size_t) NT * FF * sizeof(float) + 255) & ~(size_t) 255;
+            std::vector<Q81> hq((size_t) NT * FF / 32);
+            cudaMemcpy(hq.data(), (const uint8_t*) dscr + 3 * fa, hq.size() * sizeof(Q81), cudaMemcpyDeviceToHost);
+            std::vector<float> want;
+            q4_1_reference(blob.data() + f.down_off, hq.data(), (int) FF, (int) H, NT, want);
+            if (f.tail_off) {
+                float scale;
+                std::memcpy(&scale, blob.data() + f.tail_off + 2 * sizeof(float), sizeof(float));
+                for (auto& v : want) v *= scale;
+            }
+            const bool ok = metrics("Q4_1 down vs scalar oracle (identical hq)", got_g, want) && rel(got_g, want) < 1e-5;
+            std::printf("          Q4_1 same-block implementation check: %s\n", ok ? "ok" : "FAIL");
+            if (!ok) ++failures;
+        }
         if (f.d_type == GGML_TYPE_Q5_0) {
             // Same scratch offset already inspected by native_grouped_parity; hq is written by both SwiGLU paths.
             const size_t fa = ((size_t) NT * FF * sizeof(float) + 255) & ~(size_t) 255;

@@ -1,4 +1,4 @@
-// Real-artifact Q5_0 / Q5_1 / Q8_0 PLE rows against ggml's reference dequantizer, through both readers (the mapped
+// Real-artifact Q4_1 / Q5_0 / Q5_1 / Q8_0 PLE rows against ggml's reference dequantizer, through both readers (the mapped
 // one and the direct SSD reader).
 #define NOMINMAX
 #include "strata/artifact/gguf_reader.hpp"
@@ -63,13 +63,13 @@ int main(int argc, char** argv) {
     const auto* tensor = gguf.find("per_layer_token_embd.weight");
     // Q5_0 (#296: OrcaRouter's Q4_K_S), Q5_1 (a Q5_K_M GGUF), Q8_0 (UD-Q6_K_XL, Swift-1.5 Q4_K_L): 5 blocks of
     // 32 per row
-    if (!tensor || (tensor->type != GGML_TYPE_Q5_0 && tensor->type != GGML_TYPE_Q5_1 && tensor->type != GGML_TYPE_Q8_0) ||
+    if (!tensor || (tensor->type != GGML_TYPE_Q4_1 && tensor->type != GGML_TYPE_Q5_0 && tensor->type != GGML_TYPE_Q5_1 && tensor->type != GGML_TYPE_Q8_0) ||
         tensor->shape.size() != 2 || tensor->shape[0] != 160) {
-        std::fprintf(stderr, "expected a Q5_0, Q5_1 or Q8_0 PLE [160, N]\n");
+        std::fprintf(stderr, "expected a Q4_1, Q5_0, Q5_1 or Q8_0 PLE [160, N]\n");
         return 2;
     }
     const auto type = (ggml_type) tensor->type;
-    const size_t row_bytes = type == GGML_TYPE_Q5_0 ? 110 : type == GGML_TYPE_Q5_1 ? 120 : 170;
+    const size_t row_bytes = type == GGML_TYPE_Q4_1 ? 100 : type == GGML_TYPE_Q5_0 ? 110 : type == GGML_TYPE_Q5_1 ? 120 : 170;
     const auto* traits = ggml_get_type_traits(type);
     const uint8_t* bytes = gguf.tensor_data(*tensor);
     bool ok = true;

@@ -99,6 +99,25 @@ void bf16_widening_is_exact() {
     }
 }
 
+// Q4_1 has a per-block minimum as well as a scale; the two nibbles address opposite halves.
+void q4_1_row_values() {
+    const auto* f = k::ple_format_for_type("Q4_1");
+    CHECK(f && f->row_bytes == 100, "Q4_1 row format/size");
+    if (!f || f->row_bytes != 100) return;
+    uint8_t row[100] = {};
+    for (int b = 0; b < 5; ++b) {
+        row[20 * b + 1] = 0x38;     // d = 0.5
+        row[20 * b + 3] = 0xc0;     // m = -2
+        for (int j = 0; j < 16; ++j) row[20 * b + 4 + j] = (uint8_t) (((15 - j) << 4) | j);
+    }
+    float out[160];
+    f->dequant(row, 1.0f, out);
+    for (int b = 0; b < 5; ++b) for (int j = 0; j < 16; ++j) {
+        CHECK(out[32 * b + j] == 0.5f * j - 2.0f, "Q4_1 low block %d index %d", b, j);
+        CHECK(out[32 * b + j + 16] == 0.5f * (15 - j) - 2.0f, "Q4_1 high block %d index %d", b, j);
+    }
+}
+
 /// EVERY FORMAT OF THE TABLE, END TO END (table-driven: one entry in `k::ple_formats()` is one run here). A minimal
 /// PLE-only GGUF holds `rows` rows of that format's row size, each filled with bytes that encode the row, and both I/O
 /// modes must return exactly what the format's own dequantizer makes of those bytes - so the row width, the offset
@@ -554,6 +573,7 @@ int main(int argc, char** argv) {
         else { std::fprintf(stderr, "usage: ple_reader_test --selftest [--dir D] | --gguf SHARD2 [--rows N] [--tokens F]\n"); return 2; }
     }
     if (self) {
+        q4_1_row_values();
         // ng::ROW_BYTES (90, IQ4_NL, production default) and 110 (#296, OrcaRouter's Q5_0 PLE rows) through the
         // same generic row_bytes path -- see the comment on selftest().
         all_formats_round_trip(dir);               // every format of k::ple_formats(), both readers, vs its dequantizer

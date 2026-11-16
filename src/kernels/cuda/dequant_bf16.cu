@@ -59,6 +59,13 @@ __device__ __forceinline__ void group32(const uint8_t* row_blocks, int gi_in_row
             put(out, j, (float) ((b[2 + j] & 0x0F) - 8) * d);
             put(out, j + 16, (float) ((b[2 + j] >> 4) - 8) * d);
         }
+    } else if constexpr (TYPE == 3) {                              // Q4_1
+        const uint8_t* b = row_blocks + (size_t) gi_in_row * 20;
+        const float d = h2f(b), m = h2f(b + 2);
+        for (int j = 0; j < 16; ++j) {
+            put(out, j, (float) (b[4 + j] & 15) * d + m);
+            put(out, j + 16, (float) (b[4 + j] >> 4) * d + m);
+        }
     } else if constexpr (TYPE == 6) {                              // Q5_0
         const uint8_t* b = row_blocks + (size_t) gi_in_row * 22;
         const float d = h2f(b);
@@ -324,6 +331,7 @@ __global__ void dequant_q8_0_kernel(const uint8_t* __restrict__ blocks, int64_t 
 bool geometry(int type, int& block_elems, int& block_bytes) {
     switch (type) {
     case 2: block_elems = 32; block_bytes = 18; return true;
+    case 3: block_elems = 32; block_bytes = 20; return true;
     case 6: block_elems = 32; block_bytes = 22; return true;
     case 7: block_elems = 32; block_bytes = 24; return true;
     case 8: block_elems = 32; block_bytes = 34; return true;
@@ -390,6 +398,7 @@ void launch(int type, const void* blocks, int64_t row0, int64_t rows, int64_t co
     break
     switch (type) {
     case 2: STRATA_DQ(2);
+    case 3: STRATA_DQ(3);
     case 6: STRATA_DQ(6);
     case 7: STRATA_DQ(7);
     case 8: STRATA_DQ(8);

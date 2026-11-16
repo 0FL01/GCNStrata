@@ -257,6 +257,7 @@ Nvfp4Mode nvfp4_mode() {
 bool supported(int t) {
     switch ((ggml_type) t) {
         case GGML_TYPE_Q2_0:
+        case GGML_TYPE_Q4_1:   // bartowski Q4_1 experts: grouped MMQ prompt path (FP16 dequant + GEMM was 3.5x slower)
 #ifdef STRATA_ORCA_Q4KS_MMQ
         case GGML_TYPE_Q5_0:   // #296 (Q4_K and Q5_1: STRATA_MMQ_KQUANTS)
 #endif
@@ -500,6 +501,7 @@ void Context::run(const Product& p, void* stream) {
         case GGML_TYPE_Q5_0: mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, a, s); break;
 #endif
         case GGML_TYPE_Q2_0: mul_mat_q_case<GGML_TYPE_Q2_0>(ctx, a, s); break;
+        case GGML_TYPE_Q4_1: mul_mat_q_case<GGML_TYPE_Q4_1>(ctx, a, s); break;
         case GGML_TYPE_IQ2_XXS: mul_mat_q_case<GGML_TYPE_IQ2_XXS>(ctx, a, s); break;
         case GGML_TYPE_IQ2_XS: mul_mat_q_case<GGML_TYPE_IQ2_XS>(ctx, a, s); break;
         case GGML_TYPE_IQ2_S: mul_mat_q_case<GGML_TYPE_IQ2_S>(ctx, a, s); break;
