@@ -4,7 +4,7 @@
 //     build/native_expert_parity --synthetic GU/DOWN ...      random weights quantized by ggml (e.g. q4_K/q5_1)
 //     build/native_expert_parity --q5_1-min                   the Q5_1 min term on crafted activations
 //     build/native_expert_parity --q5_0-dot                   signed Q5_0 dot on the GPU's exact q8_1 blocks
-// Prefix --tokens 1|2|3|4|6 to select the one group's entry count (default 3).
+// Prefix --tokens 1|2|3|4|6 and --expert 0..511 for real rows (defaults 3 and 7).
 //
 // (a) float reference: ggml's own dequantizer (`to_float`) and a float SwiGLU expert, (b) the CPU path
 // (ggml-cpu vec_dot with its quantized activations), (c) the GPU path (`native_expert_grouped`, q8_1
@@ -47,7 +47,7 @@ static double rel(const std::vector<float>& a, const std::vector<float>& b) {
 
 
 namespace {
-constexpr int MAX_NT = 6, E = 7;
+constexpr int MAX_NT = 6;
 constexpr int64_t H = 2560, FF = 640;
 
 // Norms are over finite pairs; NaN/Inf counts are separate and never count as a passing comparison.
@@ -129,7 +129,7 @@ void q4_1_reference(const uint8_t* w, const Q81* x, int n, int rows, int tokens,
 
 // The three ways and the dequantizers for one expert blob; returns the number of failed checks.
 int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int seed, const std::string& label,
-               cudaStream_t s, int NT) {
+               cudaStream_t s, int NT, int expert) {
     int failures = 0;
     // (a) the float reference
     const auto* tg = ggml_get_type_traits((ggml_type) f.gu_type);
@@ -509,7 +509,7 @@ int check_blob(const cpu::NativeFmt& f, const std::vector<uint8_t>& blob, int se
     // Upstream aa678f10: Q5_0 down no longer mixes quantized codes with the original activation sum.
     const double gpu_limit = f.d_type == GGML_TYPE_Q5_0 ? 1.8e-2 : 3e-2;
     const bool ok = ec < 3e-2 && eg < gpu_limit && std::isfinite(ec) && std::isfinite(eg);
-    std::printf("          %s expert %d window_tokens=%d group_entries=%d seed=%d\n", label.c_str(), E, NT, NT, seed);
+    std::printf("          %s expert %d window_tokens=%d group_entries=%d seed=%d\n", label.c_str(), expert, NT, NT, seed);
     metrics("cpu vs float (activation quantization included)", got_c, ref);
     metrics("gpu vs float (activation quantization included)", got_g, ref);
     metrics("cpu vs gpu (different activation quantizers)", got_c, got_g);
@@ -734,7 +734,7 @@ int check_bf16_embd(cudaStream_t s) {
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IONBF, 0);   // keep the trail on a crash
-    int tokens = 3, mode_arg = 1;
+    int tokens = 3, expert = 7, mode_arg = 1;
     if (argc > 1 && std::string(argv[mode_arg]) == "--tokens") {
         if (argc < 3) { std::fprintf(stderr, "--tokens needs a count\n"); return 2; }
         const std::string n = argv[++mode_arg];
@@ -744,8 +744,17 @@ int main(int argc, char** argv) {
         tokens = std::atoi(n.c_str());
         ++mode_arg;
     }
+    if (argc > mode_arg && std::string(argv[mode_arg]) == "--expert") {
+        if (argc <= mode_arg + 1) { std::fprintf(stderr, "--expert needs an index\n"); return 2; }
+        char* end = nullptr;
+        const char* value = argv[++mode_arg];
+        const long n = std::strtol(value, &end, 10);
+        if (end == value || *end || n < 0 || n >= 512) { std::fprintf(stderr, "--expert must be 0..511\n"); return 2; }
+        expert = (int) n;
+        ++mode_arg;
+    }
     if (argc <= mode_arg) {
-        std::fprintf(stderr, "usage: native_expert_parity [--tokens 1|2|3|4|6] <shard.gguf> [layer ...]\n"
+        std::fprintf(stderr, "usage: native_expert_parity [--tokens 1|2|3|4|6] [--expert 0..511] <shard.gguf> [layer ...]\n"
                              "       native_expert_parity --synthetic GU/DOWN ...   (ggml type names, e.g. q4_K/q5_1)\n"
                              "       native_expert_parity --q5_0-dot\n"
                              "       native_expert_parity --q5_1-min\n"
@@ -785,7 +794,7 @@ int main(int argc, char** argv) {
                 continue;
             }
             const int seed = i - mode_arg + 1;   // preserve the default seeds with or without --tokens
-            failures += check_blob(f, synthetic_blob(f, seed), seed, "synthetic", s, tokens);
+            failures += check_blob(f, synthetic_blob(f, seed), seed, "synthetic", s, tokens, expert);
         }
     } else {
         const strata::GgufModel model(strata::gguf_split_paths(argv[mode_arg]));
@@ -795,24 +804,41 @@ int main(int argc, char** argv) {
         for (int l : layers) {
             const strata::TensorInfo* t[3] = {};
             const uint8_t* data[3] = {};
+            size_t shard[3] = {};
             const char* roles[3] = {"gate", "up", "down"};
             for (int r = 0; r < 3; ++r) {   // each role from the shard that holds it
-                size_t at = 0;
-                t[r] = model.find("blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight", &at);
-                if (t[r]) data[r] = model.shard(at).tensor_data(*t[r]);
+                t[r] = model.find("blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight", &shard[r]);
             }
             if (!t[0] || !t[1] || !t[2]) { std::printf("layer %d: no expert tensors\n", l); ++failures; continue; }
+            const auto& shape = t[0]->shape;
+            if (shape.size() != 3 || shape[0] != H || shape[1] != FF || shape[2] == 0 || shape[2] > 512 ||
+                (uint64_t) expert >= shape[2] || t[1]->shape != shape || t[0]->type != t[1]->type ||
+                t[2]->shape != std::vector<uint64_t>{FF, H, shape[2]}) {
+                std::printf("layer %d: incompatible expert shapes/types or expert %d is out of range\n", l, expert);
+                ++failures; continue;
+            }
+            // The GGUF tensors do not contain the per-expert NVFP4 scale tail used by native blobs.
+            if (t[0]->type == GGML_TYPE_NVFP4 || t[2]->type == GGML_TYPE_NVFP4) {
+                std::printf("layer %d: real GGUF NVFP4 expert scale tails are unsupported\n", l);
+                ++failures; continue;
+            }
+            if (!model.in_bounds(*t[0], shard[0]) || !model.in_bounds(*t[1], shard[1]) ||
+                !model.in_bounds(*t[2], shard[2])) {
+                std::printf("layer %d: expert tensor payload outside shard\n", l);
+                ++failures; continue;
+            }
+            for (int r = 0; r < 3; ++r) data[r] = model.shard(shard[r]).tensor_data(*t[r]);
             cpu::NativeFmt f;
             std::string err;
             if (!cpu::native_fmt((int) t[0]->type, (int) t[2]->type, H, FF, f, err)) {
                 std::printf("layer %d: %s\n", l, err.c_str()); ++failures; continue;
             }
             std::vector<uint8_t> blob(f.bytes);
-            std::memcpy(blob.data(), data[0] + (size_t) E * f.up_off, f.up_off);
-            std::memcpy(blob.data() + f.up_off, data[1] + (size_t) E * f.up_off, f.up_off);
-            std::memcpy(blob.data() + f.down_off, data[2] + (size_t) E * (f.bytes - f.down_off),
+            std::memcpy(blob.data(), data[0] + (size_t) expert * f.up_off, f.up_off);
+            std::memcpy(blob.data() + f.up_off, data[1] + (size_t) expert * f.up_off, f.up_off);
+            std::memcpy(blob.data() + f.down_off, data[2] + (size_t) expert * (f.bytes - f.down_off),
                         f.bytes - f.down_off);
-            failures += check_blob(f, blob, l, "layer " + std::to_string(l), s, tokens);
+            failures += check_blob(f, blob, l, "layer " + std::to_string(l), s, tokens, expert);
         }
     }
     std::printf("native_expert_parity: %d failures\n", failures);

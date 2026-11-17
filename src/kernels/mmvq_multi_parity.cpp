@@ -33,6 +33,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -40,6 +41,7 @@
 #include <string>
 #include <cstring>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -79,6 +81,80 @@ bool ck(cudaError_t e, const char* what) {
     if (e == cudaSuccess) return true;
     std::printf("CUDA: %s: %s\n", what, cudaGetErrorString(e));
     return false;
+}
+
+// Independent host FP16 decoding; unlike a multi-vs-single comparison this oracle does not use a GPU dot kernel.
+double half_value(uint16_t h) {
+    const int exp = (h >> 10) & 31, mant = h & 1023;
+    if (exp == 31) throw std::runtime_error("non-finite half in oracle input");
+    const double v = std::ldexp((double) (exp ? 1024 + mant : mant), exp ? exp - 25 : -24);
+    return h & 0x8000 ? -v : v;
+}
+
+struct Q81Host { uint16_t d, sum; int8_t qs[32]; };
+static_assert(sizeof(Q81Host) == 36);
+
+bool small_oracle(int type, int T, cudaStream_t s) {
+    constexpr int N = 2560, OUT = 64, NB = N / 32;
+    const int bytes = type == 2 ? 18 : 22, bias = type == 2 ? 8 : 16;
+    std::mt19937 rng(0x87654u + (unsigned) type * 13u + (unsigned) T);
+    std::normal_distribution<float> normal(0.f, 1.f);
+    std::vector<uint8_t> w((size_t) OUT * NB * bytes);
+    for (auto& v : w) v = (uint8_t) rng();
+    for (size_t b = 0; b < (size_t) OUT * NB; ++b) {
+        uint16_t d = sane_half(rng); std::memcpy(w.data() + b * bytes, &d, sizeof d);
+    }
+    std::vector<float> x((size_t) T * N);
+    for (auto& v : x) v = normal(rng);
+    if (T > 1) std::fill(x.end() - N, x.end(), 0.f);
+    const size_t xq_bytes = strata::kernels::native_q8_1_bytes(N, T);
+    if (xq_bytes != (size_t) T * NB * sizeof(Q81Host)) return false;
+    void *dw = nullptr, *dq = nullptr; float *dx = nullptr, *dy = nullptr;
+    if (!ck(cudaMalloc(&dw, w.size()), "oracle weights") || !ck(cudaMalloc(&dq, xq_bytes), "oracle q8") ||
+        !ck(cudaMalloc(&dx, x.size() * sizeof(float)), "oracle inputs") ||
+        !ck(cudaMalloc(&dy, (size_t) T * OUT * sizeof(float)), "oracle outputs")) return false;
+    if (!ck(cudaMemcpy(dw, w.data(), w.size(), cudaMemcpyHostToDevice), "oracle weight copy") ||
+        !ck(cudaMemcpy(dx, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice), "oracle input copy")) return false;
+    strata::kernels::quantize_q8_1_rows(dx, T, N, dq, s);
+    strata::kernels::native_mmvq(type, dw, dq, dy, N, OUT, T, s);
+    if (!ck(cudaStreamSynchronize(s), "oracle launch")) return false;
+    std::vector<Q81Host> q8((size_t) T * NB);
+    std::vector<float> got((size_t) T * OUT);
+    if (!ck(cudaMemcpy(q8.data(), dq, xq_bytes, cudaMemcpyDeviceToHost), "oracle q8 readback") ||
+        !ck(cudaMemcpy(got.data(), dy, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "oracle result readback")) return false;
+    double err = 0, refnorm = 0, neg = 0, ferr = 0, fnorm = 0, zero = 0;
+    for (int t = 0; t < T; ++t) for (int r = 0; r < OUT; ++r) {
+        double expected = 0, centered = 0, f64 = 0;
+        for (int b = 0; b < NB; ++b) {
+            const uint8_t* block = w.data() + ((size_t) r * NB + b) * bytes;
+            uint16_t d; std::memcpy(&d, block, sizeof d);
+            const double dw4 = half_value(d), da = half_value(q8[(size_t) t * NB + b].d);
+            const double sum = half_value(q8[(size_t) t * NB + b].sum);
+            int dot = 0, sumq = 0;
+            for (int k = 0; k < 32; ++k) {
+                const int ql = (block[(type == 2 ? 2 : 6) + k % 16] >> (k < 16 ? 0 : 4)) & 15;
+                const int code = ql | (type == 6 ? (((block[2 + k / 8] >> (k % 8)) & 1) << 4) : 0);
+                const int q = q8[(size_t) t * NB + b].qs[k];
+                dot += code * q; sumq += q;
+                f64 += dw4 * (code - bias) * x[(size_t) t * N + b * 32 + k];
+            }
+            expected += dw4 * (da * dot - bias * sum);
+            centered += dw4 * da * (dot - bias * sumq);
+        }
+        const double y = got[(size_t) t * OUT + r];
+        if (!std::isfinite(y)) return false;
+        err += (y - expected) * (y - expected); refnorm += expected * expected;
+        neg += (centered - expected) * (centered - expected);
+        ferr += (y - f64) * (y - f64); fnorm += f64 * f64;
+        if (T > 1 && t == T - 1) zero = std::max(zero, std::fabs(y));
+    }
+    cudaFree(dw); cudaFree(dq); cudaFree(dx); cudaFree(dy);
+    const double same_rel = std::sqrt(err / (refnorm + 1e-30));
+    const double neg_rel = std::sqrt(neg / (refnorm + 1e-30));
+    const double float_rel = std::sqrt(ferr / (fnorm + 1e-30));
+    std::printf("Q%d_0 T=%d same-code %.9g centered-control %.9g float64 %.9g zero %.9g\n",
+                type == 2 ? 4 : 5, T, same_rel, neg_rel, float_rel, zero);
+    return same_rel < 1e-4 && neg_rel > 1e-5 && float_rel < 0.04 && zero == 0;
 }
 
 // Returns the number of outputs that differ bit for bit; counts the non-finite outputs and the differences on
@@ -210,9 +286,22 @@ int sweep(bool exact, cudaStream_t s, Totals& t) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     cudaStream_t s;
     if (!ck(cudaStreamCreate(&s), "stream create")) return 1;
+
+    if (argc == 2 && std::strcmp(argv[1], "--q4-q5-oracle") == 0) {
+        bool ok = true;
+        for (bool exact : {true, false}) {
+            strata::kernels::native_mmvq_set_multi_exact(exact);
+            std::printf("small-format oracle multi_exact=%d\n", (int) exact);
+            for (int type : {2, 6}) for (int T : {1, 3, 6}) ok = small_oracle(type, T, s) && ok;
+        }
+        strata::kernels::native_mmvq_set_multi_exact(true);
+        cudaStreamDestroy(s);
+        return ok ? 0 : 1;
+    }
+    if (argc != 1) { std::printf("expected --q4-q5-oracle or no arguments\n"); cudaStreamDestroy(s); return 1; }
 
     Totals on, off;
     const int bad = sweep(true, s, on);

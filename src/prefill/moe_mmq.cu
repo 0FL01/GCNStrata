@@ -256,6 +256,12 @@ Nvfp4Mode nvfp4_mode() {
 
 bool supported(int t) {
     switch ((ggml_type) t) {
+#ifdef STRATA_HIP_GFX906
+        case GGML_TYPE_Q4_0: {
+            const char* enabled = std::getenv("STRATA_Q4_0_MMQ");
+            return enabled && std::strcmp(enabled, "1") == 0;
+        }
+#endif
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_1:   // bartowski Q4_1 experts: grouped MMQ prompt path (FP16 dequant + GEMM was 3.5x slower)
 #ifdef STRATA_ORCA_Q4KS_MMQ
@@ -497,6 +503,9 @@ void Context::run(const Product& p, void* stream) {
         return;
     }
     switch (t) {
+#ifdef STRATA_HIP_GFX906
+        case GGML_TYPE_Q4_0: mul_mat_q_case<GGML_TYPE_Q4_0>(ctx, a, s); break;
+#endif
 #ifdef STRATA_ORCA_Q4KS_MMQ
         case GGML_TYPE_Q5_0: mul_mat_q_case<GGML_TYPE_Q5_0>(ctx, a, s); break;
 #endif

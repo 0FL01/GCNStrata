@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -22,6 +23,10 @@
 
 namespace {
 namespace mmq = strata::prefill::mmq;
+
+// MMQ transposes groups of 128 Q8_1 activations across the gathered rows.
+struct Q8MMQ { ggml_fp16_t ds[8]; int8_t qs[128]; };
+static_assert(sizeof(Q8MMQ) == 144);
 
 void ck(cudaError_t e, const char* what) {
     if (e != cudaSuccess) throw std::runtime_error(std::string(what) + ": " + cudaGetErrorString(e));
@@ -140,30 +145,87 @@ void product(mmq::Context& ctx, cudaStream_t s, const char* name, ggml_type t, i
                 rel, max_abs / rms, zero_max);
     if (rel > 0.04 || max_abs / rms > 0.35 || zero_max > std::max(1e-5, 1e-4 * rms))
         throw std::runtime_error(std::string(name) + ": outside the screen");
+
+    if (t == GGML_TYPE_Q4_0) {
+        // Independently decode the actual gathered GPU activation codes and their half scales/sums. Q4_0 MMQ
+        // uses the stored original-float sum, not the sum of rounded Q8 codes, for its -8 correction.
+        const size_t blocks = (size_t) ((cols + 511) / 512 * 512 / 128);
+        std::vector<Q8MMQ> q8(blocks * (size_t) rows);
+        ck(cudaMemcpy(q8.data(), dxq.p, q8.size() * sizeof(Q8MMQ), cudaMemcpyDeviceToHost), "q8 readback");
+        double same_err2 = 0, same_ref2 = 0, negative2 = 0;
+        for (int e = 0; e < n; ++e) for (int r = bounds[(size_t) e]; r < bounds[(size_t) e + 1]; ++r)
+            for (int64_t o = 0; o < out_rows; ++o) {
+                const uint8_t* row = ws[(size_t) e].data() + (size_t) o * ggml_row_size(t, cols);
+                double expected = 0, centered = 0;
+                for (int64_t b = 0; b < cols / 32; ++b) {
+                    const uint8_t* w4 = row + b * 18;
+                    ggml_fp16_t dh; std::memcpy(&dh, w4, sizeof dh);
+                    const double d4 = ggml_fp16_to_fp32(dh);
+                    const Q8MMQ& a = q8[(size_t) (b / 4) * rows + r];
+                    const int sub = (int) (b % 4);
+                    const double d8 = ggml_fp16_to_fp32(a.ds[2 * sub]);
+                    const double sum8 = ggml_fp16_to_fp32(a.ds[2 * sub + 1]);
+                    int dot = 0, sumq = 0;
+                    for (int k = 0; k < 32; ++k) {
+                        const int code = (w4[2 + k % 16] >> (k < 16 ? 0 : 4)) & 15;
+                        const int q = a.qs[32 * sub + k];
+                        dot += code * q; sumq += q;
+                    }
+                    expected += d4 * (d8 * dot - 8 * sum8);
+                    centered += d4 * d8 * (dot - 8 * sumq);
+                }
+                const double actual = got[(size_t) dst[(size_t) r] * out_rows + o];
+                same_err2 += (actual - expected) * (actual - expected);
+                same_ref2 += expected * expected;
+                negative2 += (centered - expected) * (centered - expected);
+            }
+        const double same_rel = std::sqrt(same_err2 / (same_ref2 + 1e-30));
+        const double negative_rel = std::sqrt(negative2 / (same_ref2 + 1e-30));
+        std::printf("  Q4_0 same-code oracle rel_l2 %.9g, centered-code negative control %.9g\n", same_rel, negative_rel);
+        if (same_rel > 1e-4 || negative_rel < 1e-5)
+            throw std::runtime_error(std::string(name) + ": Q4_0 same-code oracle or negative control failed");
+    }
 }
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::strcmp(argv[1], "--q4-0-disabled") == 0) {
+            if (mmq::supported(GGML_TYPE_Q4_0)) throw std::runtime_error("Q4_0 MMQ was enabled without opt-in");
+            std::printf("Q4_0 MMQ is disabled without opt-in\n");
+            return 0;
+        }
+        const bool q4 = argc == 2 && std::strcmp(argv[1], "--q4-0") == 0;
+        if (argc != 1 && !q4) throw std::runtime_error("expected --q4-0 or --q4-0-disabled");
         if (!mmq::built()) { std::printf("no MMQ in this build\n"); return 1; }
         cudaStream_t s = nullptr;
         ck(cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking), "stream");
         {
             mmq::Context ctx;
-            const std::vector<std::vector<int>> batches{{1, 3, 3}, {4, 1, 2}, {2, 3}, {17}};
-            int trial = 0;
-            for (const auto& counts : batches) {
-                const std::string tag = "-" + std::to_string(trial);
-                product(ctx, s, ("Q4_K gate/up" + tag).c_str(), GGML_TYPE_Q4_K, 1280, 2560, counts, trial);
-                product(ctx, s, ("Q5_K gate/up" + tag).c_str(), GGML_TYPE_Q5_K, 1280, 2560, counts, trial + 5);
-                product(ctx, s, ("Q6_K gate/up" + tag).c_str(), GGML_TYPE_Q6_K, 1280, 2560, counts, trial + 17);
-                product(ctx, s, ("Q5_1 down" + tag).c_str(), GGML_TYPE_Q5_1, 2560, 640, counts, trial + 9);
-                product(ctx, s, ("Q8_0 down" + tag).c_str(), GGML_TYPE_Q8_0, 2560, 640, counts, trial + 13);
-                ++trial;
+            if (q4) {
+                const std::vector<std::vector<int>> batches{{1, 3, 3}, {2, 0, 3}, {17}};
+                for (size_t i = 0; i < batches.size(); ++i) {
+                    product(ctx, s, "Q4_0 gate/up", GGML_TYPE_Q4_0, 1280, 2560, batches[i], (int) i);
+                    product(ctx, s, "Q4_0 down", GGML_TYPE_Q4_0, 2560, 640, batches[i], (int) i + 5);
+                    product(ctx, s, "Q4_1 down", GGML_TYPE_Q4_1, 2560, 640, batches[i], (int) i + 9);
+                }
+            } else {
+                const std::vector<std::vector<int>> batches{{1, 3, 3}, {4, 1, 2}, {2, 3}, {17}};
+                int trial = 0;
+                for (const auto& counts : batches) {
+                    const std::string tag = "-" + std::to_string(trial);
+                    product(ctx, s, ("Q4_K gate/up" + tag).c_str(), GGML_TYPE_Q4_K, 1280, 2560, counts, trial);
+                    product(ctx, s, ("Q5_K gate/up" + tag).c_str(), GGML_TYPE_Q5_K, 1280, 2560, counts, trial + 5);
+                    product(ctx, s, ("Q6_K gate/up" + tag).c_str(), GGML_TYPE_Q6_K, 1280, 2560, counts, trial + 17);
+                    product(ctx, s, ("Q5_1 down" + tag).c_str(), GGML_TYPE_Q5_1, 2560, 640, counts, trial + 9);
+                    product(ctx, s, ("Q8_0 down" + tag).c_str(), GGML_TYPE_Q8_0, 2560, 640, counts, trial + 13);
+                    ++trial;
+                }
             }
         }
         ck(cudaStreamDestroy(s), "destroy");
-        std::printf("prefill MMQ K-quant screen passed\n");
+        std::printf(q4 ? "Q4_0 gate/up, Q4_0 down and Q4_1 down product screens passed\n"
+                       : "prefill MMQ K-quant screen passed\n");
         return 0;
     } catch (const std::exception& e) {
         std::fprintf(stderr, "prefill MMQ K-quant screen failed: %s\n", e.what());
