@@ -1,7 +1,7 @@
 // src/kernels/native_expert_bench.cpp - the grouped native experts on real GGUF rows: one AMD layout against
 // another, bit for bit, and each one's time.
 //
-//     build/native_expert_bench <shard1.gguf> <layer[,layer...]> <groups> <tokens per group> <ref mode> <mode> [iters]
+//     build/native_expert_bench <shard.gguf[,shard.gguf...]> <layer[,layer...]> <groups> <tokens per group> <ref mode> <mode> [iters]
 //
 // Modes are STRATA_EXP_MODE values.  A group is one expert (distinct blobs, ~2 MB each, so G >= 8 does not fit
 // in L2); its entries read distinct tokens of an 8-token window.  The output must be bitwise equal to the
@@ -13,6 +13,8 @@
 #include "ggml.h"
 
 #include <cuda_runtime.h>
+
+#include <memory>
 
 #include <cmath>
 #include <cstdio>
@@ -32,7 +34,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "usage: native_expert_bench <shard1.gguf> <layer[,layer]> <groups> <tokens> <ref mode> <mode> [iters]\n");
         return 2;
     }
-    strata::GgufFile gguf(argv[1]);
+    std::vector<std::unique_ptr<strata::GgufFile>> shards;   // a model's shards, comma-separated
+    {
+        std::stringstream ss(argv[1]);
+        std::string t;
+        while (std::getline(ss, t, ',')) shards.push_back(std::make_unique<strata::GgufFile>(t));
+    }
     std::vector<int> layers;
     {
         std::stringstream ss(argv[2]);
@@ -53,9 +60,11 @@ int main(int argc, char** argv) {
     for (int l : layers) {
         const strata::TensorInfo* t[3] = {};
         const char* roles[3] = {"gate", "up", "down"};
-        for (const auto& ti : gguf.tensors())
-            for (int r = 0; r < 3; ++r)
-                if (ti.name == "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight") t[r] = &ti;
+        const strata::GgufFile* src[3] = {};
+        for (const auto& sh : shards)
+            for (const auto& ti : sh->tensors())
+                for (int r = 0; r < 3; ++r)
+                    if (ti.name == "blk." + std::to_string(l) + ".ffn_" + roles[r] + "_exps.weight") { t[r] = &ti; src[r] = sh.get(); }
         if (!t[0] || !t[1] || !t[2]) { std::printf("layer %d: no expert tensors\n", l); ++failures; continue; }
         if (t[0]->shape.size() != 3 || t[1]->shape.size() != 3 || t[2]->shape.size() != 3 ||
             t[0]->shape[2] == 0 || t[1]->shape[2] != t[0]->shape[2] || t[2]->shape[2] != t[0]->shape[2]) {
@@ -77,10 +86,10 @@ int main(int argc, char** argv) {
         for (int g = 0; g < G; ++g) {
             const size_t E = (size_t) ((g * 37 + 5) % n_experts);
             uint8_t* b = blobs.data() + (size_t) g * f.bytes;
-            std::memcpy(b, gguf.tensor_data(*t[0]) + E * ff.up_off, f.up_off);
-            std::memcpy(b + f.up_off, gguf.tensor_data(*t[1]) + E * ff.up_off, f.up_off);
+            std::memcpy(b, src[0]->tensor_data(*t[0]) + E * ff.up_off, f.up_off);
+            std::memcpy(b + f.up_off, src[1]->tensor_data(*t[1]) + E * ff.up_off, f.up_off);
             for (int64_t r = 0; r < H; ++r)
-                std::memcpy(b + f.down_off + r * drow, gguf.tensor_data(*t[2]) + E * dsz_full + r * drow_full, drow);
+                std::memcpy(b + f.down_off + r * drow, src[2]->tensor_data(*t[2]) + E * dsz_full + r * drow_full, drow);
         }
         const int seed = std::getenv("STRATA_BENCH_SEED") ? std::atoi(std::getenv("STRATA_BENCH_SEED")) : 17;
         std::mt19937 rng(seed + l);
@@ -131,12 +140,16 @@ int main(int argc, char** argv) {
             K::native_expert_set_mode(m, phase);
             K::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, G + cap_pad, NE, dxq, dscr, dout, s);
         };
-        // STRATA_BENCH_LEGACY=<v> [STRATA_BENCH_LEGACY_REF=<v>]: the gfx906 Q4_1 kernel pair (STRATA_LEGACY_EXP) of the
-        // timed side and of the reference side (default 0, the per-entry kernels)
+        // STRATA_BENCH_LEGACY=<v> [STRATA_BENCH_LEGACY_REF=<v>]: the gfx906 Q4_1 / Q4_0 kernel pair (STRATA_LEGACY_EXP) of the
+        // timed side and of the reference side (default 0).  STRATA_LEGACY_EXP=0 alone is not the per-entry kernels for a
+        // format with a Split (its generic path is decode-once too); STRATA_BENCH_REF_OLD=1 makes the reference side the
+        // per-entry kernels (STRATA_OLD_IQ_MMVQ), the true pre-Split baseline.
         const char* lnew = std::getenv("STRATA_BENCH_LEGACY");
         const char* lref = std::getenv("STRATA_BENCH_LEGACY_REF");
+        const bool ref_old = std::getenv("STRATA_BENCH_REF_OLD") && std::getenv("STRATA_BENCH_REF_OLD")[0] == '1';
         auto setl = [&](bool test) {
             if (lnew) K::native_expert_set_legacy(test ? std::atoi(lnew) : (lref ? std::atoi(lref) : 0));
+            if (ref_old) K::iq_set_old_kernels(!test);
         };
         std::vector<float> ref((size_t) NE * H), got((size_t) NE * H);
         const bool inspect_intermediates = f.gu_type == 42;

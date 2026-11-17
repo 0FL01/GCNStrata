@@ -63,10 +63,11 @@ const char* name_of(int t) {
         case 29: return "IQ1_M";
         case 42: return "Q2_0";
         case 3: return "Q4_1";
+        case 2: return "Q4_0";
         default: return "?";
     }
 }
-int block_values(int t) { return t == 20 || t == 3 ? 32 : t == 42 ? 64 : 256; }
+int block_values(int t) { return t == 20 || t == 3 || t == 2 ? 32 : t == 42 ? 64 : 256; }
 
 // `rows` rows of `n` values of format t: random bytes, then a finite fp16 scale in every block
 std::vector<uint8_t> random_rows(int t, int64_t rows, int64_t n, std::mt19937& rng) {
@@ -329,15 +330,17 @@ void bench(cudaStream_t s, std::mt19937& rng) {
         }
         std::printf("\n");
     }
-    std::printf("Q4_1/Q4_1 grouped, 16 groups of m entries:");   // gfx906: old = per-entry, new = STRATA_LEGACY_EXP
-    for (int m : {1, 2, 3, 4, 8}) {
-        Grouped G(3, 3, 2560, 640, std::vector<int>(16, m), 8, rng);
-        float us[2];
-        for (int old = 1; old >= 0; --old)
-            us[old] = 1e3f * time_ms(s, 50, [&] { G.run(old != 0, s); });
-        std::printf("  m=%d: %.1f/%.1f", m, us[1], us[0]);
+    for (const auto& gd : {std::pair{3, 3}, std::pair{2, 2}, std::pair{2, 3}}) {   // gfx906: old = per-entry, new = STRATA_LEGACY_EXP
+        std::printf("%s/%s grouped, 16 groups of m entries:", name_of(gd.first), name_of(gd.second));
+        for (int m : {1, 2, 3, 4, 8}) {
+            Grouped G(gd.first, gd.second, 2560, 640, std::vector<int>(16, m), 8, rng);
+            float us[2];
+            for (int old = 1; old >= 0; --old)
+                us[old] = 1e3f * time_ms(s, 50, [&] { G.run(old != 0, s); });
+            std::printf("  m=%d: %.1f/%.1f", m, us[1], us[0]);
+        }
+        std::printf("\n");
     }
-    std::printf("\n");
 }
 
 // #606: the q8_1 activation quantizers (quantize_q8_1_rows, native_quantize_q8_1 and the shared expert's fused
@@ -423,7 +426,7 @@ int main(int argc, char** argv) {
     cudaStream_t s;
     ck(cudaStreamCreate(&s), "stream");
     std::mt19937 rng(18);
-    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 3}) {
+    for (int t : {16, 17, 18, 20, 21, 22, 23, 29, 42, 3, 2}) {
         check_mmvq(t, 2560, 67, s, rng);   // the model's n_embd; 67 rows: a partial block of 4 rows
         check_mmvq(t, 1024, 5, s, rng);
     }
@@ -432,6 +435,8 @@ int main(int argc, char** argv) {
         check_grouped(gu, 23, 1024, 512, s, rng);                           // IQ4_XS down needs n_ff % 256 == 0
     }
     check_grouped(3, 3, 2560, 640, s, rng);   // bartowski Q4_1 experts
+    check_grouped(2, 2, 2560, 640, s, rng);   // bartowski Q4_0 experts
+    check_grouped(2, 3, 2560, 640, s, rng);   // bartowski Q4_0, layers 0-5: Q4_1 downs
     check_q8_1_finite(s, rng);
     if (do_bench) bench(s, rng);
     std::printf("iq_multi_parity: %d failures\n", g_fail);
