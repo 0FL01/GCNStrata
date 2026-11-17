@@ -1924,6 +1924,26 @@ bool q5_head_r2_enabled() {
     }
     return eligible;
 }
+// STRATA_GFX906_Q6_HEAD_R=2|4: the Q6_K heads (n_in 2560, n_out >= 32768: the output head, the MTP draft head) with
+// R rows per wavefront (4: at 1, 2 and 4 columns only).  Each row keeps the R = 1 lane / block assignment and its own 64-lane butterfly, so every
+// output is bitwise the R = 1 kernel's (b6_mmvq_bench --q6-head-r).  0 / unset: R = 1.
+int q6_head_r() {
+    const char* e = std::getenv("STRATA_GFX906_Q6_HEAD_R");
+    const int r = e ? std::atoi(e) : 0;
+    if (r != 2 && r != 4) return 0;
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) return 0;
+    static thread_local int cached_dev = -1;
+    static thread_local bool eligible = false;
+    if (cached_dev != dev) {
+        cudaDeviceProp p{};
+        if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return 0;
+        const std::string arch(p.gcnArchName);
+        eligible = p.warpSize == 64 && (arch == "gfx906" || arch.rfind("gfx906:", 0) == 0);
+        cached_dev = dev;
+    }
+    return eligible ? r : 0;
+}
 bool q8_output_r2_enabled() {
     const char* e = std::getenv("STRATA_GFX906_Q8_OUT_R2");
     if (!e || std::string(e) != "1") return false;
@@ -2805,6 +2825,17 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(x_q8_1);
     validate_pointer(y);
     validate_stream(stream);
+#if defined(STRATA_HIP_GFX906)
+    if (!g_wave_off && n_in == 2560 && n_out >= 32768) {
+        const int r = q6_head_r();
+        if (r == 2) { wave_launch<Q6KTraits, 2>(weights, x_q8_1, y, n_in, n_out, ncols, stream); launch_check(); return; }
+        // R4 only where it measured faster (MI50 head 248320 x 2560: 1 col 1.25 -> 1.11 ms, 2 cols 1.59 -> 1.45, 4 cols
+        // 2.42 -> 2.23; 3 / 5..8 columns slower), the other column counts keep R1
+        if (r == 4 && (ncols == 1 || ncols == 2 || ncols == 4)) {
+            wave_launch<Q6KTraits, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream); launch_check(); return;
+        }
+    }
+#endif
     STRATA_WAVE_MMVQ(Q6KTraits)
     if (ncols > 1) {
         launch_multi<Q6KTraits>(weights, x_q8_1, y, n_in, n_out, ncols, stream);

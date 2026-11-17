@@ -56,6 +56,8 @@ const Case CASES[] = {
     {"router BF16", 30, 2560, 512, 1, 2, {-1, -1}},
     {"head Q5_K", 13, 2560, 248320, 256, 176, {0, 2}},
     {"draft head Q5_K", 13, 2560, 106299, 256, 176, {0, 2}},
+    {"head Q6_K", 14, 2560, 248320, 256, 210, {208, -1}},
+    {"draft head Q6_K", 14, 2560, 58963, 256, 210, {208, -1}},
 };
 const int WIDTHS[] = {1, 2, 3, 4, 5, 6, 7, 8};
 
@@ -125,6 +127,8 @@ int main(int argc, char** argv) {
     const int only = argc > 2 ? std::atoi(argv[2]) : -1;
     const int bmode = argc > 3 ? std::atoi(argv[3]) : 1;
     const bool q5r2 = argc > 4 && std::strcmp(argv[4], "--q5-head-r2") == 0;
+    // --q6-head-r <2|4>: B = STRATA_GFX906_Q6_HEAD_R=<r> (gfx906 Q6_K heads), A = R1
+    const char* q6r = argc > 5 && std::strcmp(argv[4], "--q6-head-r") == 0 ? argv[5] : nullptr;
     const char* wave_mode = std::getenv("STRATA_MMVQ_WAVE");
     if (q5r2 && (bmode != 1 || n_dev < 1 || only < -1 || only >= n_dev ||
                  (wave_mode && std::strcmp(wave_mode, "0") == 0))) return 2;
@@ -134,6 +138,8 @@ int main(int argc, char** argv) {
 #if defined(STRATA_HIP_GFX906)
             if (setenv("STRATA_GFX906_Q5_HEAD_R2", mode ? "1" : "0", 1) != 0) std::exit(2);
 #endif
+        } else if (q6r) {
+            if (setenv("STRATA_GFX906_Q6_HEAD_R", mode ? q6r : "0", 1) != 0) std::exit(2);
         } else K::native_mmvq_set_b6_rows(mode);
     };
 
