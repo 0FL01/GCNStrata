@@ -89,6 +89,10 @@ void native_expert_set_mode(int mode, int phase);
 /// gate/up IQ2_XXS / IQ2_XS / IQ3_XXS / IQ3_S / IQ2_S at n_embd 2560 and down IQ4_NL / Q2_0 at n_ff 640; other layouts
 /// keep the default kernels.  Set before graph capture; captured graphs keep the kernels they captured.
 void native_expert_set_expdec(int on);
+/// gfx906 Q4_1 grouped decode experts: the kernel pair STRATA_LEGACY_EXP selects (<gate/up digit><down digit>, 0 = the
+/// per-entry kernels; every choice gives bitwise the same outputs).  Set before graph capture.
+void native_expert_set_legacy(int v);
+int native_expert_legacy();
 int native_expert_expdec();
 /// Its knobs, read from the environment at startup (STRATA_EXPDEC_R 1 | 2, _DR 1 | 2 | 4, _MINB 2 | 4, _D20 0 | 1,
 /// _RB, _DRB, _MINBLK): gate/up and down rows per lane, the gate/up kernel's __launch_bounds__ minimum blocks per SM

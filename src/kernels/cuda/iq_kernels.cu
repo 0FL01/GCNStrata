@@ -995,6 +995,35 @@ template<> struct Split<20> {   // IQ4_NL
         return d * sumi;
     }
 };
+// Q4_1 (bartowski Q4_1: dense projections and experts): vec_dot_q4_1_q8_1 split.  Its gate/up rows have K = 160
+// calls (not the 80 of row_dot_80_sub16), so the 16-lane gate/up layout is not used for it.
+template<> inline constexpr bool kSplit<3> = true;
+template<> struct Split<3> {
+    struct W { int v[VDR_Q4_1]; half2 dm; };
+    template<bool STAGE_GRID = false>
+    __device__ static W load(const void* __restrict__ vbq, int kbx, int iqs, const uint32_t* __restrict__ = nullptr) {
+        const block_q4_1* b = (const block_q4_1*) vbq + kbx;
+        W r;
+#pragma unroll
+        for (int i = 0; i < VDR_Q4_1; ++i) r.v[i] = get_int_b4(b->qs, iqs + i);
+        r.dm = b->dm;
+        return r;
+    }
+    __device__ static float apply(const W& r, const block_q8_1* __restrict__ bq8_1, int iqs) {
+        int sumi = 0, sumu = 0;
+#pragma unroll
+        for (int i = 0; i < VDR_Q4_1; ++i) {
+            const int v = r.v[i];
+            const int u0 = get_int_b4(bq8_1->qs, iqs + i), u1 = get_int_b4(bq8_1->qs, iqs + i + QI4_1);
+            sumi = ggml_cuda_dp4a((v >> 0) & 0x0F0F0F0F, u0, sumi);
+            sumi = ggml_cuda_dp4a((v >> 4) & 0x0F0F0F0F, u1, sumi);
+            sumu = ggml_cuda_dp4a(0x01010101, u1, ggml_cuda_dp4a(0x01010101, u0, sumu));
+        }
+        const float2 dm4 = __half22float2(r.dm);
+        const float d8 = __low2float(bq8_1->ds);
+        return sumi * (dm4.x * d8) + sumu * (dm4.y * d8);
+    }
+};
 template<> inline constexpr bool kSplit<23> = true;
 template<> struct Split<23> {   // IQ4_XS
     struct W { int2 v[4]; int ls; float dw; };
@@ -1440,7 +1469,7 @@ __global__ void __launch_bounds__(256) native_gu_multi_kernel(const unsigned lon
     const uint32_t* s_grid = stage_iq_grid<TG, STAGE_GRID>(s_grid_buf, threadIdx.x, 256);
     const int nb = (int) (L.n_embd / Fmt<TG>::qk), xb = (int) (L.n_embd / 32);
     if constexpr (SUB16) {
-        if (xb == 80) {
+        if (xb == 80 && nb * Fmt<TG>::ipb == 80) {   // row_dot_80_sub16's K (not Q4_1's 160)
             const int subwarp = threadIdx.x >> 4, t = threadIdx.x & 15;
             const int row = blockIdx.x * 16 + subwarp;            // 0 .. 2*n_ff
             if (row >= 2 * L.n_ff) return;
@@ -1573,7 +1602,7 @@ __global__ void __launch_bounds__(256) native_down_multi_kernel(const unsigned l
     if (blockIdx.y >= ng) return;
     __shared__ uint32_t s_hq_buf[GRP_NC * 20 * 9];
     const int nb = (int) (L.n_ff / Fmt<TD>::qk), hb = (int) (L.n_ff / 32);
-    if constexpr (SUB_DOWN && (TD == 20 || TD == 40)) {   // IQ4_NL (K 40) and NVFP4 (K 20): 8-lane rows
+    if constexpr (SUB_DOWN && (TD == 20 || TD == 40 || TD == 3)) {   // IQ4_NL / Q4_1 (K 40) and NVFP4 (K 20): 8-lane rows
         if (hb == 20) {
             const int r = blockIdx.x * 32 + (threadIdx.x >> 3);
             const int t = threadIdx.x & 7;
@@ -2557,6 +2586,16 @@ bool env_on(const char* name) {
 // STRATA_OLD_IQ_MMVQ=1 keeps the per-column kernels (bitwise equal to the new ones; kept for A/B timing)
 bool g_old_kernels = env_on("STRATA_OLD_IQ_MMVQ");
 bool g_no_sub16_gu = env_on("STRATA_NO_SUB16_GU");
+// gfx906 Q4_1 grouped decode experts (bartowski Q4_1): STRATA_LEGACY_EXP=<gate/up><down> picks the kernels, each
+// bitwise the per-entry ones (native_expert_bench STRATA_BENCH_LEGACY=<v>, reference 0): gate/up 0 native_gu_kernel,
+// 1 native_gu_multi_kernel (32 lanes), 2 / 3 / 4 s27_gu_kernel (4 / 2 / 1 rows per warp, activations in LDS); down 0
+// native_down_kernel, 1 native_down_multi_kernel (8-lane rows), 2 / 3 s27_down_kernel (4 / 2 rows per warp).
+// Default 31 (MI50, real layer-1 rows, 10 experts, bitwise equal: 1 token per expert 82.7 -> 69 us, 2 tokens 139.6 ->
+// 86 us, 3 tokens 199 -> 102 us; 21 ties, the others are slower); STRATA_LEGACY_EXP=0 keeps the per-entry kernels.
+int g_legacy_exp = [] {
+    const char* v = std::getenv("STRATA_LEGACY_EXP");
+    return v != nullptr && v[0] != '\0' ? std::atoi(v) : 31;
+}();
 // STRATA_IQ_STAGE_GRID=0 disables staging 64-bit i-quant codebook tables into shared memory
 bool g_stage_grid = [] {
     const char* v = std::getenv("STRATA_IQ_STAGE_GRID");
@@ -3073,6 +3112,8 @@ template<> struct S27<8> {   // Q8_0
         return r.d * d8_1 * ((float) sumi);
     }
 };
+
+template<> struct S27<3> : Split<3> {};   // Q4_1 (bartowski): the same load / apply
 
 template<int TG, bool LX, int RPW, bool TS>
 __global__ void __launch_bounds__(256) s27_gu_kernel(const unsigned long long* __restrict__ grp_ptr,
@@ -4398,6 +4439,8 @@ bool g_grouped_v1 = env_on("STRATA_GROUPED_V1");
 void native_grouped_set_v1(bool v1) { g_grouped_v1 = v1; }
 
 void native_expert_set_expdec(int on) { g_expdec = on ? 1 : 0; }
+void native_expert_set_legacy(int v) { g_legacy_exp = v; }
+int native_expert_legacy() { return g_legacy_exp; }
 int native_expert_expdec() { return g_expdec; }
 void native_expert_set_expdec_params(const NativeExpertExpdecParams& p) {
     if (p.gu_rows_per_lane > 0) g_expdec_r = p.gu_rows_per_lane;
@@ -4498,7 +4541,42 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     }
     const bool v1 = g_grouped_v1;
     const int64_t gy = (v1 || grid_groups <= 0 || grid_groups > cap_groups) ? cap_groups : grid_groups;
-    const int gu_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_split(L.gu_type)) ? 16 : GU_ROWS;
+#if defined(STRATA_HIP_GFX906)
+    if (g_legacy_exp > 0 && !g_old_kernels && L.gu_type == 3 && L.d_type == 3 && L.n_embd == 2560 && L.n_ff == 640) {
+        const int vg = g_legacy_exp / 10, vd = g_legacy_exp % 10;
+        const unsigned cg = (unsigned) cap_groups, gyu = (unsigned) gy;
+        if (g_exp_phase != 2) {
+            switch (vg) {
+                case 1: native_gu_multi_kernel<3, false, false><<<dim3((unsigned) (2 * L.n_ff / GU_ROWS), gyu), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+                case 2: s27_gu_kernel<3, true, 4, false><<<dim3((unsigned) (2 * L.n_ff / (GU_ROWS * 4)), cg), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+                case 3: s27_gu_kernel<3, true, 2, false><<<dim3((unsigned) (2 * L.n_ff / (GU_ROWS * 2)), cg), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+                case 4: s27_gu_kernel<3, true, 1, false><<<dim3((unsigned) (2 * L.n_ff / GU_ROWS), cg), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+                default: native_gu_kernel<3><<<dim3((unsigned) (2 * L.n_ff / GU_ROWS), gyu), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_tok, X, L, gate, up); break;
+            }
+            check("native_expert_grouped/gu q4_1");
+            const long long nh = (long long) cap_entries * L.n_ff;
+            static const bool sw_fused_l = env_on("STRATA_HIP_SWIGLU_FUSED");   // as the default path below
+            if (v1 || !sw_fused_l) {
+                swiglu_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, h, nh);
+                quantize_q8_1_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(h, hq, nh);
+            } else {
+                swiglu_q8_1_entries_kernel<<<(unsigned) ((nh + 255) / 256), 256, 0, s>>>(gate, up, grp_start, n_groups,
+                                                                                        (int) L.n_ff, hq);
+            }
+            check("native_expert_grouped/swiglu q4_1");
+        }
+        if (g_exp_phase == 1) return;
+        switch (vd) {
+            case 1: native_down_multi_kernel<3, true><<<dim3((unsigned) (L.n_embd / 32), gyu), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+            case 2: s27_down_kernel<3, true, 4, false><<<dim3((unsigned) (L.n_embd / 32), cg), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+            case 3: s27_down_kernel<3, true, 2, false><<<dim3((unsigned) (L.n_embd / 16), cg), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+            default: native_down_kernel<3><<<dim3((unsigned) (L.n_embd / 8), gyu), 256, 0, s>>>(grp_ptr, grp_start, n_groups, ent_dst, hq, L, out); break;
+        }
+        check("native_expert_grouped/down q4_1");
+        return;
+    }
+#endif
+    const int gu_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_embd == 2560 && gu_split(L.gu_type) && L.gu_type != 3) ? 16 : GU_ROWS;
     const dim3 ggu((unsigned) ((2 * L.n_ff + gu_rows - 1) / gu_rows), (unsigned) gy);
 #if STRATA_EXP_LAYOUTS
 #if defined(STRATA_HIP_GFX906)
@@ -4620,7 +4698,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
     check("native_expert_grouped/swiglu");
     }
     if (g_exp_phase == 1) return;
-    const int d_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 640) ? (L.d_type == 20 || L.d_type == 40 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
+    const int d_rows = (!g_old_kernels && !g_no_sub16_gu && L.n_ff == 640) ? (L.d_type == 20 || L.d_type == 40 || L.d_type == 3 ? 32 : (L.d_type == 42 ? 16 : 8)) : 8;
     const dim3 gd((unsigned) ((L.n_embd + d_rows - 1) / d_rows), (unsigned) gy);
 #if STRATA_EXP_LAYOUTS
 #if defined(STRATA_HIP_GFX906) && defined(__HIPCC__)

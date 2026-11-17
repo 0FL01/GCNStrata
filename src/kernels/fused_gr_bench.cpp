@@ -59,6 +59,9 @@ int main(int argc, char** argv) {
     const int iters = argc > 1 ? std::atoi(argv[1]) : 500;
     const int t_lo = argc > 2 ? std::atoi(argv[2]) : 1, t_hi = argc > 3 ? std::atoi(argv[3]) : 6;
     const int cold_sets = argc > 4 ? std::atoi(argv[4]) : 0;
+    // STRATA_BENCH_HC_CHECK=1: pick the read variant as the engine does (fused_gr_check: the newest one bitwise equal to
+    // the plain read on this card, e.g. staged) instead of the unchecked default (plain)
+    if (std::getenv("STRATA_BENCH_HC_CHECK") != nullptr) K::fused_gr_check();
     const int N = 2560, HC = 4, D = N * HC, LR = 320, TM = K::kFusedGrMaxT;
     std::mt19937 rng(7);
     std::normal_distribution<float> nd(0.f, 1.f);

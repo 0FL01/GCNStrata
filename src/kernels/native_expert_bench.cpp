@@ -131,6 +131,13 @@ int main(int argc, char** argv) {
             K::native_expert_set_mode(m, phase);
             K::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, G + cap_pad, NE, dxq, dscr, dout, s);
         };
+        // STRATA_BENCH_LEGACY=<v> [STRATA_BENCH_LEGACY_REF=<v>]: the gfx906 Q4_1 kernel pair (STRATA_LEGACY_EXP) of the
+        // timed side and of the reference side (default 0, the per-entry kernels)
+        const char* lnew = std::getenv("STRATA_BENCH_LEGACY");
+        const char* lref = std::getenv("STRATA_BENCH_LEGACY_REF");
+        auto setl = [&](bool test) {
+            if (lnew) K::native_expert_set_legacy(test ? std::atoi(lnew) : (lref ? std::atoi(lref) : 0));
+        };
         std::vector<float> ref((size_t) NE * H), got((size_t) NE * H);
         const bool inspect_intermediates = f.gu_type == 42;
         std::vector<float> ref_gu(inspect_intermediates ? (size_t) 3 * NE * FF : 0), got_gu(ref_gu.size());
@@ -138,11 +145,13 @@ int main(int argc, char** argv) {
         const size_t nq = inspect_intermediates ? (size_t) NE * FF / 32 * 36 : 0;
         std::vector<uint8_t> ref_q(nq), got_q(nq);
         cudaMemsetAsync(dout, 0xff, got.size() * 4, s);
+        setl(false);
         run(mref, 0);
         if (inspect_intermediates) cudaMemcpyAsync(ref_gu.data(), dscr, ref_gu.size() * 4, cudaMemcpyDeviceToHost, s);
         if (inspect_intermediates) cudaMemcpyAsync(ref_q.data(), (uint8_t*) dscr + 3 * fa, nq, cudaMemcpyDeviceToHost, s);
         cudaMemcpyAsync(ref.data(), dout, ref.size() * 4, cudaMemcpyDeviceToHost, s);
         cudaMemsetAsync(dout, 0xff, got.size() * 4, s);
+        setl(true);
         run(mode, 0);
         if (inspect_intermediates) cudaMemcpyAsync(got_gu.data(), dscr, got_gu.size() * 4, cudaMemcpyDeviceToHost, s);
         if (inspect_intermediates) cudaMemcpyAsync(got_q.data(), (uint8_t*) dscr + 3 * fa, nq, cudaMemcpyDeviceToHost, s);
@@ -177,7 +186,7 @@ int main(int argc, char** argv) {
         double us[2][3] = {{1e30, 1e30, 1e30}, {1e30, 1e30, 1e30}};
         for (int round = 0; round < 3; ++round)   // interleaved, the minimum: the clocks wander between runs
             for (int k = 0; k < 2; ++k)
-                for (int p = 0; p < 3; ++p) us[k][p] = std::fmin(us[k][p], time(k ? mode : mref, p));
+                for (int p = 0; p < 3; ++p) { setl(k != 0); us[k][p] = std::fmin(us[k][p], time(k ? mode : mref, p)); }
         std::printf("layer %2d %-7s/%-6s G %d T %d | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s)"
                     " | mode %d: all %7.1f us  gu %7.1f us (%3.0f GB/s)  down %6.1f us (%3.0f GB/s) | %s\n",
                     l, ggml_type_name((ggml_type) f.gu_type), ggml_type_name((ggml_type) f.d_type), G, T,
