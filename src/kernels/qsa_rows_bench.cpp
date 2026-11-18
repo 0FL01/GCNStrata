@@ -106,6 +106,7 @@ int main(int argc, char** argv) {
     int device = 0, iters = 100;
     int64_t ctx = 131072, max_ctx = 262144;
     bool rows = false, dense = true;
+    int64_t dense_win_arg = 32768;   // --dense-win: the drafter's --mtp-window (production 16384)
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--device") == 0 && i + 1 < argc) device = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) iters = std::atoi(argv[++i]);
@@ -113,9 +114,10 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--max-context") == 0 && i + 1 < argc) max_ctx = std::atoll(argv[++i]);
         else if (std::strcmp(argv[i], "--rows") == 0) rows = true;
         else if (std::strcmp(argv[i], "--no-dense") == 0) dense = false;
+        else if (std::strcmp(argv[i], "--dense-win") == 0 && i + 1 < argc) dense_win_arg = std::atoll(argv[++i]);
         else {
             std::fprintf(stderr, "usage: qsa_rows_bench [--device N] [--iters 100] [--ctx 131072] [--max-context 262144] "
-                                 "[--rows] [--no-dense]\n");
+                                 "[--rows] [--no-dense] [--dense-win 32768]\n");
             return 2;
         }
     }
@@ -135,7 +137,7 @@ int main(int argc, char** argv) {
     const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s);              // verify.cpp: cap_ (2051)
     const int64_t cells = (ctx + MAXT + 64 + PS - 1) / PS * PS;                     // the pools' rows: resident cells
     const int64_t pages = cells / PS, prows = pages * NKV * PS;
-    const int64_t dense_win = 32768, dense_cap = dense_win;                       // the drafter's --mtp-window
+    const int64_t dense_win = dense_win_arg, dense_cap = (dense_win + 63) / 64 * 64;   // the drafter's --mtp-window
     std::printf("qsa_rows_bench on device %d (%s, %d.%d), %d iterations: context %lld, capacity %lld cells (max_blocks "
                 "%lld), selection cap %lld, int8 pools over %lld cells%s\n",
                 device, prop.name, prop.major, prop.minor, iters, (long long) ctx, (long long) max_cells,

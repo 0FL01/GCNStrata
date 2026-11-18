@@ -1048,7 +1048,17 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
     }
     cudaStream_t st = (cudaStream_t) stream;
     launch_chunks_batch(q, pools, ids, steps, cap, s, scratch, n_q, st, -1);
+#if defined(STRATA_HIP_GFX906)
+    // gfx906 STRATA_GFX906_MERGE_V2_DECODE (default on; 0: STRATA_ATTN_MERGE_V2 decides): decode-sized calls (the verify
+    // window's QSA rows, the drafter's dense window) merge with attn_merge_v2_kernel - bitwise attn_merge_kernel (same
+    // fmaf's in the same chunk order: qsa_merge_daily_parity), bounded by the width and with batched loads.  MI50,
+    // qsa_rows_bench --dense-win 16384 at 20K: the drafter's attention 448 -> 301 us (T1).  Prompt-sized calls keep
+    // STRATA_ATTN_MERGE_V2's choice (the Nov 14 screen saw the prompt slower with v2 there).
+    static const bool v2_decode = [] { const char* v = std::getenv("STRATA_GFX906_MERGE_V2_DECODE"); return v == nullptr || std::atoi(v) != 0; }();
+    launch_merge_batch(steps, cap, s, scratch, attn, n_q, (v2_decode && n_q <= 8) ? 1 : attn_merge_v2(), st);
+#else
     launch_merge_batch(steps, cap, s, scratch, attn, n_q, attn_merge_v2(), st);
+#endif
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa_decode_attn_batch: %s\n", cudaGetErrorString(e));
