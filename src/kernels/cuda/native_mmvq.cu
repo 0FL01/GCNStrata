@@ -997,6 +997,52 @@ struct Q6KTraits {
         return q6_q8_dot_impl(r.vl, r.vh, u, r.scales, r.d, d8);
     }
 };
+#if defined(STRATA_HIP_GFX906)
+// gfx906 STRATA_GFX906_Q6_HEAD_X (the Q6_K heads, default on): Q6KTraits with the same integers in fewer instructions.
+//  - q6_q8_dot_impl's vsubss4(vil | vih, 0x20202020) never saturates (every byte of vil | vih is 0..63), so
+//    dp4a(b - 32, u) == dp4a(b, u) - 32 * dp4a(0x01010101, u) exactly (the Sum u term is shared by a wave's R rows);
+//    on gfx906 the byte-wise saturating subtract is a dozen instructions;
+//  - ql / qh as one dword load each (alternate 210-byte blocks are only 2-byte aligned; MI50 loads them as one) - the
+//    same little-endian int as load_int_b2's two u16 loads.
+// The int sum, then every float operation, is q6_q8_dot_impl's, so each output is bitwise Q6KTraits' (b6_mmvq_bench
+// --q6-head-x; mb/q6head.hip on MI50, 248320 x 2560: 1 col 1.069 -> 0.907 ms (R2), 2 cols 1.434 -> 1.252 (R4)).
+__device__ __forceinline__ float q6_q8_dot_x(int vl, int vh, const int* __restrict__ u, const int8_t* __restrict__ scales,
+                                             float d, const float* __restrict__ d8) {
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int sc = scales[4 * i];
+        const int vil = (vl >> (4 * i)) & 0x0f0f0f0f;
+        const int vih = ((vh >> (4 * i)) << 4) & 0x30303030;
+        const int dot = STRATA_DP4A(vil | vih, u[i], 0) - 32 * STRATA_DP4A(0x01010101, u[i], 0);
+        sumf += d8[i] * (dot * sc);
+    }
+    return d * sumf;
+}
+struct Q6KTraitsX : Q6KTraits {
+    __device__ static W load(const Block* __restrict__ w, int iqs) {
+        W r;
+        r.bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
+        const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
+        const int vh_shift = 2 * ((iqs % 16) / 8);
+        r.vl = *reinterpret_cast<const int __attribute__((aligned(1)))*>(w->ql + 4 * iqs);
+        r.vh = *reinterpret_cast<const int __attribute__((aligned(1)))*>(w->qh + 4 * (8 * (iqs / 16) + iqs % 8)) >> vh_shift;
+        r.scales = w->scales + scale_offset;
+        r.d = w->d;
+        return r;
+    }
+    __device__ static float apply(const W& r, const Q81Block* __restrict__ x, int iqs) {
+        int u[2];
+        float d8[2];
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            u[i] = reinterpret_cast<const int*>(x[r.bq8_offset + 2 * i].qs)[iqs % 8];
+            d8[i] = __low2float(x[r.bq8_offset + 2 * i].ds);
+        }
+        return q6_q8_dot_x(r.vl, r.vh, u, r.scales, r.d, d8);
+    }
+};
+#endif
 struct IQ4XSTraits {
     using Block = IQ4XSBlock;
     static constexpr int DIV = 256, T = 8, KBY = 8, BPI = 4 * WARPS * WARP / 32;
@@ -1945,6 +1991,13 @@ int q6_head_r() {   // default 4 (unset or empty); 0 / 1: R = 1
     }
     return eligible ? r : 0;
 }
+// STRATA_GFX906_Q6_HEAD_X (default on; 0: off): the Q6_K heads on Q6KTraitsX (above) where it measured faster, with
+// the rows per wavefront that measured best for each column count; read per call (b6_mmvq_bench switches it)
+bool q6_head_x() {
+    const char* e = std::getenv("STRATA_GFX906_Q6_HEAD_X");
+    if (e && e[0] != '\0' && std::atoi(e) == 0) return false;
+    return q6_head_r() != 0 || (e && std::atoi(e) != 0);   // the same card check (gfx906, wave64)
+}
 int q40_rows() {   // read per call (graph capture freezes it for decode), so a bench can switch it; default 4, 0 / 1: R = 1
     const char* e = std::getenv("STRATA_GFX906_Q40_R");
     const int v = e && e[0] != '\0' ? std::atoi(e) : 4;
@@ -2847,6 +2900,13 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_stream(stream);
 #if defined(STRATA_HIP_GFX906)
     if (!g_wave_off && n_in == 2560 && n_out >= 32768) {
+        // (mb/q6head.hip on MI50: R2 at 1 / 3 / 4 columns, R4 at 2; 5..8 columns slower than the R1 kernel: kept)
+        if (ncols <= 4 && q6_head_x()) {
+            if (ncols == 2) wave_launch<Q6KTraitsX, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+            else wave_launch<Q6KTraitsX, 2>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
+            launch_check();
+            return;
+        }
         const int r = q6_head_r();
         if (r == 2) { wave_launch<Q6KTraits, 2>(weights, x_q8_1, y, n_in, n_out, ncols, stream); launch_check(); return; }
         // R4 only where it measured faster (MI50 head 248320 x 2560: 1 col 1.25 -> 1.11 ms, 2 cols 1.59 -> 1.45, 4 cols

@@ -138,6 +138,8 @@ int main(int argc, char** argv) {
     const char* q6r = argc > 5 && std::strcmp(argv[4], "--q6-head-r") == 0 ? argv[5] : nullptr;
     // --q40-r <2|4>: B = STRATA_GFX906_Q40_R=<r> (dense Q4_0 rows per wavefront), A = R1
     const char* q40r = argc > 5 && std::strcmp(argv[4], "--q40-r") == 0 ? argv[5] : nullptr;
+    // --q6-head-x: B = STRATA_GFX906_Q6_HEAD_X=1 (exact faster Q6_K head dot), A = the R4 head (X off)
+    const bool q6x = argc > 4 && std::strcmp(argv[4], "--q6-head-x") == 0;
     const char* wave_mode = std::getenv("STRATA_MMVQ_WAVE");
     if (q5r2 && (bmode != 1 || n_dev < 1 || only < -1 || only >= n_dev ||
                  (wave_mode && std::strcmp(wave_mode, "0") == 0))) return 2;
@@ -149,6 +151,8 @@ int main(int argc, char** argv) {
 #endif
         } else if (q6r) {
             if (setenv("STRATA_GFX906_Q6_HEAD_R", mode ? q6r : "0", 1) != 0) std::exit(2);
+        } else if (q6x) {
+            if (setenv("STRATA_GFX906_Q6_HEAD_X", mode ? "1" : "0", 1) != 0) std::exit(2);
         } else if (q40r) {
             if (setenv("STRATA_GFX906_Q40_R", mode ? q40r : "0", 1) != 0) std::exit(2);
         } else K::native_mmvq_set_b6_rows(mode);
