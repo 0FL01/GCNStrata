@@ -1925,11 +1925,12 @@ bool q5_head_r2_enabled() {
     return eligible;
 }
 // STRATA_GFX906_Q6_HEAD_R=2|4: the Q6_K heads (n_in 2560, n_out >= 32768: the output head, the MTP draft head) with
-// R rows per wavefront (4: at 1, 2 and 4 columns only).  Each row keeps the R = 1 lane / block assignment and its own 64-lane butterfly, so every
-// output is bitwise the R = 1 kernel's (b6_mmvq_bench --q6-head-r).  0 / unset: R = 1.
-int q6_head_r() {
+// R rows per wavefront (4: at 1, 2 and 4 columns only).  Each row keeps the R = 1 lane / block assignment and its own
+// 64-lane butterfly, so every output is bitwise the R = 1 kernel's (b6_mmvq_bench --q6-head-r).  Default 4 on gfx906
+// (unset or empty; engine, 4 x 3000 greedy tokens: texts identical); 0: R = 1.
+int q6_head_r() {   // default 4 (unset or empty); 0 / 1: R = 1
     const char* e = std::getenv("STRATA_GFX906_Q6_HEAD_R");
-    const int r = e ? std::atoi(e) : 0;
+    const int r = e && e[0] != '\0' ? std::atoi(e) : 4;
     if (r != 2 && r != 4) return 0;
     int dev = -1;
     if (cudaGetDevice(&dev) != cudaSuccess) return 0;
@@ -1944,9 +1945,9 @@ int q6_head_r() {
     }
     return eligible ? r : 0;
 }
-int q40_rows() {   // read per call (graph capture freezes it for decode), so a bench can switch it
+int q40_rows() {   // read per call (graph capture freezes it for decode), so a bench can switch it; default 4, 0 / 1: R = 1
     const char* e = std::getenv("STRATA_GFX906_Q40_R");
-    const int v = e ? std::atoi(e) : 0;
+    const int v = e && e[0] != '\0' ? std::atoi(e) : 4;
     return v == 2 || v == 4 ? v : 0;
 }
 bool q8_output_r2_enabled() {
@@ -1996,8 +1997,9 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
     }
 #endif
 #if defined(STRATA_HIP_GFX906)
-    // STRATA_GFX906_Q40_R=2|4: dense Q4_0 (bartowski Q4_0: GDN qkv / gate / out, QSA q / out) with R rows per
-    // wavefront; each row keeps the R = 1 lane / block assignment and its own 64-lane butterfly: bitwise R = 1's
+    // STRATA_GFX906_Q40_R=2|4 (default 4; 0: R = 1): dense Q4_0 (bartowski Q4_0: GDN qkv / gate / out, QSA q / out)
+    // with R rows per wavefront; each row keeps the R = 1 lane / block assignment and its own 64-lane butterfly:
+    // bitwise R = 1's (engine, 4 x 3000 greedy tokens: texts identical, TG +6%)
     if constexpr (std::is_same_v<Weight, Q40Block>) {
         if (!g_wave_off) {
             const int r = q40_rows();
