@@ -13195,7 +13195,14 @@ int main(int argc, char** argv) {
             int pl_pw = pipe ? o.pipeline_windows : 0;
             float pl_theta = [] {   // a speculative window is launched only when its estimated chance is at least this
                 const char* v = pipe_dbg_env("STRATA_PIPELINE_THETA");
+#if defined(STRATA_HIP_GFX906)
+                // gfx906 (4 x MI50, B3): 0.1 is 0.8% faster a window than 0.2 with the same texts (0.05 and 0 are no
+                // faster, 0.3 slower); STRATA_GFX906_PIPELINE_THETA overrides it without the debug switch
+                if (v == nullptr) v = std::getenv("STRATA_GFX906_PIPELINE_THETA");
+                return v ? (float) std::atof(v) : 0.1f;
+#else
                 return v ? (float) std::atof(v) : 0.2f;
+#endif
             }();
             int pl_force_miss = [] {   // exactness test: every k-th speculative window gets a wrong first token
                 const char* v = pipe_dbg_env("STRATA_PIPELINE_FORCE_MISS");
