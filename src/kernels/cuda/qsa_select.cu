@@ -1139,9 +1139,10 @@ __global__ void __launch_bounds__(TK_T) block_topk_wide_scan_kernel(const float*
         for (int64_t j = t; j < n_kv; j += TK_T) out[j] = (int32_t) j;
         return;
     }
-    // Current device row only: nonnegative full/tail weights and a positive threshold.
-    const bool wide_scan = n_kv > 69631 && n_kv <= 262144 &&
-                           n_bid == n_kv / R && width > 0 && width < n_kv;
+    // Current device row only: nonnegative full/tail weights and a positive threshold (then the bins' running sum from
+    // the top is monotone and the cooperative search finds the serial walk's digit and count at every length; it was
+    // measured first on 69,632-262,144 cells, 2026-11-19 on the 2,052-24,576 band of the guarded dispatch too)
+    const bool wide_scan = n_bid == n_kv / R && width > 0 && width < n_kv;
     const float* sc = scores + qi * max_blocks;
     const int64_t nb = n_bid + 1;
     const int64_t per = (nb + TK_T - 1) / TK_T;       // rows of 32 blocks per warp
@@ -2891,9 +2892,10 @@ void qsa_block_topk(const float* scores, const int32_t* steps, int64_t nq, int64
         const char* fit17 = std::getenv("STRATA_GFX906_TOPK_FIT17");
         return reg && std::strcmp(reg, "2") == 0 && fit17 && std::strcmp(fit17, "1") == 0;
     }();
+    // the wide arm's cooperative digit search (default since 2026-11-19; STRATA_GFX906_TOPK_WIDE_SCAN=0: the serial one)
     static const bool wide_scan = [] {
         const char* v = std::getenv("STRATA_GFX906_TOPK_WIDE_SCAN");
-        return v && std::strcmp(v, "1") == 0;
+        return v == nullptr || std::strcmp(v, "0") != 0;
     }();
     if (guarded_fit17 && !old && !counted && nq <= 8 &&
         reach > (int64_t) TK_T * TK_PER && reach <= (int64_t) TK_T * TK_PER_MAX &&
