@@ -297,6 +297,9 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
     check(cudaMalloc(&d_inj_out, (size_t) T * HC * sizeof(float)), "multi injection");
     check(cudaMalloc(&d_mixed, (size_t) T * N * sizeof(float)), "multi mixed");
     check(cudaMalloc(&d_xn, (size_t) T * D * sizeof(float)), "multi xn");
+    unsigned* d_sy = nullptr;   // the gfx906 one-kernel read's sync words (STRATA_HC_SPLIT=3 / 4)
+    check(cudaMalloc(&d_sy, kFusedGrSyncWords * sizeof(unsigned)), "multi sync");
+    check(cudaMemset(d_sy, 0, kFusedGrSyncWords * sizeof(unsigned)), "multi sync zero");
     check(cudaMemcpy(d_r, r.data(), r.size() * sizeof(float), cudaMemcpyHostToDevice), "multi copy R");
     check(cudaMemcpy(d_bo, bo.data(), bo.size() * sizeof(float), cudaMemcpyHostToDevice), "multi copy bo");
     check(cudaMemcpy(d_inj, inj.data(), inj.size() * sizeof(float), cudaMemcpyHostToDevice), "multi copy inj");
@@ -365,7 +368,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
     // the uploads above (and the caller's weights) run on the legacy stream, which the non-blocking `stream` does not wait for
     check(cudaDeviceSynchronize(), "multi setup");
     // Max T forces the HIP kernel's full dynamic-LDS request: 8 * 1280 * sizeof(float) = 40 KiB.
-    fused_gr_read_multi(args.data(), T, d_xn, stream);
+    fused_gr_read_multi(args.data(), T, d_xn, stream, nullptr, 0, d_sy);
     check(cudaStreamSynchronize(stream), "multi max-T sync");
     const Snapshot multi = snapshot();
     for (int t = 0; t < T; ++t) fused_gr_read(args[t], stream);
@@ -380,7 +383,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
     cudaGraph_t graph = nullptr;
     cudaGraphExec_t graph_exec = nullptr;
     check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "multi graph begin");
-    fused_gr_read_multi(args.data(), T, d_xn, stream);
+    fused_gr_read_multi(args.data(), T, d_xn, stream, nullptr, 0, d_sy);
     check(cudaStreamEndCapture(stream, &graph), "multi graph end");
     check(cudaGraphInstantiate(&graph_exec, graph, nullptr, nullptr, 0), "multi graph instantiate");
     check(cudaGraphLaunch(graph_exec, stream), "multi graph initial replay");
@@ -434,10 +437,10 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
                 cudaGraph_t qg = nullptr;
                 cudaGraphExec_t qx = nullptr;
                 if (rep == 0) {
-                    wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream);
+                    wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream, nullptr, 0, d_sy);
                 } else {   // a captured read, replayed (twice: rep 1 and 2 use fresh captures, each replayed twice)
                     check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "qfuse begin");
-                    wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream);
+                    wrote = fused_gr_read_multi(qa.data(), tt, d_xn, stream, nullptr, 0, d_sy);
                     check(cudaStreamEndCapture(stream, &qg), "qfuse end");
                     check(cudaGraphInstantiate(&qx, qg, nullptr, nullptr, 0), "qfuse instantiate");
                     check(cudaGraphLaunch(qx, stream), "qfuse replay 1");
@@ -466,6 +469,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
     check(cudaGraphDestroy(graph), "multi graph destroy");
     check(cudaStreamDestroy(stream), "multi stream destroy");
     check(cudaFree(d_xn), "free multi xn");
+    check(cudaFree(d_sy), "free multi sync");
     check(cudaFree(d_mixed), "free multi mixed");
     check(cudaFree(d_inj_out), "free multi injection");
     check(cudaFree(d_rs), "free multi rs");

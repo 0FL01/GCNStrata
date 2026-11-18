@@ -212,6 +212,7 @@ struct GrMulti {
     FusedGrArgs a[kFusedGrMaxT];
     float* xn;
     int T;
+    unsigned* sync = nullptr;   // gfx906 one-kernel read (kHcOne*): the caller's per-instance sync words, zeroed
 };
 
 
@@ -802,7 +803,9 @@ __global__ void __launch_bounds__(THREADS) gr_up_v3_kernel(GrMulti m, const floa
 //    weights are loaded while the current one is used.  A tile is 160 = 5 x 32 chunks of 8, so a lane still
 //    accumulates its chunks lane + 32 q in ascending order, as in the plain read with either tile.  Before sm_80
 //    (and on HIP) the staging is a plain copy: the same bits, only not asynchronous.
-constexpr int kHcPlain = 1, kHcSplit = 2, kHcStaged = 3;
+// gfx906: kHcOneDown = the staged read's norm and down projection in one kernel (the up projection launched after
+// it), kHcOne = the norm, down and up projections in one kernel (gr_one_kernel below); both need GrMulti::sync
+constexpr int kHcPlain = 1, kHcSplit = 2, kHcStaged = 3, kHcOneDown = 4, kHcOne = 5;
 constexpr int H_TILE = 1280;                          // staged tile: half a stream = 160 chunks of 8, 5 per lane
 constexpr int HQ = H_TILE / 8 / 32;
 constexpr int N_HTILES = D / H_TILE;                  // 8
@@ -853,12 +856,12 @@ __global__ void __launch_bounds__(THREADS) gr_norm_split_kernel(GrMulti m) {
 // thread's own sum of squares ascends in k; the warp sum, part[] sum and rsqrt are the kernel's), so rs and xn are
 // bitwise the same; what goes is the loop's one-iteration-at-a-time loads and the second pass that read xn back from
 // global memory (a write, a barrier, a read: two memory latencies).
-__global__ void __launch_bounds__(THREADS) gr_norm_split_fast_kernel(GrMulti m) {
+// the body: token `tok`, stream `c` (the kernel's blockIdx.x / .y; the gfx906 one-kernel read runs it in its first blocks)
+__device__ __forceinline__ void norm_split_fast_body(const GrMulti& m, const int tok, const int c) {
     __shared__ float part[WARPS];
     __shared__ float s_rs;
-    const FusedGrArgs& a = m.a[blockIdx.x];
-    const int c = blockIdx.y;
-    float* xn = m.xn + (size_t) blockIdx.x * D;
+    const FusedGrArgs& a = m.a[tok];
+    float* xn = m.xn + (size_t) tok * D;
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const float gw = a.apply ? 2.0f * sigmoidf_(a.inj_prev[c] / (float) HC) : 0.0f;
     // the thread's float4 of stream c: i = 4 t + 1024 k in [c N, (c + 1) N), ascending k; N / 1024 = 2.5 -> at most 3
@@ -906,6 +909,9 @@ __global__ void __launch_bounds__(THREADS) gr_norm_split_fast_kernel(GrMulti m) 
         if (ok[j])
             *reinterpret_cast<float4*>(xn + t * 4 + (k0 + j) * THREADS * 4) =
                 make_float4(r[j].x * rs, r[j].y * rs, r[j].z * rs, r[j].w * rs);
+}
+__global__ void __launch_bounds__(THREADS) gr_norm_split_fast_kernel(GrMulti m) {
+    norm_split_fast_body(m, blockIdx.x, blockIdx.y);
 }
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800 && !defined(__HIPCC__)
@@ -958,16 +964,13 @@ __device__ __forceinline__ void stage_htile(const GrMulti& m, int T, int h, floa
     }
 }
 
-template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
-__global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
-    extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
+// the body: down block `bx` (blockIdx.x) of the tokens from k0; `hbuf` = 2 buffers x [T][2][160] float4 of shared memory
+template <int MAX_T, bool EXACT_T>
+__device__ __forceinline__ void down_staged_body(const GrMulti& m, float4* hbuf, const int bx, const int k0) {
     const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
     const int T = EXACT_T ? MAX_T : m.T;
-    // sm_75: a launch of EXACT_T groups of MAX_T tokens, one per blockIdx.y (gridDim.y 1: the whole launch); every
-    // (row, token) is summed by one warp exactly as before - only more blocks share the card (#down-tg)
-    const int k0 = EXACT_T ? (int) blockIdx.y * MAX_T : 0;
-    const bool inject_block = blockIdx.x == DOWN_BLOCKS;
-    const int row = inject_block ? warp : blockIdx.x * WARPS + warp;
+    const bool inject_block = bx == DOWN_BLOCKS;
+    const int row = inject_block ? warp : bx * WARPS + warp;
     const bool active = !(inject_block && (m.a[0].w_inject == nullptr || warp >= HC));
     const uint16_t* wrow = (inject_block ? m.a[0].w_inject : m.a[0].w_down) + (size_t) (active ? row : 0) * D;
     const uint4* w4 = reinterpret_cast<const uint4*>(wrow);
@@ -1031,6 +1034,13 @@ __global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
             m.a[k0 + k].lo[row] = x / (1.0f + __expf(-x));
         }
     }
+}
+template <int MAX_T = kFusedGrMaxT, bool EXACT_T = false>
+__global__ void __launch_bounds__(THREADS) gr_down_staged_kernel(GrMulti m) {
+    extern __shared__ __align__(16) float4 hbuf[];      // 2 buffers x [T][2][160] float4
+    // sm_75: a launch of EXACT_T groups of MAX_T tokens, one per blockIdx.y (gridDim.y 1: the whole launch); every
+    // (row, token) is summed by one warp exactly as before - only more blocks share the card (#down-tg)
+    down_staged_body<MAX_T, EXACT_T>(m, hbuf, (int) blockIdx.x, EXACT_T ? (int) blockIdx.y * MAX_T : 0);
 }
 
 // the current device is Volta (sm_70): the fast norm/up is its default
@@ -1233,7 +1243,11 @@ int down_tg(int ct) {
     return per_dev[dev] == 2 && (ct == 4 || ct == 6) ? 2 : 0;
 #endif
 }
+// gfx906 (kHcOneDown / kHcOne): false when the read cannot run as one kernel (no sync words, more than kHcOneMaxT tokens,
+// STRATA_HC_REQ8) - then launch_multi runs the staged read
+bool launch_one(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0);
 void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
+    if (variant >= kHcOneDown && launch_one(m, variant, st, stamp_buf, stamp_i0)) return;
     const int n_tok = m.T;
     const bool q8w = m.a[0].s_down != nullptr;   // STRATA_HC_REQ8: w_down / w_up hold int8 codes
 #if STRATA_GR_FAST_BUILD
@@ -1361,12 +1375,17 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     }
 }
 
-/// STRATA_HC_SPLIT: unset or 2 = the newest the check accepts (staged), 1 = at most split, 0 = the plain read
+/// STRATA_HC_SPLIT: unset = the newest the check accepts (staged), 2 = at most staged, 1 = at most split, 0 = the
+/// plain read; gfx906: 3 = at most the norm and down in one kernel, 4 = the one-kernel read (opt-in)
 int env_variant() {
     const char* e = std::getenv("STRATA_HC_SPLIT");
     if (e == nullptr || e[0] == '\0') return kHcStaged;
     if (e[0] == '0') return kHcPlain;
     if (e[0] == '1') return kHcSplit;
+#if defined(STRATA_HIP_GFX906)
+    if (e[0] == '3') return kHcOneDown;
+    if (e[0] == '4') return kHcOne;
+#endif
     return kHcStaged;
 }
 
@@ -1449,16 +1468,24 @@ __device__ __forceinline__ float xor8(float v) {
 #endif
     return v;
 }
-__global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
-    __shared__ __align__(16) float lo[kFusedGrMaxT][LR];
-    __shared__ float g[kFusedGrMaxT][HC][UPM_COLS];
+// the body: up block `bx` (blockIdx.x); lo_s = T x LR floats, g_s = T x HC x UPM_COLS floats of shared memory.  ONE (the
+// gfx906 one-kernel read): the weights and the epilogue inputs that do not depend on this read are loaded first, then
+// the block waits until `sync_w` reaches `sync_n` (every down block done) before it reads rs and lo.
+__device__ __forceinline__ void one_wait(unsigned* w, unsigned target);
+// k0, TT (the one-kernel read): the tokens k0 .. k0 + TT - 1 of the read (TT 0: all m.T of them, k0 0); each token's
+// outputs are computed exactly as when the block runs every token (the weights are only re-read)
+template <bool ONE, int TT = 0>
+__device__ __forceinline__ void up_fast_body(const GrMulti& m, const int bx, float* lo_s, float* g_s, unsigned* sync_w,
+                                             const unsigned sync_n, const int k0 = 0) {
+    float (*lo)[LR] = reinterpret_cast<float (*)[LR]>(lo_s);
+    float (*g)[HC][UPM_COLS] = reinterpret_cast<float (*)[HC][UPM_COLS]>(g_s);
     const int t = threadIdx.x, j = t & 7, grp = t >> 3;
-    const int T = m.T;
-    const int d0 = blockIdx.x * UPM_COLS;
+    const int T = TT ? TT : m.T;
+    const int d0 = bx * UPM_COLS;
     static_assert(LR == 40 * 8 && HC * UPM_COLS == 64 && THREADS == 256, "geometry");
     uint4 w[2][5];
     float rv[2] = {0.0f, 0.0f}, wn[2] = {0.0f, 0.0f}, rsc[2] = {0.0f, 0.0f}, bo[2] = {0.0f, 0.0f}, ip[2] = {0.0f, 0.0f};
-    const bool apply = j < T && m.a[j < T ? j : 0].apply;
+    const bool apply = j < T && m.a[k0 + (j < T ? j : 0)].apply;
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
         const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
@@ -1467,21 +1494,27 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
         for (int q = 0; q < 4; ++q) w[p][q] = __ldg(w4 + j + 8 * q);
         w[p][4] = __ldg(w4 + 32 + j);
         if (j < T) {
-            const FusedGrArgs& a = m.a[j];
+            const FusedGrArgs& a = m.a[k0 + j];
             rv[p] = a.R[i];
             wn[p] = a.w_norm[i];
-            rsc[p] = a.rs[c];
+            if (!ONE) rsc[p] = a.rs[c];
             if (apply) { bo[p] = a.bo_prev[d0 + dd]; ip[p] = a.inj_prev[c]; }
         }
     }
-    for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[i / LR].lo[i % LR];
+    if (ONE) {
+        one_wait(sync_w, sync_n);
+#pragma unroll
+        for (int p = 0; p < 2; ++p)
+            if (j < T) rsc[p] = m.a[k0 + j].rs[(grp + 32 * p) / UPM_COLS];
+    }
+    for (int i = t; i < T * LR; i += THREADS) lo[i / LR][i % LR] = m.a[k0 + i / LR].lo[i % LR];
     __syncthreads();
 #pragma unroll
     for (int p = 0; p < 2; ++p) {
         const int r = grp + 32 * p, c = r / UPM_COLS, dd = r - c * UPM_COLS, i = c * N + d0 + dd;
         float mine = 0.0f;
 #pragma unroll
-        for (int k = 0; k < kFusedGrMaxT; ++k) {
+        for (int k = 0; k < (TT ? TT : kFusedGrMaxT); ++k) {
             if (k >= T) break;
             const float* l = lo[k];
             const float p0 = dot8(w[p][0], l + j * 8) + dot8(w[p][4], l + (32 + j) * 8);   // old lane j
@@ -1495,7 +1528,7 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
             float x0 = rv[p];
             if (apply) {
                 x0 = fmaf(bo[p], 2.0f * sigmoidf_(ip[p] / (float) HC), x0);
-                m.a[j].R_out[i] = x0;
+                m.a[k0 + j].R_out[i] = x0;
             }
             const float x = x0 * wn[p] * rsc[p];
             g[j][c][dd] = x * sigmoidf_(mine);
@@ -1507,10 +1540,133 @@ __global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
         float s = 0.0f;
 #pragma unroll
         for (int c = 0; c < HC; ++c) s += g[k][c][col];
-        m.a[k].mixed[d0 + col] = s / (float) HC;
+        m.a[k0 + k].mixed[d0 + col] = s / (float) HC;
     }
-    if (m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE, as gr_up_multi_kernel
+    if (!ONE && m.a[0].q8_mixed != nullptr) gr_q8_tail(m, d0);   // S26 STRATA_QFUSE (the one-kernel read: never with q8_mixed)
 }
+__global__ void __launch_bounds__(THREADS) gr_up_fast_kernel(GrMulti m) {
+    __shared__ __align__(16) float lo[kFusedGrMaxT][LR];
+    __shared__ float g[kFusedGrMaxT][HC][UPM_COLS];
+    up_fast_body<false>(m, (int) blockIdx.x, &lo[0][0], &g[0][0][0], nullptr, 0u);
+}
+#endif
+
+#if defined(STRATA_HIP_GFX906)
+// ---- gfx906: the hyper-connection read as ONE kernel, bitwise the staged read (kHcOneDown / kHcOne).
+// The staged read is three launches (norm T x 4 blocks, down 41 blocks, up 160 blocks): every boundary is a drain and
+// a launch gap, and while the 41 down blocks stream w_down 19 of the 60 CUs idle.  Here the down and up blocks of the
+// read are one grid, and the up blocks load their w_up rows and epilogue inputs before they wait for the down
+// projection - the up weight stream overlaps the down projection.  The blocks are the T = 1 shape of the staged read
+// per token (a token's outputs do not depend on the other tokens of the window: every (row, token) is still summed by
+// one warp in the same order), so the kernel keeps the single-token register budget at every T - the occupancy is
+// what it gains from (3 waves per SIMD: 180 resident blocks).  Grid, for T tokens:
+//   [0, 41 T)            down block (b % 41) of token b / 41; the first 4 T of them first run the norm item
+//                        (token b / 4, stream b % 4) - norm_split_fast_body, which every down block waits for
+//   [41 T, 41 T + 160 U) up block (u % 160) of the tokens (u / 160) * UPT .. + UPT - 1 (U = T / UPT), which waits for
+//                        those tokens' down blocks
+// The kernel boundaries become counters in the caller's per-instance sync words: [0] norm items done, [16 + k] down
+// blocks of token k done, [32] up blocks done; the last up block (kHcOneDown: the last down block) zeroes them for the
+// next read on the instance's stream.  A block only waits for blocks of lower index or (the norm wait) for one of the
+// first 4 T <= 16 blocks, and blocks are dispatched in index order, so the read cannot deadlock even when not all of
+// its blocks are resident.  fused_gr_check compares it with the
+// plain read bit for bit on the card before it is used.
+constexpr int kHcOneMaxT = 4;
+constexpr int ONE_ND = DOWN_BLOCKS + 1;   // 41 down blocks per token
+static_assert(HC <= ONE_ND, "every norm item is a down block");
+static_assert(LR + HC * UPM_COLS <= 2 * H_TILE, "an up block's lo / g fit one token's down tiles");
+// the block's global writes, then one count on `w` (release)
+__device__ __forceinline__ void one_signal(unsigned* w) {
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) __hip_atomic_fetch_add(w, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+}
+// until `w` reaches `target` (acquire), then every thread's later loads see the counted blocks' writes
+__device__ __forceinline__ void one_wait(unsigned* w, unsigned target) {
+    if (threadIdx.x == 0)
+        while (__hip_atomic_load(w, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < target) __builtin_amdgcn_s_sleep(1);
+    __syncthreads();
+    __threadfence();
+}
+__device__ __forceinline__ void one_reset(unsigned* sy) {
+    __hip_atomic_store(sy, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    for (int k = 0; k < kHcOneMaxT; ++k) __hip_atomic_store(sy + 16 + k, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    __hip_atomic_store(sy + 32, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+#ifndef STRATA_HC_ONE_WPE
+// waves per SIMD the one-kernel read is compiled for: 3 x 4 waves x 60 CUs = 180 blocks resident (fused_gr_bench cold:
+// 2 waves - 119 VGPRs, 120 blocks - T1 45.7 us; 3 waves 38.8 us; 4 waves spills: 70 us)
+#define STRATA_HC_ONE_WPE 3
+#endif
+template <int T, bool UP, int UPT>
+__global__ void __launch_bounds__(THREADS, STRATA_HC_ONE_WPE) gr_one_kernel(GrMulti m) {
+    extern __shared__ __align__(16) float4 hbuf[];   // down: 2 x [2][160] float4 (one token); up: lo [UPT][LR], g [UPT][HC][16]
+    static_assert(T % UPT == 0, "whole up token groups");
+    unsigned* sy = m.sync;
+    const int b = blockIdx.x;
+    if (b < ONE_ND * T) {
+        if (b < HC * T) {
+            norm_split_fast_body(m, b / HC, b % HC);
+            one_signal(sy);
+        }
+        one_wait(sy, HC * T);
+        if constexpr (T == 1) down_staged_body<1, true>(m, hbuf, b, 0);   // (constant token: no register spilled)
+        else down_staged_body<1, true>(m, hbuf, b % ONE_ND, b / ONE_ND);
+        if (UP) {
+            one_signal(sy + 16 + b / ONE_ND);
+        } else {
+            __threadfence();
+            __syncthreads();
+            if (threadIdx.x == 0 &&
+                __hip_atomic_fetch_add(sy + 32, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) == ONE_ND * T - 1)
+                one_reset(sy);   // every down block has passed its wait
+        }
+        return;
+    }
+    if constexpr (UP) {
+        const int u = b - ONE_ND * T, k0 = (u / UPM_BLOCKS) * UPT;
+        float* sm = reinterpret_cast<float*>(hbuf);
+        // the up body waits for the down blocks of its first token; the others (UPT > 1) here first
+        for (int k = 1; k < UPT; ++k) one_wait(sy + 16 + k0 + k, ONE_ND);
+        up_fast_body<true, UPT>(m, u % UPM_BLOCKS, sm, sm + UPT * LR, sy + 16 + k0, ONE_ND, k0);
+        if (threadIdx.x == 0 && __hip_atomic_fetch_add(sy + 32, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) ==
+                                    (unsigned) (UPM_BLOCKS * (T / UPT) - 1))
+            one_reset(sy);   // every block has passed its waits: the words are free for the next read
+    }
+}
+// STRATA_HC_ONE_UPT: tokens per up block - 1 (default: the T = 1 block per token, the second token's w_up from L2) or
+// 0 = the window's T (w_up read once, but the T-token block spills at 3 waves: fused_gr_bench cold T2 55.1 vs 59.4 us)
+int one_upt() {
+    static const int v = [] { const char* e = std::getenv("STRATA_HC_ONE_UPT"); return e != nullptr ? std::atoi(e) : 1; }();
+    return v;
+}
+template <int T>
+void launch_one_t(const GrMulti& m, bool up, cudaStream_t st) {
+    const size_t smem = (size_t) 2 * H_TILE * sizeof(float);
+    if (!up) { gr_one_kernel<T, false, T><<<ONE_ND * T, THREADS, smem, st>>>(m); return; }
+    if (T > 1 && one_upt() == 1) gr_one_kernel<T, true, 1><<<(ONE_ND + UPM_BLOCKS) * T, THREADS, smem, st>>>(m);
+    else gr_one_kernel<T, true, T><<<ONE_ND * T + UPM_BLOCKS, THREADS, smem, st>>>(m);
+}
+bool launch_one(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
+    if (m.sync == nullptr || m.T < 1 || m.T > kHcOneMaxT || m.a[0].s_down != nullptr || m.a[0].q8_mixed != nullptr ||
+        !gr_fast() || !norm_fast_on())
+        return false;
+    const bool up = variant >= kHcOne;
+    switch (m.T) {
+        case 1: launch_one_t<1>(m, up, st); break;
+        case 2: launch_one_t<2>(m, up, st); break;
+        case 3: launch_one_t<3>(m, up, st); break;
+        default: launch_one_t<4>(m, up, st); break;
+    }
+    // the profile's stamps: norm and down are inside the kernel (kHcOne: up as well)
+    if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0, (void*) st);
+    if (!up) {
+        if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+        gr_up_fast_kernel<<<UPM_BLOCKS, THREADS, 0, st>>>(m);
+    } else if (stamp_buf) gpu_stamp(stamp_buf, stamp_i0 + 1, (void*) st);
+    return true;
+}
+#else
+bool launch_one(const GrMulti&, int, cudaStream_t, unsigned long long*, int) { return false; }
 #endif
 
 #if defined(STRATA_HIP_GFX906)
@@ -2194,7 +2350,7 @@ int g_gr_fast = -1;
 void fused_gr_set_fast(int on) { g_gr_fast = on; }
 
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream, unsigned long long* stamp_buf,
-                         int stamp_i0) {
+                         int stamp_i0, unsigned* hc_sync) {
     if (n_tok < 1 || n_tok > kFusedGrMaxT || xn_scratch == nullptr) {
         std::fprintf(stderr, "fused_gr_read_multi: invalid arguments\n");
         std::exit(1);
@@ -2218,6 +2374,7 @@ bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, voi
         for (int t = 0; t < n_tok; ++t) m.a[t].q8_mixed = nullptr;
     m.xn = xn_scratch;
     m.T = n_tok;
+    m.sync = hc_sync;
     cudaStream_t st = (cudaStream_t) stream;
     if (a[0].q8_down != nullptr && a[0].q8_up != nullptr) {   // inject: Q8_0 copy, or the BF16 rows
         launch_q8(m, xn_scratch, st, stamp_buf, stamp_i0);   // S23 experiment: STRATA_HC_Q8=1
@@ -2397,9 +2554,9 @@ namespace {
 /// 1..8 tokens, with and without the pending write; every output of split and staged compared with the plain read's
 /// bit for bit (and the plain read's with the single-token read's).  `why[v]` gets the first difference of variant
 /// v; false if the check itself could not run.
-bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
+bool fused_gr_selftest(bool ok_variant[6], std::string why[6]) {
     constexpr int TM = kFusedGrMaxT;
-    constexpr int NV = 4;                             // sets: 0 = plain, 1 = split, 2 = staged, 3 = single-token
+    constexpr int NV = 6;   // sets: 0 = plain, 1 = split, 2 = staged, 3 = single-token, 4 = one-down, 5 = one (gfx906)
     std::mt19937 rng(20260930u);
     std::normal_distribution<float> nd(0.0f, 1.0f);
     std::vector<uint16_t> h_down((size_t) LR * D), h_up((size_t) D * LR), h_inj((size_t) HC * D);
@@ -2411,11 +2568,11 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
     for (auto& x : h_R) x = nd(rng);
     for (auto& x : h_bo) x = 0.5f * nd(rng);
     for (auto& x : h_ip) x = 2.0f * nd(rng);
-    for (int v = 0; v < 4; ++v) { ok_variant[v] = v == 1; why[v].clear(); }
+    for (int v = 0; v < 6; ++v) { ok_variant[v] = v == 1; why[v].clear(); }
 
     const size_t n_set = (size_t) TM * (D + D + LR + HC + HC + N);   // R_out, xn, lo, rs, inject, mixed (floats)
     const size_t bytes = h_down.size() * 2 + h_up.size() * 2 + h_inj.size() * 2 +
-                         (h_norm.size() + h_R.size() + h_bo.size() + h_ip.size() + NV * n_set) * 4 + 32 * 256;
+                         (h_norm.size() + h_R.size() + h_bo.size() + h_ip.size() + NV * n_set) * 4 + 33 * 256;
     uint8_t* base = nullptr;
     if (cudaMalloc((void**) &base, bytes) != cudaSuccess) {
         cudaGetLastError();
@@ -2431,6 +2588,7 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
     float* d_R = (float*) take(h_R.size() * 4);
     float* d_bo = (float*) take(h_bo.size() * 4);
     float* d_ip = (float*) take(h_ip.size() * 4);
+    unsigned* d_sync = (unsigned*) take(256);           // the one-kernel read's sync words (zeroed below)
     struct Set { float *R_out, *xn, *lo, *rs, *inj, *mixed; } set[NV];
     for (Set& x : set) {
         x.R_out = (float*) take((size_t) TM * D * 4); x.xn = (float*) take((size_t) TM * D * 4);
@@ -2446,6 +2604,7 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
               cudaMemcpyAsync(d_R, h_R.data(), h_R.size() * 4, cudaMemcpyHostToDevice, st) == cudaSuccess &&
               cudaMemcpyAsync(d_bo, h_bo.data(), h_bo.size() * 4, cudaMemcpyHostToDevice, st) == cudaSuccess &&
               cudaMemcpyAsync(d_ip, h_ip.data(), h_ip.size() * 4, cudaMemcpyHostToDevice, st) == cudaSuccess;
+    ok = ok && cudaMemsetAsync(d_sync, 0, 256, st) == cudaSuccess;
     if (!ok) why[0] = "setting up the check failed";
     std::vector<float> h1, h2;
     // true when equal; false with the first difference in `w` (or a read-back failure in `ok`)
@@ -2481,6 +2640,9 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
                same(s1.R_out, s2.R_out, (size_t) T * D, "R", T, apply, w);
     };
     ok_variant[2] = ok_variant[3] = ok;
+#if defined(STRATA_HIP_GFX906)
+    ok_variant[4] = ok_variant[5] = ok;
+#endif
     bool single_ok = ok;
     for (int apply = 0; apply < 2 && ok; ++apply) {
         for (int T = 1; T <= TM && ok; ++T) {
@@ -2504,6 +2666,15 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
                 m.T = T;
                 launch_multi(m, v + 1, st, nullptr, 0);
             }
+            for (int v = 4; v < NV; ++v) {               // the one-kernel reads (staged above kHcOneMaxT tokens)
+                if (!ok_variant[v]) continue;
+                GrMulti m;
+                for (int k = 0; k < T; ++k) m.a[k] = a[v][k];
+                m.xn = set[v].xn;
+                m.T = T;
+                m.sync = d_sync;
+                for (int rep = 0; rep < 3; ++rep) launch_multi(m, v, st, nullptr, 0);   // and the words reset
+            }
             if (T == 1) fused_gr_read(a[3][0], st);
             if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess) {
                 why[0] = "a kernel of the check failed";
@@ -2513,11 +2684,13 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
             if (ok_variant[2] && !all_same(set[0], set[1], T, apply, why[2])) ok_variant[2] = false;
             if (ok && ok_variant[3] && !all_same(set[0], set[2], T, apply, why[3])) ok_variant[3] = false;
             if (ok && T == 1 && single_ok && !all_same(set[3], set[0], T, apply, why[1])) single_ok = false;
+            for (int v = 4; v < NV && ok; ++v)
+                if (ok_variant[v] && !all_same(set[0], set[v], T, apply, why[v])) ok_variant[v] = false;
         }
     }
     if (!single_ok && ok) {                            // the plain read itself disagrees with the single-token read
-        why[2] = why[3] = "the plain read differs from the single-token read: " + why[1];
-        ok_variant[2] = ok_variant[3] = false;
+        why[2] = why[3] = why[4] = why[5] = "the plain read differs from the single-token read: " + why[1];
+        ok_variant[2] = ok_variant[3] = ok_variant[4] = ok_variant[5] = false;
     }
     if (st != nullptr) {
         cudaStreamSynchronize(st);
@@ -2525,7 +2698,7 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
     }
     cudaFree(base);
     cudaGetLastError();
-    if (!ok) ok_variant[2] = ok_variant[3] = false;
+    if (!ok) ok_variant[2] = ok_variant[3] = ok_variant[4] = ok_variant[5] = false;
     return ok;
 }
 
@@ -2538,7 +2711,7 @@ int fused_gr_variant() {
     if (v > 0) return v;
     // not checked on this card: the plain read, unless STRATA_HC_SPLIT names a variant (a test such as gr_parity)
     const char* e = std::getenv("STRATA_HC_SPLIT");
-    return e != nullptr && (e[0] == '1' || e[0] == '2') ? env_variant() : kHcPlain;
+    return e != nullptr && e[0] >= '1' && e[0] <= '4' ? env_variant() : kHcPlain;
 }
 
 void fused_gr_check() {
@@ -2552,24 +2725,28 @@ void fused_gr_check() {
                      dev);
         return;
     }
-    bool okv[4];
-    std::string why[4];
+    bool okv[6];
+    std::string why[6];
     const bool ran = fused_gr_selftest(okv, why);
     int use = kHcPlain;
-    if (want >= kHcStaged && okv[kHcStaged]) use = kHcStaged;
+    if (want >= kHcOne && okv[kHcOne]) use = kHcOne;
+    else if (want >= kHcOneDown && okv[kHcOneDown]) use = kHcOneDown;
+    else if (want >= kHcStaged && okv[kHcStaged]) use = kHcStaged;
     else if (okv[kHcSplit]) use = kHcSplit;
     g_variant[dev].store(use);
     if (!ran)
         std::fprintf(stderr, "strata hc: CUDA%d: the check of split/staged could not run (%s)\n", dev, why[0].c_str());
-    static const char* const name[4] = {"", "plain", "split", "staged"};
-    for (int v = kHcStaged; v >= kHcSplit; --v)
+    static const char* const name[6] = {"", "plain", "split", "staged", "one-kernel norm+down", "one-kernel"};
+    for (int v = kHcOne; v >= kHcSplit; --v)
         if (v <= want && !okv[v] && ran)
             std::fprintf(stderr, "strata hc: CUDA%d: the %s read differs from the plain read on this card - not used: "
                                  "%s\n", dev, name[v], why[v].c_str());
-    static const char* const what[4] = {
+    static const char* const what[6] = {
         "", "the plain read (the norm per token, the down projection on 41 blocks)",
         "split (the norm per token and stream, then the plain read's down projection)",
-        "staged (the norm per token and stream, the down projection's activations staged ahead by cp.async)"};
+        "staged (the norm per token and stream, the down projection's activations staged ahead by cp.async)",
+        "one kernel for staged's norm and down projection, then the up projection (up to 4 tokens; staged above)",
+        "one kernel for staged's norm, down and up projections (up to 4 tokens; staged above)"};
     std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as %s%s\n", dev, what[use],
                  use >= kHcSplit ? "; checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 "
                                    "for the earlier ones)" : "");

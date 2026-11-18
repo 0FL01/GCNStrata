@@ -67,8 +67,11 @@ void fused_gr_quantize_q8_0(const uint16_t* bf16, uint8_t* out, int64_t n_blocks
 /// token's outputs are bitwise `fused_gr_read(a[t])`.
 constexpr int kFusedGrMaxT = 8;
 /// Returns true when it also wrote the q8_1 images (every token's q8_mixed set and this read supports it).
+/// `hc_sync`: kFusedGrSyncWords zeroed words owned by the caller (per instance: two reads that may run concurrently
+/// need different words), for gfx906's one-kernel read (STRATA_HC_SPLIT=3 / 4); null keeps the multi-launch read.
+constexpr int kFusedGrSyncWords = 64;
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
-                         unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0);
+                         unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0, unsigned* hc_sync = nullptr);
 
 /// The bench only: the AMD latency-hidden kernels on (1) or off (0); -1 = STRATA_GR_FAST.
 void fused_gr_set_fast(int on);

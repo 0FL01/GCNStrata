@@ -813,6 +813,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
+        hcs_ = b.take<unsigned>(strata::kernels::kFusedGrSyncWords);
         xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
         sh_xq_ = b.take<uint8_t>(strata::kernels::native_q8_1_bytes(max_in, (int) T));
         xil_ = b.take<uint8_t>(strata::kernels::native_q8_1_il_bytes(max_in, 4));
@@ -1301,7 +1302,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             if (strata::kernels::fused_gr_read_persist(fa, n, cs)) return false;   // STRATA_HC_PERSIST=1; q8_mixed is never set there
             return fused_gr_read_multi(fa, n, xn_ + (size_t) tb * HC * N, cs, (prof_on_ && grp == 0) ? prof_ : nullptr,
-                                (int) (l * kProfPer + (half == 0 ? 27 : 30)));
+                                (int) (l * kProfPer + (half == 0 ? 27 : 30)), hcs_);
         };
         const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
         {   // measurement only: STRATA_DUMMY_NODES=k adds k empty kernel nodes per layer (what one node costs in a window)
@@ -2177,7 +2178,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.eps = EPS; a.lo = lo_ + t * g.hc_lr; a.rs = rs_ + t * HC;
                 a.mixed = head_mixed_ + t * N;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            fused_gr_read_multi(fa, T, xn_, cs, nullptr, 0, hcs_);
         }
         else if (fuse_head_gr) {
             FusedGrArgs fa[kFusedGrMaxT];
@@ -2195,7 +2196,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 a.inject_out = head_inj_;
                 a.mixed = head_mixed_ + t * N;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            fused_gr_read_multi(fa, T, xn_, cs, nullptr, 0, hcs_);
         } else if (head_mix_multi_enabled() && head_ != nullptr && head_->loaded()) {
             // the final mixer, the window's tokens in one read (fused_gr_read_multi without the pending write: the
             // last layer's write was done above; its sums are gr_read's)
@@ -2210,7 +2211,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 fa[t].w_up = (const uint16_t*) hu->data; fa[t].eps = EPS;
                 fa[t].lo = lo_ + t * g.hc_lr; fa[t].rs = rs_ + t * HC; fa[t].mixed = head_mixed_ + t * N;
             }
-            fused_gr_read_multi(fa, T, xn_, cs);
+            fused_gr_read_multi(fa, T, xn_, cs, nullptr, 0, hcs_);
         } else {
             for (int t = 0; t < T; ++t) {
                 BlockBuffers bb = ss.block;

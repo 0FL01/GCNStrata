@@ -80,6 +80,9 @@ int main(int argc, char** argv) {
     cudaMalloc((void**) &dinj, inj.size() * 4);
     cudaMalloc((void**) &dwn, wn.size() * 4);
     cudaMalloc((void**) &dxn, (size_t) TM * D * 4);
+    unsigned* dsy;   // the one-kernel read's sync words (STRATA_HC_SPLIT=3 / 4)
+    cudaMalloc((void**) &dsy, K::kFusedGrSyncWords * 4);
+    cudaMemset(dsy, 0, K::kFusedGrSyncWords * 4);
     cudaMalloc((void**) &dlo, (size_t) TM * LR * 4);
     cudaMalloc((void**) &drs, (size_t) TM * HC * 4);
     cudaMalloc((void**) &dio, (size_t) TM * HC * 4);
@@ -118,7 +121,7 @@ int main(int argc, char** argv) {
                     cudaMemset(dio, 0xff, (size_t) TM * HC * 4);
                     cudaMemset(dmix, 0xff, (size_t) TM * N * 4);
                     K::fused_gr_set_fast(f);
-                    K::fused_gr_read_multi(a, T, dxn, s);
+                    K::fused_gr_read_multi(a, T, dxn, s, nullptr, 0, dsy);
                     cudaStreamSynchronize(s);
                     auto& o = out[f];
                     o.resize((size_t) TM * (D + LR + HC + HC + N));
@@ -134,9 +137,9 @@ int main(int argc, char** argv) {
                 for (int round = 0; round < 3; ++round)
                     for (int f = 0; f < 2; ++f) {
                         K::fused_gr_set_fast(f);
-                        for (int i = 0; i < 20; ++i) K::fused_gr_read_multi(a, T, dxn, s);
+                        for (int i = 0; i < 20; ++i) K::fused_gr_read_multi(a, T, dxn, s, nullptr, 0, dsy);
                         cudaEventRecord(e0, s);
-                        for (int i = 0; i < iters; ++i) K::fused_gr_read_multi(a, T, dxn, s);
+                        for (int i = 0; i < iters; ++i) K::fused_gr_read_multi(a, T, dxn, s, nullptr, 0, dsy);
                         cudaEventRecord(e1, s);
                         cudaEventSynchronize(e1);
                         float ms = 0;
@@ -174,7 +177,7 @@ int main(int argc, char** argv) {
                 }
                 cudaMemcpy(dR, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
                 cudaMemset(dqm, 0, (size_t) TM * (N / 32) * 36);
-                K::fused_gr_read_multi(a, T, dxn, s);
+                K::fused_gr_read_multi(a, T, dxn, s, nullptr, 0, dsy);
                 cudaStreamSynchronize(s);
                 o[q].resize((size_t) T * (LR + N + D + HC));
                 float* p = o[q].data();
@@ -247,13 +250,13 @@ int main(int argc, char** argv) {
             for (int rep = 0; rep < 2; ++rep) {
                 for (int i = 0; i < iters; ++i) {
                     K::gpu_stamp(dst, i * 4, s);
-                    K::fused_gr_read_multi(&as[(size_t) (i % cold_sets) * 8], T, dxn, s, dst, i * 4 + 1);
+                    K::fused_gr_read_multi(&as[(size_t) (i % cold_sets) * 8], T, dxn, s, dst, i * 4 + 1, dsy);
                     K::gpu_stamp(dst, i * 4 + 3, s);
                 }
                 cudaStreamSynchronize(s);
             }
             cudaEventRecord(e0, s);
-            for (int i = 0; i < iters; ++i) K::fused_gr_read_multi(&as[(size_t) (i % cold_sets) * 8], T, dxn, s);
+            for (int i = 0; i < iters; ++i) K::fused_gr_read_multi(&as[(size_t) (i % cold_sets) * 8], T, dxn, s, nullptr, 0, dsy);
             cudaEventRecord(e1, s);
             cudaEventSynchronize(e1);
             float ms = 0;
