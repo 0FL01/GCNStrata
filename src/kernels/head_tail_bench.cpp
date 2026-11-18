@@ -77,10 +77,36 @@ int main(int argc, char** argv) {
             CK(cudaMemcpy(h1.data(), o1, R * 4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(h2.data(), o2, R * 4, cudaMemcpyDeviceToHost));
             for (int r = 0; r < R; ++r) if (h1[r] != h2[r]) { if (bad < 5) std::printf("row %d: one-block %d, argmax_rows %d\n", r, h1[r], h2[r]); ++bad; }
             std::printf("ARGMAX PARITY: %d of %d rows differ (adversarial rows: ties, NaN, -inf, +-0)\n", bad, R);
+            {   // argmax_rows_nf: the same pick, and per row "any flag word set" as logits_nonfinite_rows
+                uint32_t *f1, *f2;
+                int32_t* o3;
+                CK(cudaMalloc((void**) &f1, 8 * K::kNonfiniteBlocks * 4)); CK(cudaMalloc((void**) &f2, 8 * K::kNonfiniteBlocks * 4));
+                CK(cudaMalloc((void**) &o3, R * 4));
+                int nbad = 0;
+                for (int r0 = 0; r0 < R; r0 += 8) {
+                    CK(cudaMemset(f1, 0x5a, 8 * K::kNonfiniteBlocks * 4)); CK(cudaMemset(f2, 0x5a, 8 * K::kNonfiniteBlocks * 4));
+                    K::logits_nonfinite_rows(da + (size_t) r0 * NV, 8, NV, f1, s);
+                    K::argmax_rows_nf(da + (size_t) r0 * NV, 8, NV, scr, o3 + r0, f2, s);
+                    CK(cudaStreamSynchronize(s));
+                    std::vector<uint32_t> g1(8 * K::kNonfiniteBlocks), g2(8 * K::kNonfiniteBlocks);
+                    CK(cudaMemcpy(g1.data(), f1, g1.size() * 4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(g2.data(), f2, g2.size() * 4, cudaMemcpyDeviceToHost));
+                    for (int t = 0; t < 8; ++t) {
+                        bool a1 = false, a2 = false;
+                        for (int b = 0; b < K::kNonfiniteBlocks; ++b) { a1 |= g1[t * K::kNonfiniteBlocks + b] != 0; a2 |= g2[t * K::kNonfiniteBlocks + b] != 0; }
+                        if (a1 != a2) ++nbad;
+                    }
+                }
+                std::vector<int32_t> h3(R);
+                CK(cudaMemcpy(h3.data(), o3, R * 4, cudaMemcpyDeviceToHost));
+                CK(cudaMemcpy(h1.data(), o1, R * 4, cudaMemcpyDeviceToHost));
+                for (int r = 0; r < R; ++r) nbad += h3[r] != h1[r];
+                std::printf("ARGMAX+NF PARITY: %d mismatches (row masks vs logits_nonfinite_rows, picks vs one-block)\n", nbad);
+                bad += nbad;
+            }
             cudaGraph_t g;
             cudaGraphExec_t ge;
             CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
-            for (int l = 0; l < L; ++l) K::argmax_rows(dl, T, NV, scr, dout_d, s);
+            for (int l = 0; l < L; ++l) K::argmax_rows_nf(dl, T, NV, scr, dout_d, dnf, s);
             CK(cudaStreamEndCapture(s, &g));
             CK(cudaGraphInstantiate(&ge, g, nullptr, nullptr, 0));
             for (int i = 0; i < 3; ++i) CK(cudaGraphLaunch(ge, s));
@@ -91,7 +117,7 @@ int main(int argc, char** argv) {
                 float m = 0; CK(cudaEventElapsedTime(&m, e0, e1)); ms.push_back(m);
             }
             std::sort(ms.begin(), ms.end());
-            std::printf("T %d %-24s : %7.2f us per call (median of %d graphs of %d calls)\n", T, "argmax_rows", 1e3 * ms[ms.size() / 2] / L, reps, L);
+            std::printf("T %d %-24s : %7.2f us per call (median of %d graphs of %d calls)\n", T, "argmax_rows_nf", 1e3 * ms[ms.size() / 2] / L, reps, L);
         } else std::printf("argmax_rows not wanted on this card\n");
         if (bad) return 1;
     }

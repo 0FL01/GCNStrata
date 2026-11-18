@@ -2264,7 +2264,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Greedy, the default, is recorded here as before (no extra launch or sync per window). A request that
         // samples or penalizes is sampled again host-side after the replay (run()) with its own parameters and a
         // fresh draw counter: a captured sampler would bake them in and replay the same draws forever.
-        if (argmax_rows_wanted()) {   // sm_80 to sm_89: the pick over many blocks a row (bitwise the one-block kernel's)
+#if defined(STRATA_HIP_GFX906)
+        // gfx906 STRATA_GFX906_ARGMAX_NF (default on): the guard below on the pick's reads (one pass, one launch)
+        static const bool argmax_nf = [] { const char* v = std::getenv("STRATA_GFX906_ARGMAX_NF"); return v == nullptr || std::atoi(v) != 0; }();
+        const bool nf_fused = argmax_nf && argmax_rows_wanted() && nan_guard_on() && T <= strata::kernels::kVerifyMaxT;
+#else
+        const bool nf_fused = false;
+#endif
+        if (nf_fused) {
+            strata::kernels::argmax_rows_nf(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, m_nf_, cs);
+        } else if (argmax_rows_wanted()) {   // sm_80 to sm_89: the pick over many blocks a row (bitwise the one-block kernel's)
             argmax_rows(head_logits_, T, (int) n_vocab_, arg_scratch_, m_out_, cs);
         } else {
             SamplerParams sp;
@@ -2273,7 +2282,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             sample_tokens(head_logits_, T, (int) n_vocab_, nullptr, 0, sp, m_out_, cs);
         }
         // #879: whether each row's logits are all finite, beside the pick (read after the window's own sync)
-        if (nan_guard_on()) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
+        if (nan_guard_on() && !nf_fused) strata::kernels::logits_nonfinite_rows(head_logits_, T, (int) n_vocab_, m_nf_, cs);
     }
     stamp(g.n_layers, 1, 0);
     return true;

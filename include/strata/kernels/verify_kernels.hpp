@@ -164,6 +164,9 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
 /// their picks.  `scratch`: argmax_rows_scratch_bytes(n_rows), zero before the first launch (each launch leaves it
 /// so).  Graph-capturable.
 uint64_t argmax_rows_scratch_bytes(int n_rows);
+/// argmax_rows plus the #879 guard on the same reads (gfx906 STRATA_GFX906_ARGMAX_NF): `flags` as
+/// logits_nonfinite_rows writes them for the host's "any word of the row" test (word 0 holds the row's answer)
+void argmax_rows_nf(const float* logits, int n_rows, int n, void* scratch, int32_t* out, uint32_t* flags, void* stream);
 void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream);
 /// row_top_prob over 8 blocks a row, each computing 4 of its 32 warps' sums, the row's last block adding the 32 in
 /// order: bitwise row_top_prob.  `scratch`: row_top_prob_scratch_bytes(n_rows), zero before the first launch.
