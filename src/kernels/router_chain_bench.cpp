@@ -11,6 +11,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -67,6 +68,52 @@ int main(int argc, char** argv) {
     CK(cudaMemset(dz, 0, 16));
     cudaStream_t s;
     CK(cudaStreamCreate(&s));
+    {   // the 512 x 10 top-10 as the engine calls it (single / multi-token) against the reference kernel, bit for bit, on
+        // adversarial logits: wide, integer ties, all equal, -inf, NaN, underflow, a tied top group across lanes
+        const int NR = 4096;
+        std::vector<float> lh((size_t) NR * NE);
+        for (int t = 0; t < NR; ++t)
+            for (int e = 0; e < NE; ++e) {
+                const int kind = t % 8;
+                float v = nd(rng) * (kind == 1 ? 8.f : 1.f);
+                if (kind == 2) v = (float) (int) (v * 2);
+                if (kind == 3) v = 0.0f;
+                if (kind == 4 && e % 7 == 0) v = -INFINITY;
+                if (kind == 5 && e % 50 == 3) v = NAN;
+                if (kind == 6) v = nd(rng) * 200.f;
+                if (kind == 7 && e < 20) v = 30.0f;
+                lh[(size_t) t * NE + e] = v;
+            }
+        float *dl, *dw0, *dw1;
+        int32_t *di0, *di1;
+        CK(cudaMalloc((void**) &dl, lh.size() * 4));
+        CK(cudaMemcpy(dl, lh.data(), lh.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMalloc((void**) &dw0, (size_t) NR * KK * 4)); CK(cudaMalloc((void**) &dw1, (size_t) NR * KK * 4));
+        CK(cudaMalloc((void**) &di0, (size_t) NR * KK * 4)); CK(cudaMalloc((void**) &di1, (size_t) NR * KK * 4));
+        long long bad = 0;
+        for (int tk : {1, 2, 3, 8}) {
+            CK(cudaMemset(dw0, 0xff, (size_t) NR * KK * 4)); CK(cudaMemset(dw1, 0xfe, (size_t) NR * KK * 4));
+            CK(cudaMemset(di0, 0xff, (size_t) NR * KK * 4)); CK(cudaMemset(di1, 0xfe, (size_t) NR * KK * 4));
+            K::native_router_top10_reference(dl, di0, dw0, NR, s);
+            for (int t0 = 0; t0 < NR; t0 += tk) {
+                const size_t o = (size_t) t0;
+                if (tk == 1) K::native_router_top10(dl + o * NE, di1 + o * KK, dw1 + o * KK, s);
+                else K::native_router_top10_multi(dl + o * NE, di1 + o * KK, dw1 + o * KK, std::min(tk, NR - t0), s);
+            }
+            CK(cudaStreamSynchronize(s));
+            std::vector<uint32_t> a((size_t) NR * KK * 2), b((size_t) NR * KK * 2);
+            CK(cudaMemcpy(a.data(), di0, (size_t) NR * KK * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(a.data() + NR * KK, dw0, (size_t) NR * KK * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(b.data(), di1, (size_t) NR * KK * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(b.data() + NR * KK, dw1, (size_t) NR * KK * 4, cudaMemcpyDeviceToHost));
+            long long d = 0;
+            for (size_t i = 0; i < a.size(); ++i) d += a[i] != b[i];
+            std::printf("TOP10 PARITY n_tok %d: %lld of %zu ids/weights differ from the reference kernel\n", tk, d, a.size());
+            bad += d;
+        }
+        cudaFree(dl); cudaFree(dw0); cudaFree(dw1); cudaFree(di0); cudaFree(di1);
+        if (bad) return 1;
+    }
     {   // outputs of the router GEMV for several shapes and token counts as FNV hashes: compare across STRATA_MMVF_PF=0/1
         const int shapes[][2] = {{2560, 512}, {2560, 256}, {2560, 64}, {1280, 513}, {640, 100}, {4096, 50}, {2048, 7}, {256, 33}, {8192, 90}};
         for (const auto& sh : shapes) {

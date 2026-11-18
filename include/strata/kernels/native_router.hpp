@@ -18,6 +18,9 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, void
 void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
 /// The same contract for a model family's (experts, top-k): 512 / 10 (Flash-Next: the two calls above, unchanged) and
 /// 256 / 8 (Qwen3.6-35B-A3B).  logits [n_tok, n_expert], ids / weights [n_tok, k].  CUDA / HIP.
+/// Tests only: the multi-token 512 x 10 kernel the engine used before the gfx906 STRATA_GFX906_ROUTE_V2 selection (the
+/// reference those outputs are compared with bit for bit).
+void native_router_top10_reference(const float* logits, int32_t* ids, float* weights, int n_tok, void* stream);
 bool native_router_topk_supported(int n_expert, int k);
 void native_router_topk(const float* logits, int32_t* ids, float* weights, int n_expert, int k, int n_tok, void* stream);
 /// STRATA_ROUTE_RESIDENT: swap non-resident tail-rank experts for resident ones within `margin` logits (see the .cu).
