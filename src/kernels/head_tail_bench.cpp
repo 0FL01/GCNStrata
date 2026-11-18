@@ -62,7 +62,7 @@ int main(int argc, char** argv) {
         CK(cudaMalloc((void**) &da, a.size() * 4));
         CK(cudaMemcpy(da, a.data(), a.size() * 4, cudaMemcpyHostToDevice));
         CK(cudaMalloc((void**) &o1, R * 4)); CK(cudaMalloc((void**) &o2, R * 4));
-        const uint64_t sb = K::argmax_rows_scratch_bytes(8);
+        const uint64_t sb = K::argmax_rows_scratch_bytes(std::max(T, 8));   // the parity's 8 rows and the timing's T
         CK(cudaMalloc(&scr, sb ? sb : 16)); CK(cudaMemset(scr, 0, sb ? sb : 16));
         int bad = 0;
         if (K::argmax_rows_wanted()) {
@@ -135,6 +135,17 @@ int main(int argc, char** argv) {
         }
         std::sort(ms.begin(), ms.end());
         std::printf("T %d %-24s : %7.2f us per call (median of %d x %d direct calls)\n", T, "sampled split (direct)", 1e3 * ms[ms.size() / 2] / L, reps, L);
+    }
+    {   // the same direct-launch loop with one small kernel (the guard), for the launch cost alone
+        std::vector<float> ms;
+        for (int r = 0; r < reps; ++r) {
+            CK(cudaEventRecord(e0, s));
+            for (int l = 0; l < L; ++l) K::logits_nonfinite_rows(dl, T, NV, dnf, s);
+            CK(cudaEventRecord(e1, s)); CK(cudaEventSynchronize(e1));
+            float m = 0; CK(cudaEventElapsedTime(&m, e0, e1)); ms.push_back(m);
+        }
+        std::sort(ms.begin(), ms.end());
+        std::printf("T %d %-24s : %7.2f us per call (median of %d x %d direct calls)\n", T, "guard (direct)", 1e3 * ms[ms.size() / 2] / L, reps, L);
     }
     for (int mode = 0; mode < 3; ++mode) {
         cudaGraph_t g;

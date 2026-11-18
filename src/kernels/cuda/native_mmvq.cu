@@ -1019,14 +1019,15 @@ __device__ __forceinline__ float q6_q8_dot_x(int vl, int vh, const int* __restri
     }
     return d * sumf;
 }
+typedef int __attribute__((aligned(2))) int_a2;   // a well-defined 2-byte-aligned int (gfx906: one global_load_dword)
 struct Q6KTraitsX : Q6KTraits {
     __device__ static W load(const Block* __restrict__ w, int iqs) {
         W r;
         r.bq8_offset = 4 * (iqs / 16) + (iqs % 16) / 8;
         const int scale_offset = 8 * (iqs / 16) + (iqs % 16) / 4;
         const int vh_shift = 2 * ((iqs % 16) / 8);
-        r.vl = *reinterpret_cast<const int __attribute__((aligned(1)))*>(w->ql + 4 * iqs);
-        r.vh = *reinterpret_cast<const int __attribute__((aligned(1)))*>(w->qh + 4 * (8 * (iqs / 16) + iqs % 8)) >> vh_shift;
+        r.vl = *reinterpret_cast<const int_a2*>(w->ql + 4 * iqs);
+        r.vh = *reinterpret_cast<const int_a2*>(w->qh + 4 * (8 * (iqs / 16) + iqs % 8)) >> vh_shift;
         r.scales = w->scales + scale_offset;
         r.d = w->d;
         return r;
