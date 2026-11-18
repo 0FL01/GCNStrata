@@ -136,6 +136,68 @@ int main(int argc, char** argv) {
         std::sort(ms.begin(), ms.end());
         std::printf("T %d %-24s : %7.2f us per call (median of %d x %d direct calls)\n", T, "sampled split (direct)", 1e3 * ms[ms.size() / 2] / L, reps, L);
     }
+    {   // gfx906 round-free sampled pick (STRATA_GFX906_SAMPLER_RF) vs the split kernels: the drawn tokens of many (row,
+        // seed, parameters) on adversarial rows, with and without penalties, then the time per call
+        const int R = 32, SEEDS = 40;
+        std::vector<float> a((size_t) R * NV);
+        std::uniform_int_distribution<int> pos(0, NV - 1);
+        for (int r = 0; r < R; ++r) {
+            float* x = &a[(size_t) r * NV];
+            const int kind = r % 8;
+            for (int v = 0; v < NV; ++v) x[v] = nd(rng);
+            if (kind == 1) for (int q = 0; q < 40; ++q) x[pos(rng)] = 12.0f;                         // many tied tops
+            if (kind == 2) for (int v = 0; v < NV; v += 5) x[v] = NAN;
+            if (kind == 3) for (int v = 0; v < NV; ++v) x[v] = (v % 4096) < 4090 ? -INFINITY : 0.5f;  // few a block
+            if (kind == 4) { for (int v = 0; v < NV; ++v) x[v] = -INFINITY; for (int q = 0; q < 7; ++q) x[pos(rng)] = 1.0f; }
+            if (kind == 5) for (int v = 0; v < NV; ++v) x[v] = (v & 1) ? 0.0f : -0.0f;              // +-0 ties
+            if (kind == 6) for (int v = 0; v < NV; ++v) x[v] = (float) ((v * 7919) % 97) * 0.1f;     // dense ties
+            if (kind == 7) { x[pos(rng)] = INFINITY; x[pos(rng)] = INFINITY; }                      // +inf wins
+        }
+        float* da;
+        int *ta, *tb, *hist;
+        CK(cudaMalloc((void**) &da, a.size() * 4));
+        CK(cudaMemcpy(da, a.data(), a.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMalloc((void**) &ta, R * SEEDS * 4)); CK(cudaMalloc((void**) &tb, R * SEEDS * 4));
+        std::vector<int> hh((size_t) 8 * 64);
+        for (auto& v : hh) v = pos(rng);
+        CK(cudaMalloc((void**) &hist, hh.size() * 4)); CK(cudaMemcpy(hist, hh.data(), hh.size() * 4, cudaMemcpyHostToDevice));
+        long long diff = 0;
+        for (int pen = 0; pen < 2; ++pen) {
+            for (int rf = 0; rf < 2; ++rf) {
+                if (setenv("STRATA_GFX906_SAMPLER_RF", rf ? "1" : "0", 1) != 0) return 2;
+                for (int sd = 0; sd < SEEDS; ++sd)
+                    for (int r0 = 0; r0 < R; r0 += 8) {
+                        K::SamplerParams sp; sp.seed = 1000 + sd; sp.counter = (uint64_t) (sd * 13 + r0);
+                        const int ks[5] = {20, 1, 5, 64, 0};
+                        sp.top_k = ks[sd % 5]; sp.top_p = sd % 2 ? 0.95f : 1.0f; sp.temperature = 0.5f + 0.1f * (sd % 7);
+                        sp.min_p = sd % 3 == 0 ? 0.05f : 0.0f;
+                        if (pen) { sp.penalty_last_n = 64; sp.penalty_repeat = 1.3f; sp.penalty_freq = 0.2f; sp.penalty_present = 0.1f; }
+                        K::sample_tokens(da + (size_t) r0 * NV, 8, NV, pen ? hist : nullptr, pen ? 64 : 0, sp, (rf ? tb : ta) + sd * R + r0, s);
+                    }
+            }
+            CK(cudaStreamSynchronize(s));
+            std::vector<int> h1(R * SEEDS), h2(R * SEEDS);
+            CK(cudaMemcpy(h1.data(), ta, h1.size() * 4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(h2.data(), tb, h2.size() * 4, cudaMemcpyDeviceToHost));
+            long long d = 0;
+            for (size_t i = 0; i < h1.size(); ++i) d += h1[i] != h2[i];
+            std::printf("SAMPLER RF PARITY (penalties %d): %lld of %zu drawn tokens differ\n", pen, d, h1.size());
+            diff += d;
+        }
+        if (diff) return 1;
+        for (int rf = 0; rf < 2; ++rf) {
+            if (setenv("STRATA_GFX906_SAMPLER_RF", rf ? "1" : "0", 1) != 0) return 2;
+            std::vector<float> ms;
+            for (int r = 0; r < reps; ++r) {
+                CK(cudaEventRecord(e0, s));
+                for (int l = 0; l < L; ++l) { K::SamplerParams sp; sp.seed = 7; sp.counter = (uint64_t) l; K::sample_tokens(dl, T, NV, nullptr, 0, sp, dout_d, s); }
+                CK(cudaEventRecord(e1, s)); CK(cudaEventSynchronize(e1));
+                float m = 0; CK(cudaEventElapsedTime(&m, e0, e1)); ms.push_back(m);
+            }
+            std::sort(ms.begin(), ms.end());
+            std::printf("T %d %-24s : %7.2f us per call (median of %d x %d direct calls)\n", T, rf ? "sampled, round-free" : "sampled, split", 1e3 * ms[ms.size() / 2] / L, reps, L);
+        }
+        unsetenv("STRATA_GFX906_SAMPLER_RF");
+    }
     {   // the same direct-launch loop with one small kernel (the guard), for the launch cost alone
         std::vector<float> ms;
         for (int r = 0; r < reps; ++r) {
