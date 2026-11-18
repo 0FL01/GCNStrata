@@ -137,7 +137,7 @@ int main(int argc, char** argv) {
     const int64_t cap = k::qsa_selection_width(k::kTopkMaxCells, s);              // verify.cpp: cap_ (2051)
     const int64_t cells = (ctx + MAXT + 64 + PS - 1) / PS * PS;                     // the pools' rows: resident cells
     const int64_t pages = cells / PS, prows = pages * NKV * PS;
-    const int64_t dense_win = dense_win_arg, dense_cap = (dense_win + 63) / 64 * 64;   // the drafter's --mtp-window
+    const int64_t dense_win = dense_win_arg < ctx ? dense_win_arg : ctx, dense_cap = (dense_win + 63) / 64 * 64;   // the drafter's --mtp-window (at most the context's cells)
     std::printf("qsa_rows_bench on device %d (%s, %d.%d), %d iterations: context %lld, capacity %lld cells (max_blocks "
                 "%lld), selection cap %lld, int8 pools over %lld cells%s\n",
                 device, prop.name, prop.major, prop.minor, iters, (long long) ctx, (long long) max_cells,

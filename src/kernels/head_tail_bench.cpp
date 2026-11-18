@@ -136,6 +136,10 @@ int main(int argc, char** argv) {
         std::sort(ms.begin(), ms.end());
         std::printf("T %d %-24s : %7.2f us per call (median of %d x %d direct calls)\n", T, "sampled split (direct)", 1e3 * ms[ms.size() / 2] / L, reps, L);
     }
+    if (std::getenv("STRATA_SAMPLER_ONE_BLOCK") || std::getenv("STRATA_OLD_SAMPLER")) {
+        std::printf("the RF comparison needs the split path: unset STRATA_SAMPLER_ONE_BLOCK / STRATA_OLD_SAMPLER\n");
+        return 2;
+    }
     {   // gfx906 round-free sampled pick (STRATA_GFX906_SAMPLER_RF) vs the split kernels: the drawn tokens of many (row,
         // seed, parameters) on adversarial rows, with and without penalties, then the time per call
         const int R = 32, SEEDS = 40;
