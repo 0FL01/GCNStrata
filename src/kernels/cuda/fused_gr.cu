@@ -1375,11 +1375,17 @@ void launch_multi(const GrMulti& m, int variant, cudaStream_t st, unsigned long 
     }
 }
 
-/// STRATA_HC_SPLIT: unset = the newest the check accepts (staged), 2 = at most staged, 1 = at most split, 0 = the
-/// plain read; gfx906: 3 = at most the norm and down in one kernel, 4 = the one-kernel read (opt-in)
+/// STRATA_HC_SPLIT: unset = the newest the check accepts (staged; gfx906: the one-kernel read), 2 = at most staged,
+/// 1 = at most split, 0 = the plain read; gfx906: 3 = at most the norm and down in one kernel, 4 = the one-kernel read.
+/// gfx906 default since 2026-11-18 (B3 production config, HTTP 4 x 3000 tokens: static greedy texts identical,
+/// ms/window -1.4..-2.2%; adapt4 -4.4%; fused_gr_bench cold T1 51.2 -> 39.6 us, T2 62.5 -> 53.0)
 int env_variant() {
     const char* e = std::getenv("STRATA_HC_SPLIT");
+#if defined(STRATA_HIP_GFX906)
+    if (e == nullptr || e[0] == '\0') return kHcOne;
+#else
     if (e == nullptr || e[0] == '\0') return kHcStaged;
+#endif
     if (e[0] == '0') return kHcPlain;
     if (e[0] == '1') return kHcSplit;
 #if defined(STRATA_HIP_GFX906)
@@ -1597,7 +1603,7 @@ __device__ __forceinline__ void one_reset(unsigned* sy) {
 // 2 waves - 119 VGPRs, 120 blocks - T1 45.7 us; 3 waves 38.8 us; 4 waves spills: 70 us)
 #define STRATA_HC_ONE_WPE 3
 #endif
-template <int T, bool UP, int UPT>
+template <int T, bool UP, int UPT, bool UCOL = true>
 __global__ void __launch_bounds__(THREADS, STRATA_HC_ONE_WPE) gr_one_kernel(GrMulti m) {
     extern __shared__ __align__(16) float4 hbuf[];   // down: 2 x [2][160] float4 (one token); up: lo [UPT][LR], g [UPT][HC][16]
     static_assert(T % UPT == 0, "whole up token groups");
@@ -1623,11 +1629,15 @@ __global__ void __launch_bounds__(THREADS, STRATA_HC_ONE_WPE) gr_one_kernel(GrMu
         return;
     }
     if constexpr (UP) {
-        const int u = b - ONE_ND * T, k0 = (u / UPM_BLOCKS) * UPT;
+        // column-major: the token groups of one up column block are neighbours, so the later ones read its w_up rows
+        // from L2 (STRATA_HC_ONE_UCOL=0: token-major)
+        constexpr int U = T / UPT;
+        const int u = b - ONE_ND * T;
+        const int k0 = (UCOL ? u % U : u / UPM_BLOCKS) * UPT, bx = UCOL ? u / U : u % UPM_BLOCKS;
         float* sm = reinterpret_cast<float*>(hbuf);
         // the up body waits for the down blocks of its first token; the others (UPT > 1) here first
         for (int k = 1; k < UPT; ++k) one_wait(sy + 16 + k0 + k, ONE_ND);
-        up_fast_body<true, UPT>(m, u % UPM_BLOCKS, sm, sm + UPT * LR, sy + 16 + k0, ONE_ND, k0);
+        up_fast_body<true, UPT>(m, bx, sm, sm + UPT * LR, sy + 16 + k0, ONE_ND, k0);
         if (threadIdx.x == 0 && __hip_atomic_fetch_add(sy + 32, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) ==
                                     (unsigned) (UPM_BLOCKS * (T / UPT) - 1))
             one_reset(sy);   // every block has passed its waits: the words are free for the next read
@@ -1643,7 +1653,11 @@ template <int T>
 void launch_one_t(const GrMulti& m, bool up, cudaStream_t st) {
     const size_t smem = (size_t) 2 * H_TILE * sizeof(float);
     if (!up) { gr_one_kernel<T, false, T><<<ONE_ND * T, THREADS, smem, st>>>(m); return; }
-    if (T > 1 && one_upt() == 1) gr_one_kernel<T, true, 1><<<(ONE_ND + UPM_BLOCKS) * T, THREADS, smem, st>>>(m);
+    static const bool ucol = [] { const char* e = std::getenv("STRATA_HC_ONE_UCOL"); return e == nullptr || std::atoi(e) != 0; }();
+    if (T > 1 && one_upt() == 1) {
+        if (ucol) gr_one_kernel<T, true, 1, true><<<(ONE_ND + UPM_BLOCKS) * T, THREADS, smem, st>>>(m);
+        else gr_one_kernel<T, true, 1, false><<<(ONE_ND + UPM_BLOCKS) * T, THREADS, smem, st>>>(m);
+    }
     else gr_one_kernel<T, true, T><<<ONE_ND * T + UPM_BLOCKS, THREADS, smem, st>>>(m);
 }
 bool launch_one(const GrMulti& m, int variant, cudaStream_t st, unsigned long long* stamp_buf, int stamp_i0) {
@@ -2748,8 +2762,8 @@ void fused_gr_check() {
         "one kernel for staged's norm and down projection, then the up projection (up to 4 tokens; staged above)",
         "one kernel for staged's norm, down and up projections (up to 4 tokens; staged above)"};
     std::fprintf(stderr, "strata hc: CUDA%d: the hyper-connection read runs as %s%s\n", dev, what[use],
-                 use >= kHcSplit ? "; checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=1 or 0 "
-                                   "for the earlier ones)" : "");
+                 use >= kHcSplit ? "; checked bit for bit against the plain read on this card (STRATA_HC_SPLIT=2, 1 or "
+                                   "0 for the earlier ones)" : "");
 }
 
 
