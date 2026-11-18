@@ -775,7 +775,10 @@ void row_top_prob(const float* logits, int n_rows, int n_vocab, const int32_t* i
     check("row_top_prob");
 }
 
-#if !defined(__HIPCC__)   // warp-32 kernels: an AMD card keeps the one-block row_top_prob and sampler_greedy_kernel
+// warp-32 kernels: an AMD card keeps the one-block row_top_prob and sampler_greedy_kernel - except gfx906's argmax_rows
+// (STRATA_GFX906_ARGMAX_ROWS, below): arg_block's down-shuffles reduce each 32-lane half of a wave64 as the one-block
+// sampler_greedy_kernel's do there, and the pick (the larger value, on equality the lower index) is order-free
+#if !defined(__HIPCC__) || defined(STRATA_HIP_GFX906)
 namespace {
 
 constexpr int kArgMaxBlocks = 128, kArgThreads = 256, kTopBlocks = 8;
@@ -857,6 +860,10 @@ __global__ void argmax_rows_kernel(const float* __restrict__ logits, int n, int 
     }
 }
 
+}  // namespace
+#endif
+#if !defined(__HIPCC__)
+namespace {
 // a row's top-probability scratch: its counter, then its 32 warps' sums
 struct TopRow {
     unsigned counter;
@@ -890,7 +897,9 @@ __global__ void row_top_prob_split_kernel(const float* __restrict__ logits, int 
 }
 
 }  // namespace
+#endif
 
+#if !defined(__HIPCC__) || defined(STRATA_HIP_GFX906)
 uint64_t argmax_rows_scratch_bytes(int n_rows) { return (uint64_t) n_rows * sizeof(ArgRow); }
 
 void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t* out, void* stream) {
@@ -901,7 +910,15 @@ void argmax_rows(const float* logits, int n_rows, int n, void* scratch, int32_t*
         logits, n, per_block, (ArgRow*) scratch, out);
     check("argmax_rows");
 }
+#else
+uint64_t argmax_rows_scratch_bytes(int) { return 0; }
+void argmax_rows(const float*, int, int, void*, int32_t*, void*) {
+    std::fprintf(stderr, "argmax_rows: not built for this backend\n");
+    std::exit(1);
+}
+#endif
 
+#if !defined(__HIPCC__)
 uint64_t row_top_prob_scratch_bytes(int n_rows) { return (uint64_t) n_rows * sizeof(TopRow); }
 
 void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void* scratch,
@@ -912,11 +929,6 @@ void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int3
     check("row_top_prob_split");
 }
 #else
-uint64_t argmax_rows_scratch_bytes(int) { return 0; }
-void argmax_rows(const float*, int, int, void*, int32_t*, void*) {
-    std::fprintf(stderr, "argmax_rows: not built for this backend\n");
-    std::exit(1);
-}
 uint64_t row_top_prob_scratch_bytes(int) { return 0; }
 void row_top_prob_split(const float* logits, int n_rows, int n_vocab, const int32_t* ids, float* probs, void*,
                         void* stream) {
@@ -960,7 +972,11 @@ bool multi_block_head_ops() {
 }
 
 bool argmax_rows_wanted() {
-#if defined(__HIPCC__)
+#if defined(STRATA_HIP_GFX906)
+    // gfx906 (STRATA_GFX906_ARGMAX_ROWS, default on; 0: the one-block sampler_greedy_kernel): the same token
+    static const bool on = [] { const char* v = std::getenv("STRATA_GFX906_ARGMAX_ROWS"); return v == nullptr || std::atoi(v) != 0; }();
+    return on;
+#elif defined(__HIPCC__)
     return false;
 #else
     // sm_80 to sm_89: sample_tokens' greedy pick there is the one-block kernel (sm_90+ has the cluster kernel)

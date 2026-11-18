@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cmath>
 #include <cstdlib>
 #include <random>
 #include <vector>
@@ -40,6 +41,60 @@ int main(int argc, char** argv) {
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0));
     CK(cudaEventCreate(&e1));
+    {   // argmax_rows (the verifier's multi-block pick where argmax_rows_wanted) vs the one-block greedy, token for token
+        const int R = 64;
+        std::vector<float> a((size_t) R * NV);
+        std::uniform_int_distribution<int> pos(0, NV - 1);
+        for (int r = 0; r < R; ++r) {
+            float* x = &a[(size_t) r * NV];
+            const int kind = r % 8;
+            for (int v = 0; v < NV; ++v) x[v] = kind == 3 ? 0.0f : nd(rng);
+            if (kind == 1) { const float m = 50.f; for (int k = 0; k < 9; ++k) x[pos(rng)] = m; }      // tied maxima
+            if (kind == 2) for (int v = 0; v < NV; v += 3) x[v] = NAN;                                  // NaN never wins
+            if (kind == 4) for (int v = 0; v < NV; ++v) x[v] = -INFINITY;                               // none: 0
+            if (kind == 5) { for (int v = 0; v < NV; ++v) x[v] = -INFINITY; x[NV - 1] = -0.0f; x[NV - 7] = 0.0f; }
+            if (kind == 6) { x[0] = 99.f; x[NV - 1] = 99.f; }
+            if (kind == 7) for (int v = 0; v < NV; ++v) x[v] = (float) (v % 1000) * 0.001f;             // many ties at the top
+        }
+        float* da;
+        int32_t *o1, *o2;
+        void* scr;
+        CK(cudaMalloc((void**) &da, a.size() * 4));
+        CK(cudaMemcpy(da, a.data(), a.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMalloc((void**) &o1, R * 4)); CK(cudaMalloc((void**) &o2, R * 4));
+        const uint64_t sb = K::argmax_rows_scratch_bytes(8);
+        CK(cudaMalloc(&scr, sb ? sb : 16)); CK(cudaMemset(scr, 0, sb ? sb : 16));
+        int bad = 0;
+        if (K::argmax_rows_wanted()) {
+            for (int r0 = 0; r0 < R; r0 += 8) {
+                K::SamplerParams sp; sp.greedy = true; sp.temperature = 0.0f;
+                K::sample_tokens(da + (size_t) r0 * NV, 8, NV, nullptr, 0, sp, o1 + r0, s);
+                K::argmax_rows(da + (size_t) r0 * NV, (r0 / 8) % 2 ? 2 : 8, NV, scr, o2 + r0, s);
+                if ((r0 / 8) % 2) K::argmax_rows(da + (size_t) (r0 + 2) * NV, 6, NV, scr, o2 + r0 + 2, s);
+            }
+            CK(cudaStreamSynchronize(s));
+            std::vector<int32_t> h1(R), h2(R);
+            CK(cudaMemcpy(h1.data(), o1, R * 4, cudaMemcpyDeviceToHost)); CK(cudaMemcpy(h2.data(), o2, R * 4, cudaMemcpyDeviceToHost));
+            for (int r = 0; r < R; ++r) if (h1[r] != h2[r]) { if (bad < 5) std::printf("row %d: one-block %d, argmax_rows %d\n", r, h1[r], h2[r]); ++bad; }
+            std::printf("ARGMAX PARITY: %d of %d rows differ (adversarial rows: ties, NaN, -inf, +-0)\n", bad, R);
+            cudaGraph_t g;
+            cudaGraphExec_t ge;
+            CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+            for (int l = 0; l < L; ++l) K::argmax_rows(dl, T, NV, scr, dout_d, s);
+            CK(cudaStreamEndCapture(s, &g));
+            CK(cudaGraphInstantiate(&ge, g, nullptr, nullptr, 0));
+            for (int i = 0; i < 3; ++i) CK(cudaGraphLaunch(ge, s));
+            CK(cudaStreamSynchronize(s));
+            std::vector<float> ms;
+            for (int r = 0; r < reps; ++r) {
+                CK(cudaEventRecord(e0, s)); CK(cudaGraphLaunch(ge, s)); CK(cudaEventRecord(e1, s)); CK(cudaEventSynchronize(e1));
+                float m = 0; CK(cudaEventElapsedTime(&m, e0, e1)); ms.push_back(m);
+            }
+            std::sort(ms.begin(), ms.end());
+            std::printf("T %d %-24s : %7.2f us per call (median of %d graphs of %d calls)\n", T, "argmax_rows", 1e3 * ms[ms.size() / 2] / L, reps, L);
+        } else std::printf("argmax_rows not wanted on this card\n");
+        if (bad) return 1;
+    }
     const char* names[] = {"greedy (sample_tokens)", "nonfinite guard", "greedy + guard", "sampled (split top-k)"};
     {   // the sampled pick as the engine runs it: launched after the replay, not captured (a captured call takes the
         // one-block kernel)
