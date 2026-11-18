@@ -1876,7 +1876,27 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // move into the combine, gate + up share one launch (all bitwise; resident combine path, 2-8 rows only)
         const WeightRef* w_sgi = lfuse_on(n) && g_lfuse_gate() ? v.get("ffn_gate_inp_shexp.weight") : nullptr;
         bool sg_ready = false;
-        if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
+        // gfx906 STRATA_GFX906_ROUTER_CHAIN: router GEMV + top-10 + doorbell publish in one launch, bitwise the launches
+        // below (router_chain_fused); not with what rewrites ids_ / w_ between them or skips the bell
+        bool chain = false;
+#if defined(STRATA_HIP_GFX906)
+        {
+            static const float rp = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
+            if (dec_batch && (n == 1 || n == 2) && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10 &&
+                w_sgi == nullptr && !ar_on() && !device_plan_ && rp <= 0.0f && route_resident_cfg().margin <= 0.0f &&
+                hcs_ != nullptr) {
+                const bool all = remote_opt_ != nullptr || always_publish_;
+                const int32_t* layer_res = hits_.d_res != nullptr ? (hits_.d_res + l * g.n_expert) : nullptr;
+                try {
+                    chain = router_chain_fused(xm, (const uint16_t*) w_router->data, logits_ + tb * NE, ids_ + tb * K,
+                                               w_ + tb * K, n, all ? 2 : 1, layer_res, (int) g.n_expert, m_x_ + tb * N,
+                                               m_ids_ + tb * K, all ? m_w_ + tb * K : nullptr, m_seq_, hcs_ + 48, cs);
+                } catch (const std::exception& e) { err = "verify router chain: " + std::string(e.what()); return false; }
+            }
+        }
+#endif
+        if (chain) {
+        } else if (dec_batch && n > 1 && w_router != nullptr && native_router_enabled() && NE == 512 && K == 10) {
             try {
                 if (w_sgi != nullptr)
                     sg_ready = bf16_gemv_fp32_mmvf_multi_aux(mixed_ + tb * N, N, (const uint16_t*) w_router->data,
@@ -1905,9 +1925,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // STRATA_ROUTE_PRIOR=lambda (opt-in, changes the output): the top-10 picked again with a logit bonus for the
         // resident experts; the weights stay the router's (route_prior.cu)
         static const float route_prior = [] { const char* v = std::getenv("STRATA_ROUTE_PRIOR"); return v ? (float) std::atof(v) : 0.0f; }();
-        if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
+        if (!chain && route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
             route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
-        if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
+        if (!chain && route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
             // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
             try {
                 native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
@@ -1925,6 +1945,9 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                               hits_.cache_base, slot_off_d_, (long long) hits_.blob,
                               plan_ + (size_t) grp * (size_t) (plan_i32_ + 16), (long long) max_t_ * K, skip_ + grp,
                               (uint32_t) ((l - lb_) * G + grp + 1), cs);
+            if (chain) {
+                // published by router_chain_fused
+            } else
 #if defined(STRATA_USE_HIP)
             if (g_doorbell_store)   // #649 A/B: the step's ring stored, not incremented over PCIe
                 doorbell_publish_value(xm, ids_ + tb * K, w_ + tb * K, (int64_t) n * N, (int64_t) n * K, m_x_ + tb * N,

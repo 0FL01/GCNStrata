@@ -47,9 +47,9 @@ int main(int argc, char** argv) {
     }
     float *dx, *dlog, *dwt, *dxo;
     int32_t *dids, *dids_o, *dres;
-    CK(cudaMalloc((void**) &dx, xh.size() * 4));
+    CK(cudaMalloc((void**) &dx, (size_t) 8 * N * 4));   // the shape loop below runs up to 6 rows
     CK(cudaMemcpy(dx, xh.data(), xh.size() * 4, cudaMemcpyHostToDevice));
-    CK(cudaMalloc((void**) &dlog, (size_t) T * NE * 4));
+    CK(cudaMalloc((void**) &dlog, (size_t) 8 * NE * 4));
     CK(cudaMalloc((void**) &dwt, (size_t) T * KK * 4));
     CK(cudaMalloc((void**) &dids, (size_t) T * KK * 4));
     CK(cudaMalloc((void**) &dids_o, (size_t) T * KK * 4));
@@ -185,6 +185,97 @@ int main(int argc, char** argv) {
                 cudaGraphDestroy(g);
             }
             for (int l = 0; l < L; ++l) cudaFree(dws[l]);
+        }
+    }
+    {   // gfx906 router_chain_fused vs the separate launches: logits, ids, weights, published x / ids / weights, ring, bitwise
+        unsigned* dcnt;
+        float* dwo;
+        CK(cudaMalloc((void**) &dcnt, 64)); CK(cudaMemset(dcnt, 0, 64));
+        CK(cudaMalloc((void**) &dwo, (size_t) T * KK * 4));
+        // half the layers' residency tables say every expert is resident (publish_res skips x), half say none is
+        std::vector<int32_t> nores(NE, -1);
+        int32_t* dnores;
+        CK(cudaMalloc((void**) &dnores, NE * 4)); CK(cudaMemcpy(dnores, nores.data(), NE * 4, cudaMemcpyHostToDevice));
+        long long bad = 0;
+        for (int pub = 1; pub <= 2; ++pub)
+            for (int l = 0; l < 4; ++l) {
+                const int32_t* rt = (l & 1) ? dnores : dres;
+                std::vector<uint8_t> out[2];
+                uint32_t seq_d[2];
+                for (int f = 0; f < 2; ++f) {
+                    CK(cudaMemset(dlog, 0xff, (size_t) T * NE * 4)); CK(cudaMemset(dids, 0xff, (size_t) T * KK * 4));
+                    CK(cudaMemset(dwt, 0xff, (size_t) T * KK * 4)); CK(cudaMemset(dxo, 0xff, xh.size() * 4));
+                    CK(cudaMemset(dids_o, 0xff, (size_t) T * KK * 4)); CK(cudaMemset(dwo, 0xff, (size_t) T * KK * 4));
+                    const uint32_t s0 = *hseq;
+                    bool ran = false;
+                    if (f == 1) ran = K::router_chain_fused(dx, dw[l], dlog, dids, dwt, T, pub, rt, NE, dxo, dids_o, dwo, dseq, dcnt, s);
+                    if (f == 0 || !ran) {
+                        if (f == 1) { std::printf("CHAIN PARITY: router_chain_fused not available here (T %d)\n", T); bad = -1; break; }
+                        K::bf16_gemv_fp32_mmvf_multi(dx, N, dw[l], dlog, NE, N, NE, T, s);
+                        K::native_router_top10_multi(dlog, dids, dwt, T, s);
+                        if (pub == 2) K::doorbell_publish(dx, dids, dwt, (int64_t) T * N, (int64_t) T * KK, dxo, dids_o, dwo, dseq, s);
+                        else K::doorbell_publish_res(dx, dids, rt, NE, (int64_t) T * N, (int64_t) T * KK, dxo, dids_o, dseq, s);
+                    }
+                    CK(cudaStreamSynchronize(s));
+                    seq_d[f] = *hseq - s0;
+                    out[f].resize(((size_t) T * NE + 4 * (size_t) T * KK + xh.size()) * 4);
+                    uint8_t* q = out[f].data();
+                    CK(cudaMemcpy(q, dlog, (size_t) T * NE * 4, cudaMemcpyDeviceToHost)); q += (size_t) T * NE * 4;
+                    CK(cudaMemcpy(q, dids, (size_t) T * KK * 4, cudaMemcpyDeviceToHost)); q += (size_t) T * KK * 4;
+                    CK(cudaMemcpy(q, dwt, (size_t) T * KK * 4, cudaMemcpyDeviceToHost)); q += (size_t) T * KK * 4;
+                    CK(cudaMemcpy(q, dids_o, (size_t) T * KK * 4, cudaMemcpyDeviceToHost)); q += (size_t) T * KK * 4;
+                    CK(cudaMemcpy(q, dwo, (size_t) T * KK * 4, cudaMemcpyDeviceToHost)); q += (size_t) T * KK * 4;
+                    CK(cudaMemcpy(q, dxo, xh.size() * 4, cudaMemcpyDeviceToHost));
+                }
+                if (bad < 0) break;
+                const bool same = out[0] == out[1] && seq_d[0] == 1 && seq_d[1] == 1;
+                std::printf("CHAIN PARITY T %d publish %d layer %d (%s): %s (rings %u / %u)\n", T, pub, l, (l & 1) ? "none resident" : "all resident",
+                            same ? "bitwise equal" : "DIFFERS", seq_d[0], seq_d[1]);
+                bad += !same;
+            }
+        if (bad > 0) return 1;
+        if (bad == 0) {
+            for (int pub = 1; pub <= 2; ++pub) {
+                cudaGraph_t g;
+                cudaGraphExec_t ge;
+                CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+                for (int l = 0; l < L; ++l) K::router_chain_fused(dx, dw[l], dlog, dids, dwt, T, pub, dres, NE, dxo, dids_o, dwo, dseq, dcnt, s);
+                CK(cudaStreamEndCapture(s, &g));
+                CK(cudaGraphInstantiate(&ge, g, nullptr, nullptr, 0));
+                for (int i = 0; i < 5; ++i) CK(cudaGraphLaunch(ge, s));
+                CK(cudaStreamSynchronize(s));
+                std::vector<float> ms;
+                for (int r = 0; r < reps; ++r) {
+                    CK(cudaEventRecord(e0, s)); CK(cudaGraphLaunch(ge, s)); CK(cudaEventRecord(e1, s)); CK(cudaEventSynchronize(e1));
+                    float m = 0; CK(cudaEventElapsedTime(&m, e0, e1)); ms.push_back(m);
+                }
+                std::sort(ms.begin(), ms.end());
+                std::printf("T %d %-20s : %6.2f us per layer (median of %d graphs of %d layers)\n", T, pub == 1 ? "fused chain (res)" : "fused chain (all)",
+                            1e3 * ms[ms.size() / 2] / L, reps, L);
+                cudaGraphExecDestroy(ge); cudaGraphDestroy(g);
+                // the separate chain with the always-publish doorbell, for the (all) comparison
+                if (pub == 2) {
+                    CK(cudaStreamBeginCapture(s, cudaStreamCaptureModeThreadLocal));
+                    for (int l = 0; l < L; ++l) {
+                        K::bf16_gemv_fp32_mmvf_multi(dx, N, dw[l], dlog, NE, N, NE, T, s);
+                        K::native_router_top10_multi(dlog, dids, dwt, T, s);
+                        K::doorbell_publish(dx, dids, dwt, (int64_t) T * N, (int64_t) T * KK, dxo, dids_o, dwo, dseq, s);
+                    }
+                    CK(cudaStreamEndCapture(s, &g));
+                    CK(cudaGraphInstantiate(&ge, g, nullptr, nullptr, 0));
+                    for (int i = 0; i < 5; ++i) CK(cudaGraphLaunch(ge, s));
+                    CK(cudaStreamSynchronize(s));
+                    ms.clear();
+                    for (int r = 0; r < reps; ++r) {
+                        CK(cudaEventRecord(e0, s)); CK(cudaGraphLaunch(ge, s)); CK(cudaEventRecord(e1, s)); CK(cudaEventSynchronize(e1));
+                        float m = 0; CK(cudaEventElapsedTime(&m, e0, e1)); ms.push_back(m);
+                    }
+                    std::sort(ms.begin(), ms.end());
+                    std::printf("T %d %-20s : %6.2f us per layer (median of %d graphs of %d layers)\n", T, "separate chain (all)",
+                                1e3 * ms[ms.size() / 2] / L, reps, L);
+                    cudaGraphExecDestroy(ge); cudaGraphDestroy(g);
+                }
+            }
         }
     }
     // mode bits: 1 mmvf, 2 route, 4 doorbell, 8 an empty kernel per layer (the node floor)

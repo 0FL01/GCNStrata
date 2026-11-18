@@ -22,6 +22,7 @@
 // SOFTWARE.
 #include "strata/kernels/native_router.hpp"
 #include <cuda_runtime.h>
+#include "route_v2.cuh"
 #include <atomic>
 #include <cfloat>
 #include <cstddef>
@@ -159,73 +160,10 @@ __global__ void route_multi(const float* __restrict__ logits, int32_t* __restric
 // is the kernel above's: lane (expert & 31) of the low half adds the winners in rank order, then the same XOR tree.
 // The single-wave kernel above spends ~190 instructions a round; route_mb (lab hc1-20261118/mb) on MI50, a graph of 48
 // launches: 13.5 -> 7.7 us per layer, outputs bitwise on 4096 x 10 adversarial rows (ties, NaN, -inf, underflow).
-__device__ __forceinline__ float row_fmax(float v) {
-    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0xB1, 0xf, 0xf, false)));   // quad [1,0,3,2]
-    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x4E, 0xf, 0xf, false)));   // quad [2,3,0,1]
-    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x141, 0xf, 0xf, false)));  // row_half_mirror
-    v = fmaxf(v, __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x140, 0xf, 0xf, false)));  // row_mirror
-    return v;
-}
-__device__ __forceinline__ uint32_t row_umin(uint32_t v) {
-    v = min(v, (uint32_t) __builtin_amdgcn_update_dpp(0, (int) v, 0xB1, 0xf, 0xf, false));
-    v = min(v, (uint32_t) __builtin_amdgcn_update_dpp(0, (int) v, 0x4E, 0xf, 0xf, false));
-    v = min(v, (uint32_t) __builtin_amdgcn_update_dpp(0, (int) v, 0x141, 0xf, 0xf, false));
-    v = min(v, (uint32_t) __builtin_amdgcn_update_dpp(0, (int) v, 0x140, 0xf, 0xf, false));
-    return v;
-}
 __launch_bounds__(64)
 __global__ void route_v2(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ weights) {
-    logits += (size_t) blockIdx.x * 512; ids += (size_t) blockIdx.x * 10; weights += (size_t) blockIdx.x * 10;
-    const int lane = threadIdx.x & 31, up = threadIdx.x >> 5;
-    float values[16];
-#pragma unroll
-    for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
-    float maximum = -INFINITY;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
-    maximum = warp_max(maximum);
-    float sum = 0.0f;
-#pragma unroll
-    for (int i = 0; i < 16; ++i) {
-        values[i] = expf(values[i] - maximum);
-        sum += values[i];
-    }
-    const float reciprocal = 1.0f / warp_sum(sum);
-    float v8[8];
-#pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        float x = (up ? values[8 + j] : values[j]) * reciprocal;
-        if (__isnanf(x)) x = -FLT_MAX;
-        v8[j] = x;
-    }
-    const int base = lane + (up ? 256 : 0);   // v8[j] is expert base + 32 j
-    float selected = 0.0f, selected_sum = 0.0f;
-    for (int rank = 0; rank < 10; ++rank) {
-        float best = v8[0];   // the lane's best, the lowest j on a tie (the scan above's strict >)
-        int bj = 0;
-#pragma unroll
-        for (int j = 1; j < 8; ++j) {
-            const bool g = v8[j] > best;
-            best = g ? v8[j] : best;
-            bj = g ? j : bj;
-        }
-        const float rm = row_fmax(best);
-        const float m = fmaxf(fmaxf(__int_as_float(__builtin_amdgcn_readlane(__float_as_int(rm), 0)),
-                                    __int_as_float(__builtin_amdgcn_readlane(__float_as_int(rm), 16))),
-                              fmaxf(__int_as_float(__builtin_amdgcn_readlane(__float_as_int(rm), 32)),
-                                    __int_as_float(__builtin_amdgcn_readlane(__float_as_int(rm), 48))));
-        const uint32_t cand = best == m ? (uint32_t) (base + 32 * bj) : 0xffffffffu;
-        const uint32_t rmin = row_umin(cand);
-        const int expert = (int) min(min((uint32_t) __builtin_amdgcn_readlane((int) rmin, 0), (uint32_t) __builtin_amdgcn_readlane((int) rmin, 16)),
-                                     min((uint32_t) __builtin_amdgcn_readlane((int) rmin, 32), (uint32_t) __builtin_amdgcn_readlane((int) rmin, 48)));
-        if (base + 32 * bj == expert) v8[bj] = -INFINITY;   // the owner lane: its scan picked this expert
-        if (!up && (expert & 31) == lane) selected_sum += m;
-        if (!up && rank == lane) selected = m;
-        if (threadIdx.x == 0) ids[rank] = expert;
-    }
-    selected_sum = max(warp_sum(selected_sum), 6.103515625e-5f);
-    const float inverse_selected_sum = 1.0f / selected_sum;
-    if (!up && lane < 10) weights[lane] = selected * inverse_selected_sum;
+    rv2::route_v2_body(logits + (size_t) blockIdx.x * 512, ids + (size_t) blockIdx.x * 10, weights + (size_t) blockIdx.x * 10,
+                       (int) threadIdx.x);
 }
 bool route_v2_on() {
     static const bool on = [] { const char* e = std::getenv("STRATA_GFX906_ROUTE_V2"); return e == nullptr || std::atoi(e) != 0; }();
@@ -297,6 +235,13 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
     const auto ap = reinterpret_cast<uintptr_t>(a), bp = reinterpret_cast<uintptr_t>(b);
     return ap < bp + bn && bp < ap + an;
 }
+}
+bool native_router_v2_enabled() {
+#if defined(STRATA_HIP_GFX906)
+    return route_v2_on();
+#else
+    return false;
+#endif
 }
 void native_router_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_router_enabled() { return enabled.load(std::memory_order_relaxed); }

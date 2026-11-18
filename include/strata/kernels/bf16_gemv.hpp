@@ -59,4 +59,14 @@ bool bf16_gemv_fp32_mmvf_multi_aux(const float* x, int64_t ldx, const uint16_t* 
                                    int64_t n_in, int64_t n_out, int n_tok, const uint16_t* w_aux, float* y_aux,
                                    int64_t ldy_aux, void* stream);
 
+/// gfx906 (STRATA_GFX906_ROUTER_CHAIN, default on): the 512 x 10 router chain of one layer in one launch - the router
+/// GEMV of n_tok (1 or 2) rows of x [n_tok][2560] against w [512][2560] into logits [n_tok][512], the top-10 into
+/// ids / weights [n_tok][10], then the doorbell publish (publish 1: doorbell_publish_res with d_res / n_expert, 2:
+/// doorbell_publish with the weights) of x, ids (and weights) to x_out / ids_out / w_out and the ring `seq`.  Bitwise the
+/// separate launches (bf16_gemv_fp32_mmvf[_multi], native_router_top10[_multi], doorbell_publish[_res]).  `cnt`: one zeroed
+/// word owned by the caller (per instance, reused in stream order).  Returns false (nothing launched) where the separate
+/// launches would take other kernels: then the caller runs them.
+bool router_chain_fused(const float* x, const uint16_t* w, float* logits, int32_t* ids, float* weights, int n_tok,
+                        int publish, const int32_t* d_res, int n_expert, float* x_out, int32_t* ids_out, float* w_out,
+                        uint32_t* seq, unsigned* cnt, void* stream);
 }  // namespace strata::kernels

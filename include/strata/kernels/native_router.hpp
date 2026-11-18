@@ -6,6 +6,8 @@ namespace strata::kernels {
 // This experiment is off by default and does not modify the legacy router.
 void native_router_set_enabled(bool enabled);
 bool native_router_enabled();
+/// gfx906: the 512 x 10 top-10 runs the wave-per-token selection (STRATA_GFX906_ROUTE_V2, default on)
+bool native_router_v2_enabled();
 
 // Pinned CUDA topk-moe contract for ONE token, 512 experts, top 10, softmax,
 // no selection bias, lower normalization clamp 2^-14, and scale 1.

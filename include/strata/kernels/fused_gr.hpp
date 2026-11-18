@@ -69,7 +69,7 @@ constexpr int kFusedGrMaxT = 8;
 /// Returns true when it also wrote the q8_1 images (every token's q8_mixed set and this read supports it).
 /// `hc_sync`: kFusedGrSyncWords zeroed words owned by the caller (per instance: two reads that may run concurrently
 /// need different words), for gfx906's one-kernel read (STRATA_HC_SPLIT=3 / 4); null keeps the multi-launch read.
-constexpr int kFusedGrSyncWords = 64;
+constexpr int kFusedGrSyncWords = 64;   // [0, 33): the HC read; [48]: gfx906's fused router chain (router_chain_fused)
 bool fused_gr_read_multi(const FusedGrArgs* a, int n_tok, float* xn_scratch, void* stream,
                          unsigned long long* stamp_buf = nullptr, int stamp_i0 = 0, unsigned* hc_sync = nullptr);
 

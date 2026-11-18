@@ -2,8 +2,10 @@
 #include "s26_tsum.cuh"
 #include "strata/kernels/bf16_bits.hpp"
 #include "strata/kernels/pdl.hpp"
+#include "strata/kernels/native_router.hpp"
 
 #include <cuda_runtime.h>
+#include "route_v2.cuh"
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
@@ -139,15 +141,16 @@ __global__ void bf16_f32_mmvf_multi_kernel(const float* x_, int64_t ldx, const u
 // ordered FMAs and the same warp and block reductions: bit-identical to bf16_f32_mmvf_multi_kernel.
 // S26 STRATA_LFUSE=1 (AUX): one more block computes row 0 of w_aux into y_aux[k * ldy_aux] - the same per-output
 // code, so each aux output is bitwise what its own bf16_f32_mmvf_multi_kernel launch gave (the shared expert's gate)
-template <int BLOCK_SIZE, int NT, int RPB, bool TS = false, bool AUX = false>
-__global__ void bf16_f32_mmvf_rows_kernel(const float* __restrict__ x, int64_t ldx, const uint16_t* __restrict__ w,
-                                          float* __restrict__ y, int64_t ldy, int n_in, int n_out, int n_tok,
-                                          const uint16_t* __restrict__ w_aux = nullptr, float* __restrict__ y_aux = nullptr,
-                                          int64_t ldy_aux = 0) {
+// the body: block `bx` of `gdim` (the kernel's blockIdx.x / gridDim.x; the gfx906 fused router chain runs it too)
+template <int BLOCK_SIZE, int NT, int RPB, bool TS, bool AUX>
+__device__ __forceinline__ void mmvf_rows_body(const int bx, const int gdim, const float* __restrict__ x, int64_t ldx,
+                                               const uint16_t* __restrict__ w, float* __restrict__ y, int64_t ldy, int n_in,
+                                               int n_out, int n_tok, const uint16_t* __restrict__ w_aux,
+                                               float* __restrict__ y_aux, int64_t ldy_aux) {
     const int t = threadIdx.x;
-    int o0 = blockIdx.x * RPB;
+    int o0 = bx * RPB;
     if constexpr (AUX) {
-        if (blockIdx.x == gridDim.x - 1) { w = w_aux; y = y_aux; ldy = ldy_aux; n_out = 1; o0 = 0; }
+        if (bx == gdim - 1) { w = w_aux; y = y_aux; ldy = ldy_aux; n_out = 1; o0 = 0; }
     }
     __shared__ float partials[RPB][NT][32];
     if constexpr (BLOCK_SIZE > 32) {
@@ -227,6 +230,81 @@ __global__ void bf16_f32_mmvf_rows_kernel(const float* __restrict__ x, int64_t l
                 for (int k = 0; k < NT; ++k)
                     if (k < n_tok) y[(size_t) k * ldy + o0 + r] = acc[r][k];
 }
+template <int BLOCK_SIZE, int NT, int RPB, bool TS = false, bool AUX = false>
+__global__ void bf16_f32_mmvf_rows_kernel(const float* __restrict__ x, int64_t ldx, const uint16_t* __restrict__ w,
+                                          float* __restrict__ y, int64_t ldy, int n_in, int n_out, int n_tok,
+                                          const uint16_t* __restrict__ w_aux = nullptr, float* __restrict__ y_aux = nullptr,
+                                          int64_t ldy_aux = 0) {
+    mmvf_rows_body<BLOCK_SIZE, NT, RPB, TS, AUX>((int) blockIdx.x, (int) gridDim.x, x, ldx, w, y, ldy, n_in, n_out, n_tok,
+                                                 w_aux, y_aux, ldy_aux);
+}
+
+#if defined(STRATA_HIP_GFX906)
+// ---- gfx906 (STRATA_GFX906_ROUTER_CHAIN, default on): the FFN router chain of a verify window's layer in ONE launch -
+// the 512 x 2560 router GEMV (the T1 / T2 rows kernel's 128 blocks of 4 rows), then in the LAST block to finish (a
+// fenced counter in the caller's per-instance word) the top-10 of each token (route_v2_body, a wave per token) and the
+// doorbell publish (doorbell_publish_kernel / doorbell_publish_res_kernel's copies and ring).  Every block runs those
+// kernels' bodies on the same data in the same order, so the logits, ids, weights and published bytes are theirs bit
+// for bit; what goes is two launches and their gaps on the layer's serial path (router -> bell -> host plan).
+template <int NT, int PUB>   // PUB 1: publish x only if a routed expert is not resident (doorbell_publish_res); 2: always (+ weights)
+__global__ void __launch_bounds__(256) router_chain_kernel(const float* __restrict__ x, const uint16_t* __restrict__ w,
+                                                           float* __restrict__ logits, int32_t* __restrict__ ids,
+                                                           float* __restrict__ weights, const int32_t* __restrict__ d_res,
+                                                           int n_expert, float* x_out, int32_t* ids_out, float* w_out,
+                                                           uint32_t* seq, unsigned* cnt) {
+    constexpr int n = NT * 2560, k = NT * 10;
+    if constexpr (PUB == 2) {
+        // publish 2 copies x whatever the routing: every block its slice first (one block alone was the slower copy),
+        // fenced to the system before the block counts, so the ring below follows every byte of it
+        constexpr int S = (n + 127) / 128;
+        for (int i = (int) blockIdx.x * S + (int) threadIdx.x; i < ((int) blockIdx.x + 1) * S && i < n; i += blockDim.x)
+            x_out[i] = x[i];
+        __threadfence_system();
+    }
+    mmvf_rows_body<256, NT, 4, false, false>((int) blockIdx.x, (int) gridDim.x, x, 2560, w, logits, 512, 2560, 512, NT,
+                                             nullptr, nullptr, 0);
+    __shared__ int last;
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        last = atomicAdd(cnt, 1u) == gridDim.x - 1;
+        if (last) atomicExch(cnt, 0u);   // every block has counted: free for the next layer's launch
+    }
+    __syncthreads();
+    if (!last) return;
+    __threadfence();   // the other blocks' logits
+    const int wv = (int) threadIdx.x >> 6;
+    if (wv < NT) rv2::route_v2_body(logits + wv * 512, ids + wv * 10, weights + wv * 10, (int) threadIdx.x & 63);
+    __threadfence();
+    __syncthreads();
+    if constexpr (PUB == 2) {   // doorbell_publish_kernel (x: above, by every block)
+        if ((int) threadIdx.x < k) {
+            ids_out[threadIdx.x] = ids[threadIdx.x];
+            w_out[threadIdx.x] = weights[threadIdx.x];
+        }
+        __threadfence_system();
+        __syncthreads();
+    } else {                    // doorbell_publish_res_kernel
+        int any_miss = 0;
+        if ((int) threadIdx.x < k) {
+            const int32_t id = ids[threadIdx.x];
+            ids_out[threadIdx.x] = id;
+            if (d_res == nullptr || id < 0 || id >= n_expert || d_res[id] < 0) any_miss = 1;
+        }
+        if (__syncthreads_or(any_miss)) {
+            for (int i = threadIdx.x; i < n; i += blockDim.x) x_out[i] = x[i];
+            __threadfence_system();
+        } else if ((int) threadIdx.x < k) {
+            __threadfence_system();
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        *(volatile uint32_t*) seq = *(volatile uint32_t*) seq + 1u;
+        __threadfence_system();
+    }
+}
+#endif
 
 template <int B>
 void launch_rows(const float* x, int64_t ldx, const uint16_t* w, float* y, int64_t ldy, int n_in, int n_out, int n_tok,
@@ -411,4 +489,36 @@ void bf16_gemv_fp32_mmvf_cols(const float* x, const uint16_t* w, float* y, int64
     }
 }
 
+
+bool router_chain_fused(const float* x, const uint16_t* w, float* logits, int32_t* ids, float* weights, int n_tok,
+                        int publish, const int32_t* d_res, int n_expert, float* x_out, int32_t* ids_out, float* w_out,
+                        uint32_t* seq, unsigned* cnt, void* stream) {
+#if defined(STRATA_HIP_GFX906)
+    // only where the separate launches are the T1 / T2 rows kernels and the v2 top-10 (the bits this kernel reproduces)
+    static const bool on = [] { const char* e = std::getenv("STRATA_GFX906_ROUTER_CHAIN"); return e == nullptr || std::atoi(e) != 0; }();
+    static const bool rows = [] { const char* v = std::getenv("STRATA_MMVF_ROWS"); return v && v[0] == '1'; }();
+    static const bool ts = [] { const char* v = std::getenv("STRATA_TSUM"); return v && v[0] == '1'; }();
+    static const bool t1 = [] { const char* v = std::getenv("STRATA_GFX906_ROUTER_T1_ROWS"); return v && v[0] == '1' && v[1] == 0; }();
+    static const bool t2 = [] { const char* v = std::getenv("STRATA_GFX906_ROUTER_T2_EXACT"); return v && v[0] == '1' && v[1] == 0; }();
+    if (!on || !rows || ts || !native_router_v2_enabled() || cnt == nullptr || seq == nullptr || x_out == nullptr ||
+        ids_out == nullptr || (publish == 2 && w_out == nullptr) || (publish != 1 && publish != 2) ||
+        !((n_tok == 1 && t1) || (n_tok == 2 && t2)))
+        return false;
+    const cudaStream_t st = (cudaStream_t) stream;
+    if (n_tok == 1) {
+        if (publish == 2) router_chain_kernel<1, 2><<<128, 256, 0, st>>>(x, w, logits, ids, weights, d_res, n_expert, x_out, ids_out, w_out, seq, cnt);
+        else router_chain_kernel<1, 1><<<128, 256, 0, st>>>(x, w, logits, ids, weights, d_res, n_expert, x_out, ids_out, w_out, seq, cnt);
+    } else {
+        if (publish == 2) router_chain_kernel<2, 2><<<128, 256, 0, st>>>(x, w, logits, ids, weights, d_res, n_expert, x_out, ids_out, w_out, seq, cnt);
+        else router_chain_kernel<2, 1><<<128, 256, 0, st>>>(x, w, logits, ids, weights, d_res, n_expert, x_out, ids_out, w_out, seq, cnt);
+    }
+    const cudaError_t result = cudaGetLastError();
+    if (result != cudaSuccess) throw std::runtime_error(std::string("router_chain_fused launch: ") + cudaGetErrorString(result));
+    return true;
+#else
+    (void) x; (void) w; (void) logits; (void) ids; (void) weights; (void) n_tok; (void) publish; (void) d_res; (void) n_expert;
+    (void) x_out; (void) ids_out; (void) w_out; (void) seq; (void) cnt; (void) stream;
+    return false;
+#endif
+}
 }  // namespace strata::kernels
