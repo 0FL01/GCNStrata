@@ -57,6 +57,13 @@ const Case CASES[] = {
     {"head Q5_K", 13, 2560, 248320, 256, 176, {0, 2}},
     {"draft head Q5_K", 13, 2560, 106299, 256, 176, {0, 2}},
     {"head Q6_K", 14, 2560, 248320, 256, 210, {208, -1}},
+    {"gdn qkv Q4_0", 2, 2560, 10240, 32, 18, {0, -1}},
+    {"gdn gate Q4_0", 2, 2560, 6144, 32, 18, {0, -1}},
+    {"gdn out Q4_0", 2, 6144, 2560, 32, 18, {0, -1}},
+    {"qsa q Q4_0", 2, 2560, 12288, 32, 18, {0, -1}},
+    {"gdn qkv Q4_1", 3, 2560, 10240, 32, 20, {0, 2}},
+    {"gdn gate Q4_1", 3, 2560, 6144, 32, 20, {0, 2}},
+    {"gdn out Q4_1", 3, 6144, 2560, 32, 20, {0, 2}},
     {"draft head Q6_K", 14, 2560, 58963, 256, 210, {208, -1}},
 };
 const int WIDTHS[] = {1, 2, 3, 4, 5, 6, 7, 8};
@@ -129,6 +136,8 @@ int main(int argc, char** argv) {
     const bool q5r2 = argc > 4 && std::strcmp(argv[4], "--q5-head-r2") == 0;
     // --q6-head-r <2|4>: B = STRATA_GFX906_Q6_HEAD_R=<r> (gfx906 Q6_K heads), A = R1
     const char* q6r = argc > 5 && std::strcmp(argv[4], "--q6-head-r") == 0 ? argv[5] : nullptr;
+    // --q40-r <2|4>: B = STRATA_GFX906_Q40_R=<r> (dense Q4_0 rows per wavefront), A = R1
+    const char* q40r = argc > 5 && std::strcmp(argv[4], "--q40-r") == 0 ? argv[5] : nullptr;
     const char* wave_mode = std::getenv("STRATA_MMVQ_WAVE");
     if (q5r2 && (bmode != 1 || n_dev < 1 || only < -1 || only >= n_dev ||
                  (wave_mode && std::strcmp(wave_mode, "0") == 0))) return 2;
@@ -140,6 +149,8 @@ int main(int argc, char** argv) {
 #endif
         } else if (q6r) {
             if (setenv("STRATA_GFX906_Q6_HEAD_R", mode ? q6r : "0", 1) != 0) std::exit(2);
+        } else if (q40r) {
+            if (setenv("STRATA_GFX906_Q40_R", mode ? q40r : "0", 1) != 0) std::exit(2);
         } else K::native_mmvq_set_b6_rows(mode);
     };
 

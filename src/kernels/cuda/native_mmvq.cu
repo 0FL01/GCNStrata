@@ -1944,6 +1944,11 @@ int q6_head_r() {
     }
     return eligible ? r : 0;
 }
+int q40_rows() {   // read per call (graph capture freezes it for decode), so a bench can switch it
+    const char* e = std::getenv("STRATA_GFX906_Q40_R");
+    const int v = e ? std::atoi(e) : 0;
+    return v == 2 || v == 4 ? v : 0;
+}
 bool q8_output_r2_enabled() {
     const char* e = std::getenv("STRATA_GFX906_Q8_OUT_R2");
     if (!e || std::string(e) != "1") return false;
@@ -1987,6 +1992,19 @@ void small_mmvq(const void* weights, const void* x_q8_1, float* y,
             else wave_launch_n<F, 2, 2>(weights, x_q8_1, y, n_in, n_out, s);
             launch_check();
             return;
+        }
+    }
+#endif
+#if defined(STRATA_HIP_GFX906)
+    // STRATA_GFX906_Q40_R=2|4: dense Q4_0 (bartowski Q4_0: GDN qkv / gate / out, QSA q / out) with R rows per
+    // wavefront; each row keeps the R = 1 lane / block assignment and its own 64-lane butterfly: bitwise R = 1's
+    if constexpr (std::is_same_v<Weight, Q40Block>) {
+        if (!g_wave_off) {
+            const int r = q40_rows();
+            // 4: R4 at 1-3 columns, R2 above (MI50, b6_mmvq_bench --q40-r: R2 faster than R1 at every column count,
+            // R4 faster than R2 at 1-3 and slower from 5; qkv 2560 x 10240 1 / 2 cols 46.7 -> 37.9 / 66.6 -> 46.9 us)
+            if (r == 4 && ncols <= 3) { wave_launch<SmallTraits<Weight, Qi>, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream); launch_check(); return; }
+            if (r != 0) { wave_launch<SmallTraits<Weight, Qi>, 2>(weights, x_q8_1, y, n_in, n_out, ncols, stream); launch_check(); return; }
         }
     }
 #endif
