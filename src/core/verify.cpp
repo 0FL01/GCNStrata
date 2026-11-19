@@ -1669,8 +1669,15 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 }
                 if (!sidem) idx_key(cs);
                 stamp(l, 7, grp);
-                mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
-                mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                // gfx906: K and V (same type, same q8_1 input) in one launch, bitwise the two (STRATA_GFX906_QKVZ)
+                if (!(wk->native_type == wv->native_type &&
+                      !(g_mmvq_il() && strata::kernels::native_mmvq_il_supported(wk->native_type, n, (int) (NKV * HD))) &&
+                      strata::kernels::native_mmvq_two(wk->native_type, wk->native_data, kcur_ + tb * NKV * HD,
+                                                       (int) (NKV * HD), wv->native_data, vcur_ + tb * NKV * HD,
+                                                       (int) (NKV * HD), xq_, (int) N, n, cs))) {
+                    mm(wk, kcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                    mm(wv, vcur_ + tb * NKV * HD, (int) N, (int) (NKV * HD));
+                }
                 if (qb) norm_rope(kcur_ + tb * NKV * HD, wkn, (int) (n * NKV), (int) HD, pos_k + tb * NKV);
                 else for (int t = tb; t < te; ++t) norm_rope(kcur_ + t * NKV * HD, wkn, (int) NKV, (int) HD, pos_ + t * NH);
                 if (st.kv_rot) {   // K and V rotated before they are stored (kv_q4.hpp)

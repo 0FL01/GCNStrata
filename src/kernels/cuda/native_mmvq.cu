@@ -3021,16 +3021,28 @@ bool native_mmvq_two(int ggml_type, const void* w1, float* y1, int n_out1, const
                      const void* x_q8_1, int n_in, int ncols, void* stream) {
 #if defined(STRATA_HIP_GFX906)
     static const bool on = [] { const char* e = std::getenv("STRATA_GFX906_QKVZ"); return e == nullptr || std::atoi(e) != 0; }();
-    // only where both calls would take the dense Q4_0 wave path (small_mmvq: R4 at 1-3 columns, R2 above)
-    if (!on || ggml_type != 2 || g_wave_off || ncols < 1 || ncols > 4 || n_in <= 0 || n_in % 32 != 0 || n_out1 <= 0 ||
-        n_out2 <= 0 || !w1 || !w2 || !y1 || !y2 || !x_q8_1 || !stream)
+    // only where both calls would take the same wave path as small_mmvq: Q4_0 R4 at 1-3 columns / R2 above (R1 when
+    // STRATA_GFX906_Q40_R=0 or 1), Q5_0 and Q8_0 R1 (not the packed Q8_0 tensors, not the opt-in Q8_0 out-proj R2)
+    if (!on || g_wave_off || ncols < 1 || ncols > 4 || n_in <= 0 || n_in % 32 != 0 || n_out1 <= 0 || n_out2 <= 0 || !w1 ||
+        !w2 || !y1 || !y2 || !x_q8_1 || !stream)
         return false;
-    const int r = q40_rows();
-    if (r == 0) return false;
-    using F = SmallTraits<Q40Block, 4>;
     const auto s = static_cast<cudaStream_t>(stream);
-    const bool ok = r == 4 && ncols <= 3 ? wave2_launch<F, 4>(w1, y1, n_out1, w2, y2, n_out2, x_q8_1, n_in, ncols, s)
-                                         : wave2_launch<F, 2>(w1, y1, n_out1, w2, y2, n_out2, x_q8_1, n_in, ncols, s);
+    bool ok = false;
+    if (ggml_type == 2) {
+        using F = SmallTraits<Q40Block, 4>;
+        const int r = q40_rows();
+        ok = r == 4 && ncols <= 3 ? wave2_launch<F, 4>(w1, y1, n_out1, w2, y2, n_out2, x_q8_1, n_in, ncols, s)
+           : r != 0               ? wave2_launch<F, 2>(w1, y1, n_out1, w2, y2, n_out2, x_q8_1, n_in, ncols, s)
+                                  : wave2_launch<F, 1>(w1, y1, n_out1, w2, y2, n_out2, x_q8_1, n_in, ncols, s);
+    } else if (ggml_type == 6) {
+        ok = wave2_launch<SmallTraits<Q50Block, 4>, 1>(w1, y1, n_out1, w2, y2, n_out2, x_q8_1, n_in, ncols, s);
+    } else if (ggml_type == 8) {
+        const auto& reg = q8_packed_registry();
+        if (reg.count(w1) || reg.count(w2)) return false;
+        if (n_in == 6144 && (n_out1 == 2560 || n_out2 == 2560) && (ncols == 1 || ncols == 2) && q8_output_r2_enabled())
+            return false;
+        ok = wave2_launch<SmallTraits<Q80Block, 8>, 1>(w1, y1, n_out1, w2, y2, n_out2, x_q8_1, n_in, ncols, s);
+    }
     if (ok) launch_check();
     return ok;
 #else

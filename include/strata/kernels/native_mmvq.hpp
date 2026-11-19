@@ -156,8 +156,8 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
 /// gfx906 (STRATA_GFX906_QKVZ, default on; 0 off): native_mmvq(w1 -> y1, n_out1) and native_mmvq(w2 -> y2, n_out2) of
-/// one type on the same q8_1 input in ONE launch, bitwise the two calls (each row's wave body unchanged). Dense Q4_0
-/// wave path, 1-4 columns; returns false (nothing launched) elsewhere.
+/// one type on the same q8_1 input in ONE launch, bitwise the two calls (each row's wave body unchanged). Q4_0 / Q5_0 /
+/// Q8_0 wave paths, 1-4 columns; returns false (nothing launched) elsewhere.
 bool native_mmvq_two(int ggml_type, const void* w1, float* y1, int n_out1, const void* w2, float* y2, int n_out2,
                      const void* x_q8_1, int n_in, int ncols, void* stream);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,
