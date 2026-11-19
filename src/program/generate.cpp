@@ -14979,6 +14979,8 @@ int main(int argc, char** argv) {
                             if (H.ready && !H.launched && H.T == 1 && (req_spec_min_p <= 0.0 || pd >= (float) req_spec_min_p)) {
                                 H.tok[1] = mtp.chain_tok()[j];
                                 H.prob[0] = pd;
+                                H.alt[1] = mtp.chain_tok2()[j];
+                                H.altp[1] = mtp.chain_prob2()[j];
                                 H.T = 2;
                                 ++pl_hedge_t2;
                             }
@@ -15142,7 +15144,7 @@ int main(int argc, char** argv) {
                             // second chain would share the drafter's card with A's last stage (measured: +1 ms a
                             // window when every hedge got one, HG3)
                             if (hedge_draft && H.ready && !H.launched && H.T == 1 && S_mtp >= 2 && !hch_live &&
-                                !A.s1 && A.fr + 2 <= pl_nf && !A.spec &&
+                                !A.s1 && A.fr + 2 <= pl_nf && !A.spec && B.ready && B.p_on >= theta &&
                                 A.T + 1 <= S_mtp + 1 && A.T + 1 < strata::kernels::kVerifyMaxT) {
                                 int32_t f[16] = {};
                                 for (int i = 1; i < A.T; ++i) f[i - 1] = A.tok[i];
