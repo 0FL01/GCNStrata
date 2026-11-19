@@ -153,6 +153,12 @@ public:
     bool chain_live() const { return chain_live_; }
     const int32_t* chain_tok() const { return chain_tok_; }
     const float* chain_prob() const { return chain_prob_; }
+    /// --pipeline-windows hedge (hedge_on()): each chain output's runner-up under the draft layer and its probability
+    /// (-1 / 0 when off)
+    const int32_t* chain_tok2() const { return chain_tok2_; }
+    const float* chain_prob2() const { return chain_prob2_; }
+    /// STRATA_GFX906_HEDGE != 0 or STRATA_PIPELINE_HEDGE_DIAG=1: the chain graphs also record each output's runner-up
+    static bool hedge_on();
 
     double ms_draft = 0, ms_prefill = 0;
     double ms_src = 0;      ///< the host time spent staging the source rows (a cross-card copy when the drafter is on another card)
@@ -236,6 +242,13 @@ private:
     int steps_seen_ = 0, chain_n_ = 0, chain_early_ = 0;
     int32_t chain_tok_[8] = {};
     float chain_prob_[8] = {};
+    int32_t chain_tok2_[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+    float chain_prob2_[8] = {};
+    bool top2_on_ = false;            // hedge_on() at load: ids2_ / probs2_ and the mapped runner-up outputs exist
+    int32_t* ids2_ = nullptr;
+    float* probs2_ = nullptr;
+    int32_t *h_out2_ = nullptr, *m_out2_ = nullptr;
+    float *h_prob2_ = nullptr, *m_prob2_ = nullptr;
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;

@@ -146,6 +146,14 @@ void ident_hits(const int32_t* ids, int n, int32_t* slot, int32_t* dst, int32_t*
 void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const int32_t* row_dev, float* R_dst,
                 int32_t* tok_dst, int32_t* out, int j, void* stream, const float* probs = nullptr,
                 float* out_p = nullptr);
+/// --pipeline-windows hedge: ids2[t] = row t's runner-up (the largest logit other than ids[t], lower index on ties,
+/// NaN never), through `map` (subset -> token id; null: identity), probs2[t] = probs[t] * exp(l2 - l[ids[t]]).
+/// Call before ids are mapped.  Graph-capturable.
+void row_top2(const float* logits, int n_rows, int n_vocab, const int32_t* ids, const float* probs, const int32_t* map,
+              int32_t* ids2, float* probs2, void* stream);
+/// out2[j] = ids2[*row_dev], outp2[j] = probs2[*row_dev] (mapped host memory, as mtp_select's out / out_p).
+void mtp_pick2(const int32_t* ids2, const float* probs2, const int32_t* row_dev, int32_t* out2, float* outp2, int j,
+               void* stream);
 /// --pipeline-windows, the drafter's chain teacher forced: `*tok = force[j]` when force[j] >= 0 (`force` is mapped
 /// host memory, read when the kernel runs), else `*tok` is left as it is.
 void force_token(int32_t* tok, const int32_t* force, int j, void* stream);

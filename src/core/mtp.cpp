@@ -166,7 +166,7 @@ MtpDrafter::~MtpDrafter() {
     if (head_borrow_reservation_) cudaFree(head_borrow_reservation_);
     if (ev_chain_) cudaEventDestroy(ev_chain_);
     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
-    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_};
+    void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_, h_out2_, h_prob2_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
 }
 
@@ -390,6 +390,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
               mapped(T * 4 + 64, (void**) &h_out_, (void**) &m_out_) &&
               mapped(T * 4 + 64, (void**) &h_prob_, (void**) &m_prob_) &&
               (!force_on_ || mapped(64, (void**) &h_force_, (void**) &m_force_));
+    top2_on_ = force_on_ && hedge_on();
+    if (ok && top2_on_)
+        ok = mapped(T * 4 + 64, (void**) &h_out2_, (void**) &m_out2_) && mapped(T * 4 + 64, (void**) &h_prob2_, (void**) &m_prob2_);
     if (!ok) { err = "mtp: mapped staging failed"; return false; }
     if (h_force_ != nullptr) for (int j = 0; j < 16; ++j) h_force_[j] = -1;
     auto carve = [&](Bump& b) {
@@ -424,6 +427,10 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         x_bf16_ = b.take<uint16_t>(N);
         out_ids_ = b.take<int32_t>(T + 4);
         probs_ = b.take<float>(T + 4);
+        if (top2_on_) {
+            ids2_ = b.take<int32_t>(T + 4);
+            probs2_ = b.take<float>(T + 4);
+        }
         arg_scratch_ = b.take<uint8_t>(strata::kernels::argmax_rows_scratch_bytes((int) T));
         top_scratch_ = b.take<uint8_t>(strata::kernels::row_top_prob_scratch_bytes((int) T));
         dummy_inj_ = b.take<float>(HC);
@@ -521,6 +528,15 @@ bool full_head_env() {
     return on;
 }
 }  // namespace
+
+bool MtpDrafter::hedge_on() {
+    static const bool on = [] {
+        const char* h = std::getenv("STRATA_GFX906_HEDGE");
+        const char* d = std::getenv("STRATA_PIPELINE_HEDGE_DIAG");
+        return (h != nullptr && std::atoi(h) != 0) || (d != nullptr && d[0] == '1');
+    }();
+    return on;
+}
 
 bool MtpDrafter::top2_env() {
     static const bool on = [] { const char* v = std::getenv("STRATA_MTP_TOP2"); return v && v[0] == '1'; }();
@@ -1375,6 +1391,7 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         }
         if (multi_block_head_ops()) row_top_prob_split(head_logits_, T, (int) nv, out_ids_, probs_, top_scratch_, cs);
         else row_top_prob(head_logits_, T, (int) nv, out_ids_, probs_, cs);
+        if (top2_on_) row_top2(head_logits_, T, (int) nv, out_ids_, probs_, sub ? dvocab_ : nullptr, ids2_, probs2_, cs);
         if (sub) map_ids(out_ids_, dvocab_, T, cs);
         g_mp.stamp(15, cs);
     } catch (const std::exception& e) {
@@ -1466,6 +1483,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
         coupled_rec_ = false;
     }
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
+    if (ok && top2_on_) mtp_pick2(ids2_, probs2_, row_ + 1, m_out2_, m_prob2_, 0, cs_);
     if (ok) g_mp.stamp(16, cs_);
     g_mp.base = -1;
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
@@ -1496,6 +1514,7 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     bool ok = record_forward(1, row, cs_, err);
     coupled_rec_ = false;
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
+    if (ok && top2_on_) mtp_pick2(ids2_, probs2_, row_ + 1, m_out2_, m_prob2_, j, cs_);
     if (ok) g_mp.stamp(16, cs_);
     g_mp.base = -1;
     if (ok && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
@@ -1987,6 +2006,10 @@ int MtpDrafter::chain_outputs_ready(std::string& err) {
         if (q != cudaSuccess) { err = std::string("mtp chain: ") + cudaGetErrorString(q); return -1; }
         chain_tok_[steps_seen_] = ((volatile int32_t*) h_out_)[steps_seen_];
         chain_prob_[steps_seen_] = ((volatile float*) h_prob_)[steps_seen_];
+        if (top2_on_) {
+            chain_tok2_[steps_seen_] = ((volatile int32_t*) h_out2_)[steps_seen_];
+            chain_prob2_[steps_seen_] = ((volatile float*) h_prob2_)[steps_seen_];
+        }
         ++steps_seen_;
     }
     return steps_seen_;
@@ -2002,8 +2025,10 @@ int MtpDrafter::chain_poll(std::string& err) {
     for (int j = 0; j < chain_n_; ++j) {
         chain_tok_[j] = ((volatile int32_t*) h_out_)[j];
         chain_prob_[j] = ((volatile float*) h_prob_)[j];
+        chain_tok2_[j] = top2_on_ ? ((volatile int32_t*) h_out2_)[j] : -1;
+        chain_prob2_[j] = top2_on_ ? ((volatile float*) h_prob2_)[j] : 0.0f;
     }
-    for (int j = chain_n_; j < 8; ++j) { chain_tok_[j] = 0; chain_prob_[j] = 0.0f; }
+    for (int j = chain_n_; j < 8; ++j) { chain_tok_[j] = 0; chain_prob_[j] = 0.0f; chain_tok2_[j] = -1; chain_prob2_[j] = 0.0f; }
     return 1;
 }
 

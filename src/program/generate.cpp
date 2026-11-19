@@ -14553,6 +14553,11 @@ int main(int argc, char** argv) {
                     bool made = false;     // made from a chain (its outcome can be scored even when the gate held it)
                     bool sfx = false;      // a lookup window (the suffix drafter's drafts)
                     int sfx_match = 0;
+                    // hedge (MtpDrafter::hedge_on): alt[i] the drafter's runner-up for tok[i], altp[i] its probability,
+                    // p0 the drafter's probability of tok[0] (alt[0] / p0 only for a window made from a chain)
+                    int32_t alt[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
+                    float altp[8] = {};
+                    float p0 = 0.0f;
                 };
                 // front stage `st`'s verifier of w's parity, and the last stage's
                 auto VF = [&](int st, const PW& w) -> strata::core::Verifier& { return stage_ver_p(st, w.seq & 1); };
@@ -14560,6 +14565,12 @@ int main(int argc, char** argv) {
                 auto SDf = [&](const PW& w) { return (void*) PSD[w.seq & 1]; };
                 const float theta = pl_theta;
                 const int force_miss = pl_force_miss;
+                const bool hedge_on = strata::core::MtpDrafter::hedge_on();
+                // STRATA_PIPELINE_HEDGE_DIAG: what a runner-up would have caught.  Bonus: A accepted whole, B made from
+                // the chain: scored, B's pick right, wrong, its runner-up right (per decile of the pick's probability,
+                // and of the runner-up's).  Draft: a draft rejected inside A, its runner-up right.
+                int64_t hd_scored = 0, hd_hit1 = 0, hd_miss = 0, hd_hit2 = 0, hd_drej = 0, hd_dhit2 = 0;
+                int64_t hd_miss_p1[10] = {}, hd_hit2_p1[10] = {}, hd_miss_p2[10] = {}, hd_hit2_p2[10] = {};
                 static const bool pl_log = pipe_dbg_env("STRATA_PIPELINE_LOG") != nullptr;
                 // the snapshot of the GDN state window `seq` reads on front stage `st` (overlapped: before its launch
                 // there, on the stage's side stream)
@@ -14666,6 +14677,10 @@ int main(int argc, char** argv) {
                         B.prob[i - 1] = op[base + i];
                     }
                     B.p_on = pa * op[base];
+                    if (hedge_on) {
+                        for (int i = 0; i < B.T; ++i) { B.alt[i] = mtp.chain_tok2()[base + i]; B.altp[i] = mtp.chain_prob2()[base + i]; }
+                        B.p0 = op[base];
+                    }
                     if (force_miss > 0 && ++pl_fm % force_miss == 0) B.tok[0] = B.tok[0] == 0 ? 1 : 0;
                     B.ready = true;
                     B.made = true;
@@ -14770,6 +14785,7 @@ int main(int argc, char** argv) {
                     }
                     w.sfx = true;
                     w.sfx_match = match;
+                    for (int i = 0; i < 8; ++i) w.alt[i] = -1;
                     const int rest = k - (w.T - 1);   // lookup tokens past w: B's row 0 (w's bonus guess) and its drafts
                     if (&w == &A && rest >= 1 && pl_lookup_pon > 0.0f && !b_done) {
                         B = PW{};
@@ -14883,6 +14899,8 @@ int main(int argc, char** argv) {
                                 for (int i = 1; i < A.T; ++i) {
                                     A.tok[i] = mtp.chain_tok()[i - 1];
                                     A.prob[i - 1] = mtp.chain_prob()[i - 1];
+                                    A.alt[i] = mtp.chain_tok2()[i - 1];
+                                    A.altp[i] = mtp.chain_prob2()[i - 1];
                                 }
                                 pick_lookup(A, mtp.chain_tok());
                                 A.ready = true;
@@ -14900,6 +14918,8 @@ int main(int argc, char** argv) {
                             for (int i = 1; i < A.T; ++i) {
                                 A.tok[i] = oc[i - 1];
                                 A.prob[i - 1] = op[i - 1];
+                                A.alt[i] = mtp.chain_tok2()[i - 1];
+                                A.altp[i] = mtp.chain_prob2()[i - 1];
                             }
                             pick_lookup(A, oc);
                             A.ready = true;
@@ -15049,6 +15069,26 @@ int main(int argc, char** argv) {
                         cal_on[bin] += would ? 1 : 0;
                     }
                     tre("V", A.seq, a, on ? 1 : (B.launched ? -1 : 0));
+                    if (hedge_on && !nf && !A.sfx) {
+                        if (a < A.T - 1) {
+                            ++hd_drej;
+                            if (A.alt[a + 1] == outp[(size_t) a]) ++hd_dhit2;
+                        } else if (B.made && !B.sfx) {
+                            ++hd_scored;
+                            const int32_t y = outp[(size_t) A.T - 1];
+                            if (B.tok[0] == y) ++hd_hit1;
+                            else {
+                                const int b1 = std::min(9, std::max(0, (int) (B.p0 * 10.0f)));
+                                const int b2 = std::min(9, std::max(0, (int) (B.altp[0] * 10.0f)));
+                                ++hd_miss;
+                                ++hd_miss_p1[b1];
+                                ++hd_miss_p2[b2];
+                                if (B.alt[0] == y) { ++hd_hit2; ++hd_hit2_p1[b1]; ++hd_hit2_p2[b2]; }
+                            }
+                            tre("H", A.seq, B.tok[0] == y ? 1 : B.alt[0] == y ? 2 : 0,
+                                (int) (1000.0f * B.p0) * 1000 + (int) (999.0f * B.altp[0]));
+                        }
+                    }
                     {
                         const double now = ms_now();
                         const int c = A.spec ? 1 : 0;
@@ -15172,6 +15212,21 @@ int main(int argc, char** argv) {
                             cal += b;
                         }
                     std::fprintf(stderr, "strata pipeline calibration (p_on decile: on/scored):%s\n", cal.c_str());
+                    if (hedge_on) {
+                        std::string h1, h2;
+                        for (int i = 0; i < 10; ++i) {
+                            std::snprintf(b, sizeof b, " %.1f:%lld/%lld", i / 10.0, (long long) hd_hit2_p1[i], (long long) hd_miss_p1[i]);
+                            h1 += b;
+                            std::snprintf(b, sizeof b, " %.1f:%lld/%lld", i / 10.0, (long long) hd_hit2_p2[i], (long long) hd_miss_p2[i]);
+                            h2 += b;
+                        }
+                        std::fprintf(stderr, "strata pipeline hedge: bonus scored %lld, pick right %lld, wrong %lld, runner-up right "
+                                             "%lld; drafts rejected %lld, runner-up right %lld\n", (long long) hd_scored,
+                                     (long long) hd_hit1, (long long) hd_miss, (long long) hd_hit2, (long long) hd_drej,
+                                     (long long) hd_dhit2);
+                        std::fprintf(stderr, "strata pipeline hedge: wrong bonus by pick p (runner-up right/wrong):%s\n", h1.c_str());
+                        std::fprintf(stderr, "strata pipeline hedge: wrong bonus by runner-up p:%s\n", h2.c_str());
+                    }
                 }
             }
             const strata::core::Verifier::PrimaryCommitContext primary_context{

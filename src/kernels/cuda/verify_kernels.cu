@@ -676,6 +676,55 @@ __global__ void mtp_select_kernel(const float* __restrict__ R_src, int64_t strid
     }
 }
 
+// --pipeline-windows hedge (STRATA_GFX906_HEDGE / STRATA_PIPELINE_HEDGE_DIAG): each row's runner-up - the largest
+// logit other than the row's pick ids[t] (ties to the lower index, NaN never picked) - mapped through `map` (a subset
+// index back to a token id; null: identity), and its probability p1 * exp(l2 - l1) from the pick's p1 = probs[t]
+__global__ void row_top2_kernel(const float* __restrict__ logits, int n_vocab, const int32_t* __restrict__ ids,
+                                const float* __restrict__ probs, const int32_t* __restrict__ map, int32_t* __restrict__ ids2,
+                                float* __restrict__ probs2) {
+    const int t = blockIdx.x;
+    const float* l = logits + (size_t) t * n_vocab;
+    const int skip = ids[t];
+    float bv = 0.0f;
+    int bi = -1;
+    for (int i = threadIdx.x; i < n_vocab; i += blockDim.x) {
+        const float v = l[i];
+        if (i == skip || !(v == v)) continue;
+        if (bi < 0 || v > bv) { bv = v; bi = i; }   // ascending i per thread: equality keeps the lower index
+    }
+    __shared__ float sv[256];
+    __shared__ int si[256];
+    sv[threadIdx.x] = bv;
+    si[threadIdx.x] = bi;
+    __syncthreads();
+    for (int st = blockDim.x / 2; st > 0; st >>= 1) {
+        if ((int) threadIdx.x < st) {
+            const float v = sv[threadIdx.x + st];
+            const int i = si[threadIdx.x + st], m = si[threadIdx.x];
+            if (i >= 0 && (m < 0 || v > sv[threadIdx.x] || (v == sv[threadIdx.x] && i < m))) {
+                sv[threadIdx.x] = v;
+                si[threadIdx.x] = i;
+            }
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const int i = si[0];
+        const bool ok = i >= 0 && skip >= 0 && skip < n_vocab;
+        ids2[t] = !ok ? -1 : (map != nullptr ? map[i] : i);
+        probs2[t] = !ok ? 0.0f : probs[t] * __expf(sv[0] - l[skip]);
+    }
+}
+
+// the chain's runner-up for output j: row *row_dev's, to the mapped outputs (as mtp_select does the pick)
+__global__ void mtp_pick2_kernel(const int32_t* __restrict__ ids2, const float* __restrict__ probs2,
+                                 const int32_t* __restrict__ row_dev, int32_t* out2, float* outp2, int j) {
+    const int row = *row_dev;
+    ((volatile float*) outp2)[j] = probs2[row];
+    __threadfence_system();
+    ((volatile int32_t*) out2)[j] = ids2[row];
+}
+
 __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int32_t* __restrict__ steps) {
     const int i = threadIdx.x;
     if (i >= n) return;
@@ -747,6 +796,18 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
     mtp_select_kernel<<<1, 256, 0, (cudaStream_t) stream>>>(R_src, R_stride, ids, row_dev, R_dst, tok_dst, out, j,
                                                             probs, out_p);
     check("mtp_select");
+}
+
+void row_top2(const float* logits, int n_rows, int n_vocab, const int32_t* ids, const float* probs, const int32_t* map,
+              int32_t* ids2, float* probs2, void* stream) {
+    row_top2_kernel<<<n_rows, 256, 0, (cudaStream_t) stream>>>(logits, n_vocab, ids, probs, map, ids2, probs2);
+    check("row_top2");
+}
+
+void mtp_pick2(const int32_t* ids2, const float* probs2, const int32_t* row_dev, int32_t* out2, float* outp2, int j,
+               void* stream) {
+    mtp_pick2_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(ids2, probs2, row_dev, out2, outp2, j);
+    check("mtp_pick2");
 }
 
 void force_token(int32_t* tok, const int32_t* force, int j, void* stream) {
