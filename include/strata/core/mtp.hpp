@@ -159,6 +159,19 @@ public:
     const float* chain_prob2() const { return chain_prob2_; }
     /// STRATA_GFX906_HEDGE != 0 or STRATA_PIPELINE_HEDGE_DIAG=1: the chain graphs also record each output's runner-up
     static bool hedge_on();
+    /// --pipeline-windows hedge: every chain also keeps the residual it has after each output (before prepare_chain)
+    void set_keep_rin(bool on) { keep_rin_ = on; }
+    /// Step j of the last chain again, its input token `tok` instead of output j - 1, from the residual the chain had
+    /// after output j - 1 (its cells as the chain staged them; its other outputs stand, output j is replaced): the
+    /// pick lands in branch_tok() / branch_prob() (runner-up branch_tok2 / branch_prob2).  Not beside a chain.
+    bool branch_launch(int j, int32_t tok, std::string& err);
+    /// 1: the branch step is done (its outputs read), 0: running, -1: an error
+    int branch_poll(std::string& err);
+    bool branch_live() const { return branch_live_; }
+    int32_t branch_tok() const { return branch_tok_; }
+    float branch_prob() const { return branch_prob_; }
+    int32_t branch_tok2() const { return branch_tok2_; }
+    float branch_prob2() const { return branch_prob2_; }
 
     double ms_draft = 0, ms_prefill = 0;
     double ms_src = 0;      ///< the host time spent staging the source rows (a cross-card copy when the drafter is on another card)
@@ -245,6 +258,12 @@ private:
     int32_t chain_tok2_[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
     float chain_prob2_[8] = {};
     bool top2_on_ = false;            // hedge_on() at load: ids2_ / probs2_ and the mapped runner-up outputs exist
+    bool keep_rin_ = false, branch_live_ = false;
+    float* rin_keep_ = nullptr;       // max_t rows: the chain's residual after each output
+    cudaEvent_t ev_branch_ = nullptr;
+    int branch_j_ = 0;
+    int32_t branch_tok_ = -1, branch_tok2_ = -1;
+    float branch_prob_ = 0.0f, branch_prob2_ = 0.0f;
     int32_t* ids2_ = nullptr;
     float* probs2_ = nullptr;
     int32_t *h_out2_ = nullptr, *m_out2_ = nullptr;

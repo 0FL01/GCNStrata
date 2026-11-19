@@ -8902,6 +8902,7 @@ int main(int argc, char** argv) {
             // the setters reach the later stages; the pipeline never chains run/commit
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
             if (pl_hedge) {   // the third lane: its verifiers and hand-offs, as the odd windows'
+                mtp.set_keep_rin(true);   // the hedge's draft: one chain step again (before prepare_chain)
                 std::vector<size_t> free0((size_t) n_stages, 0);
                 for (int st = 0; st < n_stages; ++st) {
                     const strata::core::OnDevice on(stage_ver_p(st, 0).device());
@@ -14696,7 +14697,9 @@ int main(int argc, char** argv) {
                 // the hedge's draft: a second chain over the same catch-up as the one that made B, forced through A's
                 // drafts and H's token, once that chain is done (the drafter's card idles while A is on the front
                 // stages); STRATA_GFX906_HEDGE_DRAFT=0: H stays one row
-                static const bool hedge_draft = [] { const char* v = std::getenv("STRATA_GFX906_HEDGE_DRAFT"); return v == nullptr || std::atoi(v) != 0; }();
+                // 1: only behind a fresh A on stage 0/1 (the full second chain); 2 (default): one step of the chain again
+                // (MtpDrafter::branch_launch), behind any A
+                static const int hedge_draft = [] { const char* v = std::getenv("STRATA_GFX906_HEDGE_DRAFT"); return v ? std::atoi(v) : 2; }();
                 bool hch_live = false;
                 int ch_T = 0, ch_a = 0;
                 int64_t ch_p = 0;
@@ -14970,17 +14973,18 @@ int main(int argc, char** argv) {
                 // the hedge chain: once done, H takes its draft (the serial rule: below spec_min_p it stays one row)
                 auto hch_poll = [&](bool wait) -> bool {
                     while (hch_live) {
-                        const int r2 = mtp.chain_poll(err);
+                        const bool br = hedge_draft >= 2;
+                        const int r2 = br ? mtp.branch_poll(err) : mtp.chain_poll(err);
                         if (r2 < 0) return false;
                         if (r2 == 1) {
                             hch_live = false;
                             const int j = A.T;
-                            const float pd = mtp.chain_prob()[j];
+                            const float pd = br ? mtp.branch_prob() : mtp.chain_prob()[j];
                             if (H.ready && !H.launched && H.T == 1 && (req_spec_min_p <= 0.0 || pd >= (float) req_spec_min_p)) {
-                                H.tok[1] = mtp.chain_tok()[j];
+                                H.tok[1] = br ? mtp.branch_tok() : mtp.chain_tok()[j];
                                 H.prob[0] = pd;
-                                H.alt[1] = mtp.chain_tok2()[j];
-                                H.altp[1] = mtp.chain_prob2()[j];
+                                H.alt[1] = br ? mtp.branch_tok2() : mtp.chain_tok2()[j];
+                                H.altp[1] = br ? mtp.branch_prob2() : mtp.chain_prob2()[j];
                                 H.T = 2;
                                 ++pl_hedge_t2;
                             }
@@ -15143,14 +15147,18 @@ int main(int argc, char** argv) {
                             // only while A has the front stages ahead of it (a fresh A on stage 0 or 1): later, the
                             // second chain would share the drafter's card with A's last stage (measured: +1 ms a
                             // window when every hedge got one, HG3)
-                            if (hedge_draft && H.ready && !H.launched && H.T == 1 && S_mtp >= 2 && !hch_live &&
-                                !A.s1 && A.fr + 2 <= pl_nf && !A.spec && B.ready && B.p_on >= theta &&
-                                A.T + 1 <= S_mtp + 1 && A.T + 1 < strata::kernels::kVerifyMaxT) {
-                                int32_t f[16] = {};
-                                for (int i = 1; i < A.T; ++i) f[i - 1] = A.tok[i];
-                                f[A.T - 1] = H.tok[0];
-                                if (!mtp.chain_launch(ch_T, ch_tok, ch_p, ch_a, f, A.T, A.T + 1, A.T + 1, err)) return die(err);
-                                hch_live = true;
+                            if (hedge_draft > 0 && H.ready && !H.launched && H.T == 1 && S_mtp >= 2 && !hch_live &&
+                                B.ready && B.p_on >= theta && A.T + 1 < strata::kernels::kVerifyMaxT) {
+                                if (hedge_draft >= 2) {
+                                    if (!mtp.branch_launch(A.T, H.tok[0], err)) return die(err);
+                                    hch_live = true;
+                                } else if (!A.s1 && A.fr + 2 <= pl_nf && !A.spec) {
+                                    int32_t f[16] = {};
+                                    for (int i = 1; i < A.T; ++i) f[i - 1] = A.tok[i];
+                                    f[A.T - 1] = H.tok[0];
+                                    if (!mtp.chain_launch(ch_T, ch_tok, ch_p, ch_a, f, A.T, A.T + 1, A.T + 1, err)) return die(err);
+                                    hch_live = true;
+                                }
                             }
                         }
                     }
@@ -15459,6 +15467,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 while (mtp.chain_live() && mtp.chain_poll(err) == 0) {}
+                while (mtp.branch_live() && mtp.branch_poll(err) == 0) {}   // a hedge's draft step (its flag cleared)
                 mtp.set_source_R(ver.final_R_all());   // the serial loop's rows again
                 const double pl_ms = std::chrono::duration<double, std::milli>(Clock::now() - pl_t0).count();
                 dt_run += pl_ms;

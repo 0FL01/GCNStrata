@@ -165,6 +165,8 @@ MtpDrafter::~MtpDrafter() {
     // Reservation is never referenced by a kernel or graph. Destroy graph users first on error unwind.
     if (head_borrow_reservation_) cudaFree(head_borrow_reservation_);
     if (ev_chain_) cudaEventDestroy(ev_chain_);
+    if (ev_branch_) cudaEventDestroy(ev_branch_);
+    if (rin_keep_) cudaFree(rin_keep_);
     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_, h_out2_, h_prob2_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
@@ -1941,13 +1943,22 @@ bool MtpDrafter::prepare_chain(std::string& err) {
             err = "mtp: event creation failed";
             return false;
         }
+    if (keep_rin_) {
+        const size_t bytes = (size_t) max_t_ * (size_t) (g_->hc * g_->n_embd) * sizeof(float);
+        if ((rin_keep_ == nullptr && cudaMalloc((void**) &rin_keep_, bytes) != cudaSuccess) ||
+            (ev_branch_ == nullptr && cudaEventCreateWithFlags(&ev_branch_, cudaEventDisableTiming) != cudaSuccess)) {
+            cudaGetLastError();
+            err = "mtp: the hedge's residual rows do not fit";
+            return false;
+        }
+    }
     return true;
 }
 
 bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, const int32_t* force, int n_force,
                               int n_out, int n_early, std::string& err) {
     const OnDevice on_device(device_);
-    if (chain_live_) { err = "mtp: a chain is already in flight"; return false; }
+    if (chain_live_ || branch_live_) { err = "mtp: a chain is already in flight"; return false; }
     if (!force_on_ || ev_chain_ == nullptr) { err = "mtp: chains need prepare_chain"; return false; }
     if (T < 1 || T > max_t_ || a < 0 || a >= T || n_out < 1 || n_out > max_t_ - 1 || n_force < 0 || n_force > n_out ||
         n_force > 16) {
@@ -1978,10 +1989,16 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!stage_source_R(T, err)) return false;
     chain_early_ = std::max(0, std::min(n_early, n_out));
+    const size_t HCN = (size_t) (g_->hc * g_->n_embd);
+    const bool keep = keep_rin_ && rin_keep_ != nullptr;   // the residual after each output (branch_launch)
     bool ok = cudaGraphLaunch(round_exec_[T], cs_) == cudaSuccess;
+    if (ok && keep) ok = cudaMemcpyAsync(rin_keep_, Rin_, HCN * sizeof(float), cudaMemcpyDeviceToDevice, cs_) == cudaSuccess;
     if (ok && chain_early_ >= 1) ok = cudaEventRecord(ev_step_[0], cs_) == cudaSuccess;
     for (int j = 1; ok && j < n_out; ++j) {
         ok = cudaGraphLaunch(step_exec_[j], cs_) == cudaSuccess;
+        if (ok && keep)
+            ok = cudaMemcpyAsync(rin_keep_ + (size_t) j * HCN, Rin_, HCN * sizeof(float), cudaMemcpyDeviceToDevice, cs_) ==
+                 cudaSuccess;
         if (ok && j < chain_early_) ok = cudaEventRecord(ev_step_[j], cs_) == cudaSuccess;
     }
     if (!ok || cudaEventRecord(ev_chain_, cs_) != cudaSuccess) {
@@ -1995,6 +2012,52 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     ms_draft += ms_since(t0);
     ++rounds;
     return true;
+}
+
+bool MtpDrafter::branch_launch(int j, int32_t tok, std::string& err) {
+    const OnDevice on_device(device_);
+    if (chain_live_ || branch_live_) { err = "mtp: a chain is already in flight"; return false; }
+    if (!keep_rin_ || rin_keep_ == nullptr || ev_branch_ == nullptr || j < 1 || j >= chain_n_ || j > max_t_ - 2 ||
+        step_exec_[j] == nullptr) {
+        err = "mtp: branch arguments out of range";
+        return false;
+    }
+    const size_t HCN = (size_t) (g_->hc * g_->n_embd);
+    ((volatile int32_t*) h_force_)[15] = tok;   // slot 15: never a chain's force (n_force <= max_t - 1)
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    bool ok = cudaMemcpyAsync(Rin_, rin_keep_ + (size_t) (j - 1) * HCN, HCN * sizeof(float), cudaMemcpyDeviceToDevice,
+                              cs_) == cudaSuccess;
+    if (ok) {
+        try {
+            strata::kernels::copy_i32_from_mapped(tok_, m_force_ + 15, 1, cs_);
+        } catch (const std::exception& e) {
+            err = std::string("mtp branch: ") + e.what();
+            return false;
+        }
+    }
+    ok = ok && cudaGraphLaunch(step_exec_[j], cs_) == cudaSuccess && cudaEventRecord(ev_branch_, cs_) == cudaSuccess;
+    if (!ok) {
+        err = std::string("mtp branch: ") + cudaGetErrorString(cudaGetLastError());
+        return false;
+    }
+    (void) cudaStreamQuery(cs_);
+    branch_live_ = true;
+    branch_j_ = j;
+    return true;
+}
+
+int MtpDrafter::branch_poll(std::string& err) {
+    if (!branch_live_) return 1;
+    const OnDevice on_device(device_);
+    const cudaError_t q = cudaEventQuery(ev_branch_);
+    if (q == cudaErrorNotReady) return 0;
+    branch_live_ = false;
+    if (q != cudaSuccess) { err = std::string("mtp branch: ") + cudaGetErrorString(q); return -1; }
+    branch_tok_ = ((volatile int32_t*) h_out_)[branch_j_];
+    branch_prob_ = ((volatile float*) h_prob_)[branch_j_];
+    branch_tok2_ = top2_on_ ? ((volatile int32_t*) h_out2_)[branch_j_] : -1;
+    branch_prob2_ = top2_on_ ? ((volatile float*) h_prob2_)[branch_j_] : 0.0f;
+    return 1;
 }
 
 int MtpDrafter::chain_outputs_ready(std::string& err) {
