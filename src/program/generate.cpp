@@ -4511,7 +4511,8 @@ int main(int argc, char** argv) {
     // estimate).  Allocated after the caches, so kept out of them.
     const bool pl_hedge_cfg = o.pipeline_windows >= 2 && hedge_run_env();   // the hedge's third lane (if the pipeline runs)
     // hedge: a third verifier everywhere (160) and, on a later front stage, a third GDN snapshot (~3 MiB per GDN layer)
-    const int64_t kPipeWindowMib = o.pipeline_windows > 0 ? (pl_hedge_cfg ? 384 : 160) : 0;
+    // (measured on B3: the third verifier takes 80 MiB a card; the snapshot 30-40 MiB on a front stage)
+    const int64_t kPipeWindowMib = o.pipeline_windows > 0 ? (pl_hedge_cfg ? 288 : 160) : 0;
     const int64_t kPipeSnapMib = o.pipeline_windows >= 2 ? (pl_hedge_cfg ? 144 : 96) : 0;   // ~3 MiB per GDN layer, two (three) copies
     const int64_t kPipeSnapCopies = pl_hedge_cfg ? 3 : 2;
     auto gdn_snapshot_bytes = [&](const strata::core::SessionState& s0) -> size_t {
@@ -15137,7 +15138,11 @@ int main(int argc, char** argv) {
                             chain_kind = 0;
                             // the main chain is done (B made): H's draft from a second chain, its step A.T forced to
                             // H's token (the steps before it forced to A's drafts: the same inputs as the main chain's)
+                            // only while A has the front stages ahead of it (a fresh A on stage 0 or 1): later, the
+                            // second chain would share the drafter's card with A's last stage (measured: +1 ms a
+                            // window when every hedge got one, HG3)
                             if (hedge_draft && H.ready && !H.launched && H.T == 1 && S_mtp >= 2 && !hch_live &&
+                                !A.s1 && A.fr + 2 <= pl_nf && !A.spec &&
                                 A.T + 1 <= S_mtp + 1 && A.T + 1 < strata::kernels::kVerifyMaxT) {
                                 int32_t f[16] = {};
                                 for (int i = 1; i < A.T; ++i) f[i - 1] = A.tok[i];
