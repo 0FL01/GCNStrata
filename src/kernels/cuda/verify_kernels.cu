@@ -712,7 +712,8 @@ __global__ void row_top2_kernel(const float* __restrict__ logits, int n_vocab, c
         const int i = si[0];
         const bool ok = i >= 0 && skip >= 0 && skip < n_vocab;
         ids2[t] = !ok ? -1 : (map != nullptr ? map[i] : i);
-        probs2[t] = !ok ? 0.0f : probs[t] * __expf(sv[0] - l[skip]);
+        const float q = !ok ? 0.0f : probs[t] * __expf(sv[0] - l[skip]);
+        probs2[t] = q == q ? q : 0.0f;   // a NaN elsewhere in the row (the pick's softmax) never scores a hedge
     }
 }
 

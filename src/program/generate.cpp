@@ -4510,7 +4510,8 @@ int main(int argc, char** argv) {
     // stage's GDN state (sized from its session where the first card's cache is sized; this is the split search's
     // estimate).  Allocated after the caches, so kept out of them.
     const bool pl_hedge_cfg = o.pipeline_windows >= 2 && hedge_run_env();   // the hedge's third lane (if the pipeline runs)
-    const int64_t kPipeWindowMib = o.pipeline_windows > 0 ? (pl_hedge_cfg ? 320 : 160) : 0;
+    // hedge: a third verifier everywhere (160) and, on a later front stage, a third GDN snapshot (~3 MiB per GDN layer)
+    const int64_t kPipeWindowMib = o.pipeline_windows > 0 ? (pl_hedge_cfg ? 384 : 160) : 0;
     const int64_t kPipeSnapMib = o.pipeline_windows >= 2 ? (pl_hedge_cfg ? 144 : 96) : 0;   // ~3 MiB per GDN layer, two (three) copies
     const int64_t kPipeSnapCopies = pl_hedge_cfg ? 3 : 2;
     auto gdn_snapshot_bytes = [&](const strata::core::SessionState& s0) -> size_t {
@@ -9923,6 +9924,7 @@ int main(int argc, char** argv) {
             drive.d.pcie_num = num_of(nf);
             split_drive.pcie_num[0] = drive.d.pcie_num;
             split_drive_b.pcie_num[0] = drive.d.pcie_num;
+            split_drive_c.pcie_num[0] = drive.d.pcie_num;
             for (int st = 1; st < n_stages; ++st) {
                 GpuStage& gs = *stages[(size_t) st - 1];
                 if (!(gs.link_gbps > 0.0)) continue;
@@ -9930,6 +9932,7 @@ int main(int argc, char** argv) {
                                    PcieAuto::kPoolFactor * rate) * 20.0) / 20.0));
                 split_drive.pcie_num[st] = num_of(gs.pcie_frac);
                 split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
+                split_drive_c.pcie_num[st] = split_drive.pcie_num[st];
                 std::fprintf(stderr, "strata serve: PCIe share: stage %d (link %.1f GB/s) -> pcie_frac %.2f\n", st + 1,
                              gs.link_gbps, gs.pcie_frac);
             }
@@ -14301,12 +14304,14 @@ int main(int argc, char** argv) {
             req_sp.penalty_freq = req_penalty_freq;
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
-            if (!ver.set_logit_bias(req_bias, err) || (pipe && !ver_b.set_logit_bias(req_bias, err))) {
+            if (!ver.set_logit_bias(req_bias, err) || (pipe && !ver_b.set_logit_bias(req_bias, err)) ||
+                (pl_hedge && !ver_c.set_logit_bias(req_bias, err))) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
             ver.set_sampling(req_sp);
             if (pipe) ver_b.set_sampling(req_sp);   // (reaches the later stage's odd verifier)
+            if (pl_hedge) ver_c.set_sampling(req_sp);   // the hedge's lane likewise (a hedge on the path is verified as any window)
             if (use_mtp) mtp.set_draft_sampling(req_sp);   // STRATA_SPEC_COUPLED=1: sampled drafts (a no-op otherwise)
             {   // aux_cpus=0|1: where the non-pool, non-host threads run for this request (-1 = the start-up --aux-cpus); moves
                 // threads only.  An enabled placement is swept at every request: it catches threads created since.
@@ -14325,9 +14330,11 @@ int main(int argc, char** argv) {
                 split_drive.pcie_num[st] = (st == 0 || split_same || req_pcie_frac != o.pcie_frac)
                                                ? drive.d.pcie_num : pcie_num_of(stages[(size_t) st - 1]->pcie_frac);
             if (pipe) for (int st = 0; st < split_drive.n; ++st) split_drive_b.pcie_num[st] = split_drive.pcie_num[st];
+            if (pl_hedge) for (int st = 0; st < split_drive.n; ++st) split_drive_c.pcie_num[st] = split_drive.pcie_num[st];
             const int hist_n = std::min(req_sp.penalty_last_n, kPenaltyWindowCap);
             ver.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             if (pipe) ver_b.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
+            if (pl_hedge) ver_c.set_history(hist_n > 0 ? d_hist : nullptr, hist_n);
             bool cancelled = false;
             tr("prompt start", n - 1);
             // The prompt is read in two parts when it has a turn boundary past `resume`: up to the last <|im_start|>
@@ -14966,7 +14973,9 @@ int main(int argc, char** argv) {
                     if (drive.d.failed) return die(drive.d.fail ? drive.d.fail : "the expert pool failed");
                     // ---- a wrong speculative window has stopped (it is launched on no further stage once doomed):
                     // every front stage it ran on back to the verified window's real commit
-                    if (doomed && !D.fl && !doomed_h) {
+                    // (a wrong hedge still in flight is not waited for: its remaining work precedes the undo's on its
+                    // stage's stream, and it never committed)
+                    if (doomed && !D.fl) {
                         for (int st = 0; st < pl_nf; ++st) {
                             if ((undo_w.com & (1u << st)) == 0) continue;
                             PlSnap& sn = pl_snaps[(size_t) st];
@@ -15214,15 +15223,15 @@ int main(int argc, char** argv) {
                             const int32_t y = outp[(size_t) A.T - 1];
                             if (B.tok[0] == y) ++hd_hit1;
                             else {
-                                const int b1 = std::min(9, std::max(0, (int) (B.p0 * 10.0f)));
-                                const int b2 = std::min(9, std::max(0, (int) (B.altp[0] * 10.0f)));
+                                const int b1 = B.p0 == B.p0 ? std::min(9, std::max(0, (int) (B.p0 * 10.0f))) : 0;
+                                const int b2 = B.altp[0] == B.altp[0] ? std::min(9, std::max(0, (int) (B.altp[0] * 10.0f))) : 0;
                                 ++hd_miss;
                                 ++hd_miss_p1[b1];
                                 ++hd_miss_p2[b2];
                                 if (B.alt[0] == y) { ++hd_hit2; ++hd_hit2_p1[b1]; ++hd_hit2_p2[b2]; }
                             }
                             tre("H", A.seq, B.tok[0] == y ? 1 : B.alt[0] == y ? 2 : 0,
-                                (int) (1000.0f * B.p0) * 1000 + (int) (999.0f * B.altp[0]));
+                                b1 * 1000 + b2);
                         }
                     }
                     {
