@@ -327,6 +327,18 @@ public:
     /// The commit without a host sync; `ss.ple_prev` advances now (host side).  A second call for the same window
     /// (after its state was restored) replays it with another count.
     bool pl_commit_async(int n_keep, std::string& err);
+    /// --pipeline-windows hedge (STRATA_GFX906_HEDGE): keep each QSA layer's appended K/V rows of the window in
+    /// flight (set before init; the window graphs copy them aside), so kv_reappend can write them again after a later
+    /// window on another verifier wrote the same positions.
+    void set_kv_keep(bool on) { kv_keep_on_ = on; }
+    /// The last window's K/V rows appended again from the kept copy (the same append, bit for bit), on the stream.
+    bool kv_reappend(std::string& err);
+    /// The session's indexer tails back to what this verifier's last window saw before its rows (its own snapshot,
+    /// as its commit restores them), on the stream.
+    bool idx_tail_restore(std::string& err);
+    /// The PLE stage: the session's GPU PLE history as after row keep - 1 of this verifier's last window (what its
+    /// commit with `keep` copies), on the stream; nothing on other stages.
+    bool ple_hist_restore(int keep, std::string& err);
     /// Fold another verifier's counters and GPU profile into this one's (the two verifiers of one stage report once).
     void absorb_stats(Verifier& o);
     /// The watchdog's line for a pipelined verifier: in flight, layers served, the GPU's ring and flags, its events.
@@ -625,6 +637,8 @@ private:
     float *qfull_ = nullptr, *qcur_ = nullptr, *kcur_ = nullptr, *vcur_ = nullptr, *idx_raw_L_ = nullptr;
     float *qidx_ = nullptr, *scores_ = nullptr, *attn_ = nullptr, *attn32_ = nullptr, *attn_scratch_ = nullptr;
     float* tail_snap_ = nullptr;                              // per QSA layer
+    bool kv_keep_on_ = false;
+    float *kv_keep_k_ = nullptr, *kv_keep_v_ = nullptr;      // hedge: per QSA layer, max_t rows of the K/V appended
     int32_t* sel_ = nullptr;
     float *logits_ = nullptr, *w_ = nullptr, *shared_ = nullptr, *parts_ = nullptr, *hit_out_ = nullptr;
     int32_t *ids_ = nullptr, *hit_slot_ = nullptr, *hit_dst_ = nullptr, *hit_count_ = nullptr;

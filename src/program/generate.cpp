@@ -491,6 +491,14 @@ using Clock = std::chrono::steady_clock;
 // --pipeline-windows: every STRATA_PIPELINE_* test and tuning variable (THETA, FORCE_MISS, SWITCH, LOG, TRACE, DOOM_SKIP,
 // LOOKUP_PON, PRESTAGE, AGREE, SNAP_OVERLAP, SPEC_DEPTH) is read only with STRATA_PIPELINE_DEBUG=1; without it the
 // defaults apply.
+// --pipeline-windows 2 hedge (STRATA_GFX906_HEDGE=1): a third window per front stage behind the speculative one, at
+// its position with the drafter's runner-up for its first token, so a wrong bonus guess the runner-up catches is not a
+// fresh window.  The third lane's verifiers, hand-offs and snapshots are allocated only with it.
+static bool hedge_run_env() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_GFX906_HEDGE"); return v != nullptr && std::atoi(v) != 0; }();
+    return on;
+}
+
 static const char* pipe_dbg_env(const char* name) {
     static const bool on = [] { const char* v = std::getenv("STRATA_PIPELINE_DEBUG"); return v != nullptr && v[0] != 0 && v[0] != '0'; }();
     return on ? std::getenv(name) : nullptr;
@@ -1365,6 +1373,7 @@ struct GpuStage {
     int32_t* d_res = nullptr;                            ///< the residency table on its device
     strata::core::Verifier ver;
     strata::core::Verifier ver_b;                        ///< --pipeline-windows: the odd windows' verifier
+    strata::core::Verifier ver_c;                        ///< --pipeline-windows hedge: the third lane's verifier
     strata::prefill::Prefill sp;
     cudaStream_t adapt_stream = nullptr;
     cudaEvent_t adapt_ev = nullptr;
@@ -4500,8 +4509,10 @@ int main(int argc, char** argv) {
     // 64 MiB left two RTX 5070 Ti under Linux short of it) and, with the decode pipelined, two copies of the first
     // stage's GDN state (sized from its session where the first card's cache is sized; this is the split search's
     // estimate).  Allocated after the caches, so kept out of them.
-    const int64_t kPipeWindowMib = o.pipeline_windows > 0 ? 160 : 0;
-    const int64_t kPipeSnapMib = o.pipeline_windows >= 2 ? 96 : 0;   // ~3 MiB per GDN layer, twice, ~15 layers
+    const bool pl_hedge_cfg = o.pipeline_windows >= 2 && hedge_run_env();   // the hedge's third lane (if the pipeline runs)
+    const int64_t kPipeWindowMib = o.pipeline_windows > 0 ? (pl_hedge_cfg ? 320 : 160) : 0;
+    const int64_t kPipeSnapMib = o.pipeline_windows >= 2 ? (pl_hedge_cfg ? 144 : 96) : 0;   // ~3 MiB per GDN layer, two (three) copies
+    const int64_t kPipeSnapCopies = pl_hedge_cfg ? 3 : 2;
     auto gdn_snapshot_bytes = [&](const strata::core::SessionState& s0) -> size_t {
         return (size_t) s0.gdn_alloc * ((size_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                         (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1)) * sizeof(float);
@@ -5780,7 +5791,7 @@ int main(int argc, char** argv) {
                         if (stages.empty())
                             for (const auto& d : slot_mtp) mtp_b += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
                         const int64_t pipe_b = o.pipeline_windows <= 0 ? 0
-                            : (kPipeWindowMib << 20) + (o.pipeline_windows >= 2 ? 2 * (int64_t) gdn_snapshot_bytes(ss) : 0);
+                            : (kPipeWindowMib << 20) + (o.pipeline_windows >= 2 ? kPipeSnapCopies * (int64_t) gdn_snapshot_bytes(ss) : 0);
                         const int64_t room = (int64_t) strata::core::device_free_bytes() -
                                              ((((int64_t) o.vram_reserve_mib + pf_mib) << 20) + mtp_b + pipe_b);
                         cap_bytes = room > 0 ? (uint64_t) room : 0;
@@ -5917,7 +5928,7 @@ int main(int argc, char** argv) {
     bool reserve_adapted = false;   // #496: the auto sizing lowered the reserve so a small card's cache fits
     // --pipeline-windows: what it allocates on CUDA0 after the cache (see kPipeWindowMib)
     const int64_t pipe_first = o.pipeline_windows <= 0 ? 0
-        : (kPipeWindowMib << 20) + (o.pipeline_windows >= 2 ? 2 * (int64_t) gdn_snapshot_bytes(ss) : 0);
+        : (kPipeWindowMib << 20) + (o.pipeline_windows >= 2 ? kPipeSnapCopies * (int64_t) gdn_snapshot_bytes(ss) : 0);
     if (pipe_first > 0)
         std::fprintf(stderr, "strata generate: --pipeline-windows %d: %lld MiB of CUDA0 kept out of the expert cache "
                              "(the second verifier%s)\n", o.pipeline_windows, (long long) (pipe_first >> 20),
@@ -8712,13 +8723,16 @@ int main(int argc, char** argv) {
         // K+1 while stage 1 still reads window K's hand-off.  With more stages every stage but the last is a "front"
         // stage: window K+1 follows window K through them one card behind, and only the last stage waits for K's verdict
         const bool pipe = o.pipeline_windows > 0 && n_stages >= 2 && !split_same && (int) stages.size() == n_stages - 1;
-        strata::core::Verifier ver_b;
-        SplitDrive split_drive_b;
+        strata::core::Verifier ver_b, ver_c;
+        SplitDrive split_drive_b, split_drive_c;
         std::vector<cudaStream_t> pl_stream(pipe ? (size_t) n_stages : 0, nullptr);
-        // stage st's verifier of one parity (0: the even windows, 1: the odd ones)
+        const bool pl_hedge = pipe && pl_hedge_cfg;
+        const int pl_lanes = pl_hedge ? 3 : 2;
+        // stage st's verifier of one lane (0, 1: the windows alternate; 2: the hedge's third lane)
         auto stage_ver_p = [&](int st, int par) -> strata::core::Verifier& {
-            if (st == 0) return par == 0 ? ver : ver_b;
-            return par == 0 ? stages[(size_t) st - 1]->ver : stages[(size_t) st - 1]->ver_b;
+            if (st == 0) return par == 0 ? ver : par == 1 ? ver_b : ver_c;
+            GpuStage& gs_ = *stages[(size_t) st - 1];
+            return par == 0 ? gs_.ver : par == 1 ? gs_.ver_b : gs_.ver_c;
         };
         if (pipe) {
             bool ok_p = true;
@@ -8729,9 +8743,11 @@ int main(int argc, char** argv) {
             }
             if (!ok_p) { std::fprintf(stderr, "strata serve: --pipeline-windows: stream creation failed\n"); return 1; }
             for (int st = 0; st < n_stages; ++st)
-                for (int par = 0; par < 2; ++par) {
+                for (int par = 0; par < pl_lanes; ++par) {
                     stage_ver_p(st, par).set_stream(pl_stream[(size_t) st]);
                     stage_ver_p(st, par).set_always_publish(true);
+                    // hedge: a front stage's windows keep their K/V rows (a hedge at the same positions overwrites them)
+                    if (pl_hedge && st + 1 < n_stages) stage_ver_p(st, par).set_kv_keep(true);
                 }
         }
         if (n_stages > 1) {
@@ -8883,6 +8899,44 @@ int main(int argc, char** argv) {
             }
             // the setters reach the later stages; the pipeline never chains run/commit
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
+            if (pl_hedge) {   // the third lane: its verifiers and hand-offs, as the odd windows'
+                std::vector<float*> hand_c((size_t) n_stages - 1, nullptr);
+                for (float*& h : hand_c) {
+                    float* hh = nullptr;
+                    if (cudaHostAlloc((void**) &hh, hb, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                        cudaHostGetDevicePointer((void**) &h, hh, 0) != cudaSuccess) {
+                        std::fprintf(stderr, "strata serve: --pipeline-windows hedge: the third hand-off allocation failed\n");
+                        return 1;
+                    }
+                    std::memset(hh, 0, hb);
+                }
+                ver_c.set_stage(0, split_at[0], nullptr, hand_c[0]);
+                for (int st = 1; st < n_stages; ++st) {
+                    GpuStage& gs = *stages[(size_t) st - 1];
+                    const bool last = st + 1 == n_stages;
+                    gs.ver_c.set_stage(split_at[(size_t) st - 1], last ? -1 : split_at[(size_t) st], hand_c[(size_t) st - 1],
+                                       last ? nullptr : hand_c[(size_t) st]);
+                    const strata::core::OnDevice on(gs.dev);
+                    strata::core::VerifyHits vs;
+                    vs.d_res = gs.d_res;
+                    vs.h_res = host_res.empty() ? nullptr : host_res.data();
+                    vs.cache_base = gs.cache.device_slot(0);
+                    vs.blob = thits.blob;
+                    vs.slot_off = gs.cache.slot_offsets();
+                    vs.n_slots = gs.cache.slots();
+                    if (!gs.ver_c.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, o.spec, err)) {
+                        std::fprintf(stderr, "strata serve: --pipeline-windows hedge: the third verifier on CUDA%d (stage %d): "
+                                             "%s (STRATA_GFX906_HEDGE=0)\n", gs.dev, st + 1, err.c_str());
+                        return 1;
+                    }
+                }
+                if (!ver_c.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
+                    std::fprintf(stderr, "strata serve: --pipeline-windows hedge: the third verifier on CUDA0: %s "
+                                         "(STRATA_GFX906_HEDGE=0)\n", err.c_str());
+                    return 1;
+                }
+                for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 2).set_next(&stage_ver_p(st + 1, 2), &split_drive_c);
+            }
         }
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
@@ -8946,6 +9000,14 @@ int main(int argc, char** argv) {
                 stage_ver_p(st, 1).set_split(o.spec_split);
                 stage_ver_p(st, 1).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
             }
+            if (pl_hedge) {   // the third lane's, likewise
+                split_drive_c = split_drive;
+                for (int st = 0; st < n_stages; ++st) {
+                    split_drive_c.plan[st] = stage_ver_p(st, 2).plan_sink();
+                    stage_ver_p(st, 2).set_split(o.spec_split);
+                    stage_ver_p(st, 2).set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+                }
+            }
         }
         // the pool the verify windows call: with a layer split, the wrapper that routes each layer to its stage
         const strata::core::PoolMultiFn win_pool_fn = n_stages > 1 ? &drive_pool_split : &drive_pool_multi;
@@ -8967,9 +9029,9 @@ int main(int argc, char** argv) {
             int dev = 0;
             size_t bytes = 0;
             void* state = nullptr;            // the stage's GDN state (its session's)
-            float* buf[2] = {nullptr, nullptr};
+            float* buf[3] = {nullptr, nullptr, nullptr};   // per lane (the third with the hedge)
             cudaStream_t side = nullptr;
-            cudaEvent_t pre[2] = {nullptr, nullptr}, ev[2] = {nullptr, nullptr};
+            cudaEvent_t pre[3] = {nullptr, nullptr, nullptr}, ev[3] = {nullptr, nullptr, nullptr};
         };
         const int pl_nf = pipe ? n_stages - 1 : 0;   // the front stages
         std::vector<PlSnap> pl_snaps((size_t) pl_nf);
@@ -8994,8 +9056,9 @@ int main(int argc, char** argv) {
                 }
                 if (pl_snap_overlap) {
                     bool ok_s = cudaMalloc((void**) &sn.buf[1], sn.bytes) == cudaSuccess &&
+                                (!pl_hedge || cudaMalloc((void**) &sn.buf[2], sn.bytes) == cudaSuccess) &&
                                 cudaStreamCreateWithFlags(&sn.side, cudaStreamNonBlocking) == cudaSuccess;
-                    for (int i = 0; i < 2 && ok_s; ++i)
+                    for (int i = 0; i < pl_lanes && ok_s; ++i)
                         ok_s = cudaEventCreateWithFlags(&sn.pre[i], cudaEventDisableTiming) == cudaSuccess &&
                                cudaEventCreateWithFlags(&sn.ev[i], cudaEventDisableTiming) == cudaSuccess;
                     if (!ok_s) {
@@ -9013,8 +9076,10 @@ int main(int argc, char** argv) {
         // the verifiers by [stage][parity] - the first stage and the LAST (stage 1 of a two-stage split; the decode loop
         // reaches the middle stages through stage_ver_p) - their pool routing, and the drafter's events (in a pipelined
         // prompt read, a stage-1 window waits until the drafter has read the rows of the same parity's previous window)
-        strata::core::Verifier* PV[2][2] = {{&ver, &ver_b}, {pipe ? &stages.back()->ver : nullptr, pipe ? &stages.back()->ver_b : nullptr}};
-        SplitDrive* PSD[2] = {&split_drive, &split_drive_b};
+        strata::core::Verifier* PV[2][3] = {{&ver, &ver_b, &ver_c},
+                                            {pipe ? &stages.back()->ver : nullptr, pipe ? &stages.back()->ver_b : nullptr,
+                                             pipe ? &stages.back()->ver_c : nullptr}};
+        SplitDrive* PSD[3] = {&split_drive, &split_drive_b, &split_drive_c};
         cudaEvent_t pl_mtp_ev[2] = {nullptr, nullptr};
         bool pl_mtp_live[2] = {false, false};
         bool pl_prepared = false, pl_eager_prepared = false;
@@ -9050,7 +9115,7 @@ int main(int argc, char** argv) {
             // before any selective capture; fail closed on a violated idle boundary.
             if (shapes.selective) {
                 for (int st = 0; st < n_stages; ++st)
-                    for (int par = 0; par < 2; ++par)
+                    for (int par = 0; par < pl_lanes; ++par)
                         if (!stage_ver_p(st, par).pipeline_capture_ready(e)) return false;
                 const strata::core::OnDevice on(mtp.device());
                 const cudaError_t q = cudaStreamQuery(mtp.stream());
@@ -9060,10 +9125,10 @@ int main(int argc, char** argv) {
                 }
             }
             for (int st = 0; st < n_stages; ++st)
-                for (int par = 0; par < 2; ++par) {
+                for (int par = 0; par < pl_lanes; ++par) {
                     strata::core::Verifier& v = stage_ver_p(st, par);
                     const strata::core::OnDevice on(v.device());
-                    if (shapes.selective ? !v.capture_shapes(shapes.mask[par], e) : !v.capture_all(e)) return false;
+                    if (shapes.selective && par < 2 ? !v.capture_shapes(shapes.mask[par], e) : !v.capture_all(e)) return false;
                 }
             if (!shapes.selective) pl_eager_prepared = true;
             if (pl_prepared) return true;
@@ -9087,7 +9152,7 @@ int main(int argc, char** argv) {
             for (int round = 0; round < 10000000; ++round) {
                 bool any = false;
                 for (int st = 0; st < n_stages && pipe; ++st)
-                    for (int par = 0; par < 2; ++par) {
+                    for (int par = 0; par < pl_lanes; ++par) {
                         strata::core::Verifier& v = stage_ver_p(st, par);
                         if (!v.in_flight()) continue;
                         any = true;
@@ -14558,11 +14623,14 @@ int main(int argc, char** argv) {
                     int32_t alt[8] = {-1, -1, -1, -1, -1, -1, -1, -1};
                     float altp[8] = {};
                     float p0 = 0.0f;
+                    int lane = 0;          // its verifiers, hand-offs and snapshots (0 / 1 alternate; 2 the hedge's lane)
+                    uint32_t ran = 0;      // the front stages it was launched on (bit per stage)
+                    uint32_t reapp = 0;    // front stages whose K/V rows it writes again before its commit there (a hedge overwrote them)
                 };
                 // front stage `st`'s verifier of w's parity, and the last stage's
-                auto VF = [&](int st, const PW& w) -> strata::core::Verifier& { return stage_ver_p(st, w.seq & 1); };
-                auto V1 = [&](const PW& w) -> strata::core::Verifier& { return *PV[1][w.seq & 1]; };
-                auto SDf = [&](const PW& w) { return (void*) PSD[w.seq & 1]; };
+                auto VF = [&](int st, const PW& w) -> strata::core::Verifier& { return stage_ver_p(st, w.lane); };
+                auto V1 = [&](const PW& w) -> strata::core::Verifier& { return *PV[1][w.lane]; };
+                auto SDf = [&](const PW& w) { return (void*) PSD[w.lane]; };
                 const float theta = pl_theta;
                 const int force_miss = pl_force_miss;
                 const bool hedge_on = strata::core::MtpDrafter::hedge_on();
@@ -14574,20 +14642,36 @@ int main(int argc, char** argv) {
                 static const bool pl_log = pipe_dbg_env("STRATA_PIPELINE_LOG") != nullptr;
                 // the snapshot of the GDN state window `seq` reads on front stage `st` (overlapped: before its launch
                 // there, on the stage's side stream)
-                auto snap_take = [&](int st, int seq) -> bool {
+                auto snap_take = [&](int st, int lane) -> bool {
                     if (!pl_snap_overlap) return true;
                     PlSnap& sn = pl_snaps[(size_t) st];
                     const strata::core::OnDevice on(sn.dev);
                     cudaStream_t cs = pl_stream[(size_t) st];
-                    const int q = seq & 1;
+                    const int q = lane;
                     return cudaEventRecord(sn.pre[q], cs) == cudaSuccess &&
                            cudaStreamWaitEvent(sn.side, sn.pre[q], 0) == cudaSuccess &&
                            cudaMemcpyAsync(sn.buf[q], sn.state, sn.bytes, cudaMemcpyDeviceToDevice, sn.side) == cudaSuccess &&
                            cudaEventRecord(sn.ev[q], sn.side) == cudaSuccess &&
                            (cudaStreamQuery(sn.side), true);
                 };
+                // w's commit on front stage st; first its K/V rows again where a hedge behind it overwrote them
+                auto commit_on = [&](int st, PW& w, int keep) -> bool {
+                    if ((w.reapp & (1u << st)) != 0) {
+                        if (!VF(st, w).kv_reappend(err)) return false;
+                        w.reapp &= ~(1u << st);
+                    }
+                    return VF(st, w).pl_commit_async(keep, err);
+                };
                 PW A, B, D;              // A: the oldest window not verified; B: the next; D: a wrong speculative window
                 bool doomed = false;     // D still runs: when it finishes, stage 0 goes back to undo_w's real commit
+                // hedge: H runs behind B at B's position with the runner-up for B's first token; DH a wrong one of them
+                // that needs no undo (it only has to stop: no commit of it ever ran), drained before its lane is reused
+                PW H, DH;
+                bool doomed_h = false;
+                int last_lane = 1;       // the lane of the window verified last (the next B's)
+                int64_t pl_hedged = 0, pl_hedge_on = 0, pl_hedge_late = 0;
+                static const float hedge_pmax = [] { const char* v = std::getenv("STRATA_GFX906_HEDGE_PMAX"); return v ? (float) std::atof(v) : 1.01f; }();
+                static const float hedge_pmin = [] { const char* v = std::getenv("STRATA_GFX906_HEDGE_PMIN"); return v ? (float) std::atof(v) : 0.0f; }();
                 PW undo_w;
                 int undo_keep = 0;
                 int32_t undo_ple[2] = {-1, -1};
@@ -14602,6 +14686,7 @@ int main(int argc, char** argv) {
                 A.p = p;
                 A.tok[0] = x;
                 A.ready = true;
+                A.lane = 0;
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
@@ -14645,7 +14730,7 @@ int main(int argc, char** argv) {
                     // its remaining layers, so it frees stage 0 and the pool sooner (its rows are discarded and the
                     // undo restores everything it wrote).  STRATA_PIPELINE_DOOM_SKIP=0: served in full.
                     static const bool doom_skip = [] { const char* e = pipe_dbg_env("STRATA_PIPELINE_DOOM_SKIP"); return e == nullptr || std::atoi(e) != 0; }();
-                    const bool skip = doom_skip && doomed && &w == &D;
+                    const bool skip = doom_skip && ((doomed && &w == &D) || (doomed_h && &w == &DH));
                     if (v.service(skip ? nullptr : &drive_pool_split, SDf(w), err) < 0) return false;
                     if (v.done(err)) {
                         if (!v.pl_finish(nullptr, err)) return false;
@@ -14684,6 +14769,23 @@ int main(int argc, char** argv) {
                     if (force_miss > 0 && ++pl_fm % force_miss == 0) B.tok[0] = B.tok[0] == 0 ? 1 : 0;
                     B.ready = true;
                     B.made = true;
+                    B.lane = last_lane;
+                    // the hedge: B's first token's runner-up at B's position, on the third lane, when that lane is not
+                    // held by a wrong window still running
+                    H = PW{};
+                    const int hl = 3 - A.lane - B.lane;
+                    if (pl_hedge && hl >= 0 && hl < 3 && hl != A.lane && hl != B.lane && B.alt[0] >= 0 &&
+                        B.alt[0] != B.tok[0] && B.p0 < hedge_pmax && B.altp[0] >= hedge_pmin && force_miss <= 0) {
+                        H.seq = B.seq;
+                        H.p = B.p;
+                        H.T = 1;
+                        H.tok[0] = B.alt[0];
+                        H.p_on = pa * B.altp[0];
+                        H.p0 = B.altp[0];
+                        H.ready = true;
+                        H.made = true;
+                        H.lane = hl;
+                    }
                 };
                 // events after all the work both stages' streams hold now, and whether they have passed
                 std::vector<cudaEvent_t> fence_ev((size_t) n_stages, nullptr), exch_ev((size_t) n_stages, nullptr);
@@ -14745,7 +14847,9 @@ int main(int argc, char** argv) {
                 };
                 // --adapt-async: the asynchronous tier beside the windows (see adapt_tick).  A stage is idle when neither
                 // of its verifiers has a window in flight (a commit or a snapshot copy waits on nothing of the host's)
-                if (ajob) a_pl_idle = [&](int st) { return !PV[st][0]->in_flight() && !PV[st][1]->in_flight(); };
+                if (ajob) a_pl_idle = [&](int st) {
+                    return !PV[st][0]->in_flight() && !PV[st][1]->in_flight() && (!pl_hedge || !PV[st][2]->in_flight());
+                };
                 double a_poll_ms = 0.0;
                 auto pl_adapt = [&]() -> bool {   // the blocking tier (--adapt-async 0)
                     if (pl_adapt_thr.joinable() && pl_adapt_done.load()) {
@@ -14797,6 +14901,8 @@ int main(int argc, char** argv) {
                         B.p_on = pl_lookup_pon;
                         B.ready = true;
                         B.made = true;
+                        B.lane = last_lane;
+                        H = PW{};
                         b_done = true;   // the chain in flight makes no B for this A
                         tre("CD", A.seq + 1, 3, (int) (1000.0f * B.p_on));
                     }
@@ -14843,7 +14949,11 @@ int main(int argc, char** argv) {
                         }
                     }
                     // ---- every window in flight served
-                    if ((doomed && !pump0(D)) || !pump0(A) || !pump0(B)) return die(err);
+                    if ((doomed && !pump0(D)) || (doomed_h && !pump0(DH)) || !pump0(A) || !pump0(B) || !pump0(H)) return die(err);
+                    if (doomed_h && !DH.fl) {   // a wrong hedge (or a B the hedge beat) has stopped: its lane is free
+                        doomed_h = false;
+                        DH = PW{};
+                    }
                     if (A.s1 && !A.s1_done) {
                         strata::core::Verifier& v = V1(A);
                         if (v.service(&drive_pool_split, SDf(A), err) < 0) return die(err);
@@ -14856,13 +14966,13 @@ int main(int argc, char** argv) {
                     if (drive.d.failed) return die(drive.d.fail ? drive.d.fail : "the expert pool failed");
                     // ---- a wrong speculative window has stopped (it is launched on no further stage once doomed):
                     // every front stage it ran on back to the verified window's real commit
-                    if (doomed && !D.fl) {
+                    if (doomed && !D.fl && !doomed_h) {
                         for (int st = 0; st < pl_nf; ++st) {
                             if ((undo_w.com & (1u << st)) == 0) continue;
                             PlSnap& sn = pl_snaps[(size_t) st];
                             {
                                 const strata::core::OnDevice on(sn.dev);
-                                if (cudaMemcpyAsync(sn.state, sn.buf[pl_snap_overlap ? (undo_w.seq & 1) : 0], sn.bytes,
+                                if (cudaMemcpyAsync(sn.state, sn.buf[pl_snap_overlap ? undo_w.lane : 0], sn.bytes,
                                                     cudaMemcpyDeviceToDevice, pl_stream[(size_t) st]) != cudaSuccess)
                                     return die("restoring the GDN snapshot failed");
                             }
@@ -14870,14 +14980,14 @@ int main(int argc, char** argv) {
                                 ss.ple_prev[0] = undo_ple[0];
                                 ss.ple_prev[1] = undo_ple[1];
                             }
-                            if (!VF(st, undo_w).pl_commit_async(undo_keep, err)) return die(err);
+                            if (!commit_on(st, undo_w, undo_keep)) return die(err);
                         }
                         doomed = false;
                         ++pl_undo;
                         tre("U", undo_w.seq, undo_keep);
                     }
                     if (ending) {
-                        if (!doomed) break;
+                        if (!doomed && !doomed_h) break;
                         continue;
                     }
                     // ---- the drafter's chain, read as its outputs land (an event after each): a fresh A once its size
@@ -14950,7 +15060,8 @@ int main(int argc, char** argv) {
                                 // stage B now (its PLE rows from the tokens before it as they will be once A is
                                 // committed whole), so its launch behind A is only the graph launch (never while a
                                 // rollback is pending: B's verifier is the one the undo commit reads)
-                                if (B.ready && B.p_on >= theta && pl_prestage && !VF(0, B).in_flight() && !doomed) {
+                                if (B.ready && B.p_on >= theta && pl_prestage && !VF(0, B).in_flight() && !doomed &&
+                                    !(doomed_h && DH.lane == B.lane)) {
                                     int32_t prev[2] = {ss.ple_prev[0], ss.ple_prev[1]};
                                     for (int i = 0; i < A.T; ++i) { prev[0] = prev[1]; prev[1] = A.tok[i]; }
                                     if (!VF(0, B).prestage(B.T, B.tok, B.p, prev, err)) return die(err);
@@ -14966,13 +15077,14 @@ int main(int argc, char** argv) {
                     }
                     // ---- the front stages: A on its next one (never while a wrong window still holds a front stage's
                     // state)
-                    if (A.ready && !A.fl && A.fr < pl_nf && !doomed) {
+                    if (A.ready && !A.fl && A.fr < pl_nf && !doomed && !(doomed_h && DH.lane == A.lane)) {
                         const int st = A.fr;
                         if (st == 0 && A.p + A.T > o.max_context) { ending = true; continue; }
                         if (ajob && st == 0) a_gap(0);   // --adapt-async: stage 0 is idle until this launch
-                        if (!snap_take(st, A.seq)) return die("the GDN snapshot failed");
+                        if (!snap_take(st, A.lane)) return die("the GDN snapshot failed");
                         if (!VF(st, A).pl_launch(A.T, A.tok, A.p, err)) return die(err);
                         A.fl = true;
+                        A.ran |= 1u << st;
                         if (st == 0) A.launched = true;
                         tre("L0", A.seq, A.T, st);
                     }
@@ -14983,7 +15095,8 @@ int main(int argc, char** argv) {
                         const char* v = pipe_dbg_env("STRATA_PIPELINE_SPEC_DEPTH");
                         return v ? std::max(1, std::atoi(v)) : 1 << 20;
                     }();
-                    if (B.ready && !B.fl && B.fr < pl_nf && B.fr < pl_spec_depth && A.fr > B.fr && !doomed) {
+                    if (B.ready && !B.fl && B.fr < pl_nf && B.fr < pl_spec_depth && A.fr > B.fr && !doomed &&
+                        !(doomed_h && DH.lane == B.lane)) {
                         const int st = B.fr;
                         if (st > 0 || (B.p_on >= theta && B.p + B.T <= o.max_context)) {
                             if (ajob && st == 0) a_gap(0);   // --adapt-async: stage 0 is idle until this launch
@@ -14991,7 +15104,7 @@ int main(int argc, char** argv) {
                             cudaStream_t cs = pl_stream[(size_t) st];
                             {
                                 const strata::core::OnDevice on(sn.dev);
-                                if (pl_snap_overlap ? cudaStreamWaitEvent(cs, sn.ev[A.seq & 1], 0) != cudaSuccess
+                                if (pl_snap_overlap ? cudaStreamWaitEvent(cs, sn.ev[A.lane], 0) != cudaSuccess
                                                     : cudaMemcpyAsync(sn.buf[0], sn.state, sn.bytes,
                                                                       cudaMemcpyDeviceToDevice, cs) != cudaSuccess)
                                     return die("the GDN snapshot failed");
@@ -15000,11 +15113,12 @@ int main(int argc, char** argv) {
                                 undo_ple[0] = ss.ple_prev[0];
                                 undo_ple[1] = ss.ple_prev[1];
                             }
-                            if (!VF(st, A).pl_commit_async(A.T, err) || !snap_take(st, B.seq) ||
+                            if (!commit_on(st, A, A.T) || !snap_take(st, B.lane) ||
                                 !VF(st, B).pl_launch(B.T, B.tok, B.p, err))
                                 return die(err.empty() ? std::string("the GDN snapshot failed") : err);
                             A.com |= 1u << st;
                             B.fl = true;
+                            B.ran |= 1u << st;
                             if (st == 0) {
                                 B.launched = true;
                                 B.spec = true;
@@ -15013,7 +15127,28 @@ int main(int argc, char** argv) {
                             tre("L0", B.seq, B.T, 10 + st);
                         } else {
                             B.ready = false;   // not worth it: A's verdict decides the next window
+                            H = PW{};
                             ++pl_gate;
+                        }
+                    }
+                    // ---- the hedge: H behind B on the front stages B has left, from the state B started from there
+                    // (A committed whole; its indexer tails as B found them; stage 0's PLE history after A's rows)
+                    if (H.ready && !H.fl && H.fr < pl_nf && B.launched && B.fr > H.fr && !doomed &&
+                        !(doomed_h && DH.lane == H.lane)) {
+                        const int st = H.fr;
+                        if (st == 0 && B.p + 1 > o.max_context) H = PW{};
+                        else {
+                            if (!VF(st, B).idx_tail_restore(err) || (st == 0 && !VF(0, A).ple_hist_restore(A.T, err)) ||
+                                !snap_take(st, H.lane) || !VF(st, H).pl_launch(H.T, H.tok, H.p, err))
+                                return die(err.empty() ? std::string("the GDN snapshot failed") : err);
+                            H.fl = true;
+                            H.ran |= 1u << st;
+                            if (st == 0) {
+                                H.launched = true;
+                                H.spec = true;
+                                ++pl_hedged;
+                            }
+                            tre("L0", H.seq, H.T, 20 + st);
                         }
                     }
                     // ---- the last stage: A, once every front stage is done
@@ -15062,13 +15197,14 @@ int main(int argc, char** argv) {
                     else if (stop_req.load()) finish = "cancel";
                     const bool last = nf || eos || produced_n >= max_new || stop_req.load();
                     const bool on = !nf && B.launched && a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
+                    const bool on_h = !nf && !on && H.launched && a == A.T - 1 && H.tok[0] == outp[(size_t) A.T - 1];
                     if (B.made) {   // the gate's calibration: would B have been on the path, by its estimate p_on
                         const bool would = a == A.T - 1 && B.tok[0] == outp[(size_t) A.T - 1];
                         const int bin = std::min(9, std::max(0, (int) (B.p_on * 10.0f)));
                         cal_n[bin] += 1;
                         cal_on[bin] += would ? 1 : 0;
                     }
-                    tre("V", A.seq, a, on ? 1 : (B.launched ? -1 : 0));
+                    tre("V", A.seq, a, on ? 1 : on_h ? 2 : (B.launched ? -1 : 0));
                     if (hedge_on && !nf && !A.sfx) {
                         if (a < A.T - 1) {
                             ++hd_drej;
@@ -15111,6 +15247,19 @@ int main(int argc, char** argv) {
                     p = A.p + kept_rows;
                     pcie_auto_step(req_pcie_frac);   // 0.1.44: the measured share in the pipelined loop too (STRATA_PCIE_AUTO_SPLIT=1 on a split)
                     if (!last && !ajob && !pl_adapt()) return die("an adaptive refill failed");
+                    // a wrong window that needs no undo (a hedge, or the B a hedge beat) parked as DH until it stops (a
+                    // DH still running from before is drained first: one slot)
+                    auto park = [&](PW& w) -> bool {
+                        while (doomed_h && DH.fl)
+                            if (!pump0(DH)) return false;
+                        doomed_h = false;
+                        DH = PW{};
+                        if (w.fl) {
+                            DH = w;
+                            doomed_h = true;
+                        }
+                        return true;
+                    };
                     if (on && !last) {
                         ++pl_on;
                         // the chain over A, forced through B's drafts: B's bonus guess and the next window's drafts
@@ -15125,14 +15274,49 @@ int main(int argc, char** argv) {
                         // A accepted whole: its commit on the front stages B has not reached yet (B, now A, runs there
                         // after it)
                         for (int st = 0; st < pl_nf; ++st)
-                            if ((A.com & (1u << st)) == 0 && !VF(st, A).pl_commit_async(A.T, err)) return die(err);
+                            if ((A.com & (1u << st)) == 0 && !commit_on(st, A, A.T)) return die(err);
+                        // a hedge behind B lost: where it ran, B's K/V rows are written again before B's commit there
+                        if (H.launched) {
+                            B.reapp |= H.ran;
+                            if (!park(H)) return die(err);
+                        }
+                        H = PW{};
+                        last_lane = A.lane;
                         A = B;
+                        B = PW{};
+                    } else if (on_h && !last) {
+                        ++pl_hedge_on;
+                        // the hedge was right: it is A now (one row, its runner-up first token), the chain over A as
+                        // for a B with no drafts: its bonus guess and the next window's drafts
+                        mtp.set_source_R(V1(A).final_R(0));
+                        chain_n = std::min(strata::kernels::kVerifyMaxT - 1, H.T + S_mtp - 1);
+                        if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
+                            return die(err);
+                        chain_kind = 1;
+                        tre("CL", A.seq, 3);
+                        early_used = false;
+                        b_done = false;
+                        for (int st = 0; st < pl_nf; ++st)
+                            if ((A.com & (1u << st)) == 0 && !commit_on(st, A, A.T)) return die(err);
+                        // B lost: no commit of it ran, so nothing to undo; where it ran and H has not yet, the indexer
+                        // tails go back to what B found (H's launch there reads them; its K/V rows overwrite B's)
+                        for (int st = 0; st < pl_nf; ++st)
+                            if ((B.ran & (1u << st)) != 0 && (H.ran & (1u << st)) == 0 && !VF(st, B).idx_tail_restore(err))
+                                return die(err);
+                        if (!park(B)) return die(err);
+                        last_lane = A.lane;
+                        A = H;
+                        H = PW{};
                         B = PW{};
                     } else {
                         // the front stages B never ran on take A's real commit now; those it did run on are undone
                         // (snapshot restored, the commit replayed) once it has stopped
                         for (int st = 0; st < pl_nf; ++st)
-                            if ((A.com & (1u << st)) == 0 && !VF(st, A).pl_commit_async(kept_rows, err)) return die(err);
+                            if ((A.com & (1u << st)) == 0 && !commit_on(st, A, kept_rows)) return die(err);
+                        if (H.launched && !park(H)) return die(err);   // its rows are past A's: the undo covers them
+                        H = PW{};
+                        const int b_lane = B.lane;
+                        const bool b_had = B.launched || B.made;
                         if (B.launched) {   // a wrong guess (or the end): undo once it has stopped
                             doomed = true;
                             D = B;
@@ -15155,6 +15339,10 @@ int main(int argc, char** argv) {
                             nA.seq = A.seq + 1;
                             nA.p = A.p + a + 1;
                             nA.tok[0] = outp[(size_t) a];
+                            // the lane B had (the two-lane alternation), else the next one no wrong window holds
+                            nA.lane = b_had ? b_lane : (A.lane + 1) % pl_lanes;
+                            if (!b_had && doomed_h && DH.lane == nA.lane) nA.lane = (A.lane + 2) % pl_lanes;
+                            last_lane = A.lane;
                             A = nA;
                         }
                     }
@@ -15181,7 +15369,8 @@ int main(int argc, char** argv) {
                     }
                 }
                 // the odd windows' counters and GPU profiles into the verifiers that report them
-                for (int st = 0; st < n_stages; ++st) stage_ver_p(st, 0).absorb_stats(stage_ver_p(st, 1));
+                for (int st = 0; st < n_stages; ++st)
+                    for (int par = 1; par < pl_lanes; ++par) stage_ver_p(st, 0).absorb_stats(stage_ver_p(st, par));
                 if (!pl_adapt_ok) {
                     std::printf("ERR an adaptive refill failed\n");
                     return 1;
@@ -15196,6 +15385,9 @@ int main(int argc, char** argv) {
                                          "the path, %lld rolled back, %lld below the gate (theta %.2f)\n",
                                  (long long) dec_windows, pl_ms, avg(pl_ms, (double) dec_windows), (long long) pl_spec,
                                  (long long) pl_on, (long long) pl_undo, (long long) pl_gate, theta);
+                    if (pl_hedge)
+                        std::fprintf(stderr, "strata pipeline hedge: %lld hedges launched, %lld on the path (pmax %.2f pmin %.2f)\n",
+                                     (long long) pl_hedged, (long long) pl_hedge_on, hedge_pmax, hedge_pmin);
                     std::fprintf(stderr, "strata pipeline classes: fresh %.0f windows %.2f ms %.2f tok | speculative %.0f "
                                          "windows %.2f ms %.2f tok | forced-chain disagreements %lld, chain late %lld\n",
                                  cls_n[0], avg(cls_ms[0], cls_n[0]), avg(cls_tok[0], cls_n[0]), cls_n[1],

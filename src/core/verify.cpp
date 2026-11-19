@@ -827,6 +827,10 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         attn_ = b.take<float>(T * NH * HD); attn32_ = b.take<float>(T * NH * HD);
         attn_scratch_ = b.take<float>(T * (uint64_t) attn_scratch_floats_);
         tail_snap_ = b.take<float>(nQ * TS);
+        if (kv_keep_on_) {
+            kv_keep_k_ = b.take<float>(nQ * T * NKV * HD);
+            kv_keep_v_ = b.take<float>(nQ * T * NKV * HD);
+        }
         logits_ = b.take<float>(T * (uint64_t) g.n_expert); w_ = b.take<float>(T * K); ids_ = b.take<int32_t>(T * K);
         shared_ = b.take<float>(T * N); parts_ = b.take<float>(T * K * N); hit_out_ = b.take<float>(T * K * N);
         hit_slot_ = b.take<int32_t>(T * K); hit_dst_ = b.take<int32_t>(T * K); hit_count_ = b.take<int32_t>(4);
@@ -1721,6 +1725,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kcur_ + t * NKV * HD,
                                        vcur_ + t * NKV * HD, s, cs, &st.host);
                 }
+                if (kv_keep_k_ != nullptr && !batch_rec_) {   // hedge: this window's rows kept for kv_reappend
+                    const size_t off = ((size_t) qi * MT + (size_t) tb) * NKV * HD, bytes = (size_t) n * NKV * HD * sizeof(float);
+                    if (cudaMemcpyAsync(kv_keep_k_ + off, kcur_ + tb * NKV * HD, bytes, cudaMemcpyDeviceToDevice, cs) != cudaSuccess ||
+                        cudaMemcpyAsync(kv_keep_v_ + off, vcur_ + tb * NKV * HD, bytes, cudaMemcpyDeviceToDevice, cs) != cudaSuccess) {
+                        err = "verify: keeping the window's K/V rows failed";
+                        return false;
+                    }
+                }
                 if (!sidem) idx_append(cs);
                 stamp(l, 9, grp);
                 if (qbr) {
@@ -2472,6 +2484,107 @@ bool Verifier::capture(int T, std::string& err) {
     // First-request pipeline preparation captures every shape on each stage/parity.
     // Completed graphs are progress; a single stalled capture still has the ordinary watchdog deadline.
     if (ue == cudaSuccess && us == cudaSuccess) progress_beat();
+    return true;
+}
+
+bool Verifier::kv_reappend(std::string& err) {
+    using namespace strata::kernels;
+    if (kv_keep_k_ == nullptr || last_t_ < 1) { err = "verify: kv_reappend without kept rows"; return false; }
+    const OnDevice on_device(device_);
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const QsaShapes s = shapes_of(g);
+    const int64_t NKV = g.n_head_kv, HD = g.head_dim, MT = max_t_;
+    const int n = last_t_;
+    static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
+    int64_t qi = 0;
+    for (int64_t l = 0; l < lb_; ++l) if (is_qsa_layer(g, l)) ++qi;
+    try {
+        for (int64_t l = lb_; l < le_; ++l) {
+            if (!is_qsa_layer(g, l)) continue;
+            const QsaState& st = ss.qsa_states[qi];
+            const float* kc = kv_keep_k_ + (size_t) qi * MT * NKV * HD;
+            const float* vc = kv_keep_v_ + (size_t) qi * MT * NKV * HD;
+            // the window's own append (record_window), with its step records (step_ still holds them)
+            if (dec_batch && !g_no_batch_kv) {
+                if (st.kv_hybrid) {
+                    const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
+                    const bool mirror = st.host.present();
+                    kv_append_q8_steps(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_, kStepCount, kc, kc,
+                                       (int) (NKV * HD), n, s, cs_, mirror ? &hk : nullptr);
+                    kv_append_q4_steps(st.v_q4, st.v_q4, st.page_table, step_, kStepCount, n, vc, vc, s, cs_,
+                                       mirror ? &hv : nullptr);
+                } else if (st.kv_q4)
+                    kv_append_q4_steps(st.k_q4, st.v_q4, st.page_table, step_, kStepCount, n, kc, vc, s, cs_, &st.host);
+                else if (st.kv_int8)
+                    kv_append_q8_steps(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_, kStepCount, kc, vc,
+                                       (int) (NKV * HD), n, s, cs_, &st.host);
+                else
+                    for (int t = 0; t < n; ++t)
+                        kv_append_step(st.k_pool, st.v_pool, st.page_table, step_ + t * kStepCount, kc + t * NKV * HD,
+                                       vc + t * NKV * HD, s, cs_, &st.host);
+            } else {
+                for (int t = 0; t < n; ++t) {
+                    const int32_t* step_t = step_ + t * kStepCount;
+                    const float* kt = kc + t * NKV * HD;
+                    const float* vt = vc + t * NKV * HD;
+                    if (st.kv_hybrid) {
+                        const KvHostPools hk = kv_hybrid_k_half(st.host), hv = kv_hybrid_v_half(st.host);
+                        const bool mirror = st.host.present();
+                        kv_append_q8_step(st.k_q, st.k_q, st.k_scale, st.k_scale, st.page_table, step_t, kt, kt, s, cs_,
+                                          mirror ? &hk : nullptr);
+                        kv_append_q4_step(st.v_q4, st.v_q4, st.page_table, step_t, vt, vt, s, cs_, mirror ? &hv : nullptr);
+                    } else if (st.kv_q4)
+                        kv_append_q4_step(st.k_q4, st.v_q4, st.page_table, step_t, kt, vt, s, cs_, &st.host);
+                    else if (st.kv_int8)
+                        kv_append_q8_step(st.k_q, st.v_q, st.k_scale, st.v_scale, st.page_table, step_t, kt, vt, s, cs_, &st.host);
+                    else
+                        kv_append_step(st.k_pool, st.v_pool, st.page_table, step_t, kt, vt, s, cs_, &st.host);
+                }
+            }
+            ++qi;
+        }
+    } catch (const std::exception& e) {
+        err = std::string("verify: kv_reappend: ") + e.what();
+        return false;
+    }
+    (void) cudaStreamQuery(cs_);
+    return true;
+}
+
+bool Verifier::idx_tail_restore(std::string& err) {
+    using namespace strata::kernels;
+    const OnDevice on_device(device_);
+    const ModelGeometry& g = *g_;
+    SessionState& ss = *ss_;
+    const QsaShapes s = shapes_of(g);
+    const int64_t TS = (s.idx_block - 1) * g.idx_key_dim;
+    int64_t qi = 0;
+    for (int64_t l = 0; l < lb_; ++l) if (is_qsa_layer(g, l)) ++qi;
+    try {
+        for (int64_t l = lb_; l < le_; ++l) {
+            if (!is_qsa_layer(g, l)) continue;
+            copy_from_mapped(ss.qsa_states[qi].idx_tail, tail_snap_ + (size_t) qi * TS, TS, cs_);
+            ++qi;
+        }
+    } catch (const std::exception& e) {
+        err = std::string("verify: idx_tail_restore: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
+bool Verifier::ple_hist_restore(int keep, std::string& err) {
+    SessionState& ss = *ss_;
+    if (!(ss.ple.ready() && ple_stage())) return true;
+    if (keep < 1 || keep > max_t_) { err = "verify: ple_hist_restore: keep out of range"; return false; }
+    const OnDevice on_device(device_);
+    const size_t HS = (size_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM;
+    if (cudaMemcpyAsync(ss.ple.hist, hist_snap_ + (size_t) (keep - 1) * HS, HS * sizeof(*hist_snap_),
+                        cudaMemcpyDeviceToDevice, cs_) != cudaSuccess) {
+        err = "verify: ple_hist_restore failed";
+        return false;
+    }
     return true;
 }
 
