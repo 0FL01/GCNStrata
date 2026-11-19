@@ -1396,7 +1396,14 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                 df_side_[1]);
                 }
                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
-                if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
+                // gfx906: qkv and z (same type, same q8_1 input) in one launch, bitwise the two (STRATA_GFX906_QKVZ)
+                bool z_done = false;
+                if (!side_proj && !br && wqkv->native_type == wg->native_type &&
+                    !(g_mmvq_il() && strata::kernels::native_mmvq_il_supported(wqkv->native_type, n, (int) C)))
+                    z_done = strata::kernels::native_mmvq_two(wqkv->native_type, wqkv->native_data, qkv + (size_t) tb * C,
+                                                              (int) C, wg->native_data, z_ + (size_t) tb * ZV, (int) ZV,
+                                                              xq_, (int) N, n, cs);
+                if (!side_proj && !z_done) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
@@ -1429,7 +1436,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
-                if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                if (!side_proj && !z_done) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
                 if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
                     err = "verify: the gate projection's branch could not join";

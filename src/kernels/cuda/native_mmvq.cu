@@ -1863,13 +1863,12 @@ void launch_check() {
 // column's sums do not depend on how many columns (verify tokens) ride along.  STRATA_MMVQ_WAVE=0: the CUDA layout.
 bool g_wave_off = std::getenv("STRATA_MMVQ_WAVE") && std::string(std::getenv("STRATA_MMVQ_WAVE")) == "0";
 template<typename F, int NCOLS, int R>
-__launch_bounds__(256)
-__global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
-                                        float* __restrict__ y, int n_in, int n_out) {
+__device__ __forceinline__ void native_mmvq_wave_body(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
+                                                      float* __restrict__ y, int n_in, int n_out, int bx) {
     constexpr int BPIW = 64 / F::T;
     static_assert(64 % F::T == 0, "a block's threads must tile the wavefront");
     const int lane = int(threadIdx.x) & 63;
-    const int row0 = (int(blockIdx.x) * 4 + (int(threadIdx.x) >> 6)) * R;
+    const int row0 = (bx * 4 + (int(threadIdx.x) >> 6)) * R;
     if (row0 >= n_out) return;
     const int blocks_per_row = n_in / F::DIV;
     const int x_stride = n_in / Q8K;
@@ -1895,6 +1894,24 @@ __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w,
             for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
             if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = v;
         }
+}
+template<typename F, int NCOLS, int R>
+__launch_bounds__(256)
+__global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
+                                        float* __restrict__ y, int n_in, int n_out) {
+    native_mmvq_wave_body<F, NCOLS, R>(w, x, y, n_in, n_out, int(blockIdx.x));
+}
+// STRATA_GFX906_QKVZ: two matrices of one type that read the same q8_1 input (GDN qkv and z) in ONE grid: blocks
+// [0, nb1) are matrix 1's wave blocks, the rest matrix 2's, each row computed by the same body as its own launch
+// (bitwise the two launches); one launch and one ramp / tail instead of two.
+template<typename F, int NCOLS, int R>
+__launch_bounds__(256)
+__global__ void native_mmvq_wave2_kernel(const typename F::Block* __restrict__ w1, float* __restrict__ y1, int n_out1,
+                                         int nb1, const typename F::Block* __restrict__ w2, float* __restrict__ y2,
+                                         int n_out2, const Q81Block* __restrict__ x, int n_in) {
+    const int b = int(blockIdx.x);
+    if (b < nb1) native_mmvq_wave_body<F, NCOLS, R>(w1, x, y1, n_in, n_out1, b);
+    else native_mmvq_wave_body<F, NCOLS, R>(w2, x, y2, n_in, n_out2, b - nb1);
 }
 // Indexed MTP head component only. Existing wave kernel and dispatch stay unchanged.
 template<typename F, int NCOLS, int R>
@@ -1953,6 +1970,26 @@ void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, in
         case 7: wave_launch_n<F, 7, R>(weights, x_q8_1, y, n_in, n_out, s); break;
         case 8: wave_launch_n<F, 8, R>(weights, x_q8_1, y, n_in, n_out, s); break;
         default: throw std::invalid_argument("native MMVQ (wave) requires 1 <= ncols <= 8");
+    }
+}
+template<typename F, int NCOLS, int R>
+void wave2_launch_n(const void* w1, float* y1, int n_out1, const void* w2, float* y2, int n_out2, const void* x_q8_1,
+                    int n_in, cudaStream_t s) {
+    const int nb1 = int((std::size_t(n_out1) + 4 * R - 1) / (4 * R));
+    const int nb2 = int((std::size_t(n_out2) + 4 * R - 1) / (4 * R));
+    native_mmvq_wave2_kernel<F, NCOLS, R><<<unsigned(nb1 + nb2), 256, 0, s>>>(
+        static_cast<const typename F::Block*>(w1), y1, n_out1, nb1, static_cast<const typename F::Block*>(w2), y2, n_out2,
+        static_cast<const Q81Block*>(x_q8_1), n_in);
+}
+template<typename F, int R>
+bool wave2_launch(const void* w1, float* y1, int n_out1, const void* w2, float* y2, int n_out2, const void* x_q8_1,
+                  int n_in, int ncols, cudaStream_t s) {
+    switch (ncols) {
+        case 1: wave2_launch_n<F, 1, R>(w1, y1, n_out1, w2, y2, n_out2, x_q8_1, n_in, s); return true;
+        case 2: wave2_launch_n<F, 2, R>(w1, y1, n_out1, w2, y2, n_out2, x_q8_1, n_in, s); return true;
+        case 3: wave2_launch_n<F, 3, R>(w1, y1, n_out1, w2, y2, n_out2, x_q8_1, n_in, s); return true;
+        case 4: wave2_launch_n<F, 4, R>(w1, y1, n_out1, w2, y2, n_out2, x_q8_1, n_in, s); return true;
+        default: return false;
     }
 }
 bool q5_head_r2_enabled() {
@@ -2978,6 +3015,29 @@ void q8_0_pair_launch(const Q80Block* w1, const Q80Block* w2, const Q81Block* x,
         native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, true, true><<<unsigned(2 * n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
     else
         native_mmvq_multi_kernel<F, NCOLS, WARPS, 1, false, true><<<unsigned(2 * n_out), threads, 0, s>>>(w1, x, y1, n_in, n_out, w2, y2);
+}
+
+bool native_mmvq_two(int ggml_type, const void* w1, float* y1, int n_out1, const void* w2, float* y2, int n_out2,
+                     const void* x_q8_1, int n_in, int ncols, void* stream) {
+#if defined(STRATA_HIP_GFX906)
+    static const bool on = [] { const char* e = std::getenv("STRATA_GFX906_QKVZ"); return e == nullptr || std::atoi(e) != 0; }();
+    // only where both calls would take the dense Q4_0 wave path (small_mmvq: R4 at 1-3 columns, R2 above)
+    if (!on || ggml_type != 2 || g_wave_off || ncols < 1 || ncols > 4 || n_in <= 0 || n_in % 32 != 0 || n_out1 <= 0 ||
+        n_out2 <= 0 || !w1 || !w2 || !y1 || !y2 || !x_q8_1 || !stream)
+        return false;
+    const int r = q40_rows();
+    if (r == 0) return false;
+    using F = SmallTraits<Q40Block, 4>;
+    const auto s = static_cast<cudaStream_t>(stream);
+    const bool ok = r == 4 && ncols <= 3 ? wave2_launch<F, 4>(w1, y1, n_out1, w2, y2, n_out2, x_q8_1, n_in, ncols, s)
+                                         : wave2_launch<F, 2>(w1, y1, n_out1, w2, y2, n_out2, x_q8_1, n_in, ncols, s);
+    if (ok) launch_check();
+    return ok;
+#else
+    (void) ggml_type; (void) w1; (void) y1; (void) n_out1; (void) w2; (void) y2; (void) n_out2; (void) x_q8_1;
+    (void) n_in; (void) ncols; (void) stream;
+    return false;
+#endif
 }
 
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,
