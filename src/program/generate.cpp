@@ -8901,6 +8901,12 @@ int main(int argc, char** argv) {
             // the setters reach the later stages; the pipeline never chains run/commit
             for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 1).set_next(&stage_ver_p(st + 1, 1), &split_drive_b);
             if (pl_hedge) {   // the third lane: its verifiers and hand-offs, as the odd windows'
+                std::vector<size_t> free0((size_t) n_stages, 0);
+                for (int st = 0; st < n_stages; ++st) {
+                    const strata::core::OnDevice on(stage_ver_p(st, 0).device());
+                    size_t tb_ = 0;
+                    cudaMemGetInfo(&free0[(size_t) st], &tb_);
+                }
                 std::vector<float*> hand_c((size_t) n_stages - 1, nullptr);
                 for (float*& h : hand_c) {
                     float* hh = nullptr;
@@ -8937,6 +8943,15 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 for (int st = 0; st + 1 < n_stages; ++st) stage_ver_p(st, 2).set_next(&stage_ver_p(st + 1, 2), &split_drive_c);
+                std::string used_s;
+                for (int st = 0; st < n_stages; ++st) {
+                    const strata::core::OnDevice on(stage_ver_p(st, 0).device());
+                    size_t f1 = 0, tb_ = 0;
+                    cudaMemGetInfo(&f1, &tb_);
+                    used_s += " " + std::to_string((long long) ((int64_t) free0[(size_t) st] - (int64_t) f1) >> 20);
+                }
+                std::fprintf(stderr, "strata serve: --pipeline-windows hedge: the third lane's verifiers took MiB per card:%s\n",
+                             used_s.c_str());
             }
         }
         ver.set_remote_expert_opt(remote_opt.get());
@@ -14676,7 +14691,21 @@ int main(int argc, char** argv) {
                 PW H, DH;
                 bool doomed_h = false;
                 int last_lane = 1;       // the lane of the window verified last (the next B's)
-                int64_t pl_hedged = 0, pl_hedge_on = 0, pl_hedge_late = 0;
+                int64_t pl_hedged = 0, pl_hedge_on = 0, pl_hedge_late = 0, pl_hedge_t2 = 0;
+                // the hedge's draft: a second chain over the same catch-up as the one that made B, forced through A's
+                // drafts and H's token, once that chain is done (the drafter's card idles while A is on the front
+                // stages); STRATA_GFX906_HEDGE_DRAFT=0: H stays one row
+                static const bool hedge_draft = [] { const char* v = std::getenv("STRATA_GFX906_HEDGE_DRAFT"); return v == nullptr || std::atoi(v) != 0; }();
+                bool hch_live = false;
+                int ch_T = 0, ch_a = 0;
+                int64_t ch_p = 0;
+                int32_t ch_tok[8] = {};
+                auto ch_note = [&](int T_, const int32_t* tok_, int64_t p_, int a_) {   // the main chain's catch-up
+                    ch_T = T_;
+                    ch_p = p_;
+                    ch_a = a_;
+                    for (int i = 0; i < 8; ++i) ch_tok[i] = i < T_ ? tok_[i] : 0;
+                };
                 static const float hedge_pmax = [] { const char* v = std::getenv("STRATA_GFX906_HEDGE_PMAX"); return v ? (float) std::atof(v) : 1.01f; }();
                 static const float hedge_pmin = [] { const char* v = std::getenv("STRATA_GFX906_HEDGE_PMIN"); return v ? (float) std::atof(v) : 0.0f; }();
                 PW undo_w;
@@ -14937,6 +14966,27 @@ int main(int argc, char** argv) {
                     return v == nullptr || std::atoi(v) != 0;
                 }();
                 auto ms_now = [&]() { return std::chrono::duration<double, std::milli>(Clock::now() - pl_t0).count(); };
+                // the hedge chain: once done, H takes its draft (the serial rule: below spec_min_p it stays one row)
+                auto hch_poll = [&](bool wait) -> bool {
+                    while (hch_live) {
+                        const int r2 = mtp.chain_poll(err);
+                        if (r2 < 0) return false;
+                        if (r2 == 1) {
+                            hch_live = false;
+                            const int j = A.T;
+                            const float pd = mtp.chain_prob()[j];
+                            if (H.ready && !H.launched && H.T == 1 && (req_spec_min_p <= 0.0 || pd >= (float) req_spec_min_p)) {
+                                H.tok[1] = mtp.chain_tok()[j];
+                                H.prob[0] = pd;
+                                H.T = 2;
+                                ++pl_hedge_t2;
+                            }
+                            break;
+                        }
+                        if (!wait) break;
+                    }
+                    return true;
+                };
                 while (true) {
                     g_pl_diag.iters.fetch_add(1, std::memory_order_relaxed);
                     g_pl_diag.a_seq.store(A.seq, std::memory_order_relaxed);
@@ -14957,6 +15007,7 @@ int main(int argc, char** argv) {
                     }
                     // ---- every window in flight served
                     if ((doomed && !pump0(D)) || (doomed_h && !pump0(DH)) || !pump0(A) || !pump0(B) || !pump0(H)) return die(err);
+                    if (hch_live && !hch_poll(false)) return die(err);
                     if (doomed_h && !DH.fl) {   // a wrong hedge (or a B the hedge beat) has stopped: its lane is free
                         doomed_h = false;
                         DH = PW{};
@@ -15082,7 +15133,19 @@ int main(int argc, char** argv) {
                                                          "outputs)\n", chain_kind, (long long) A.p, A.T, B.T, B.p_on, k);
                             }
                         }
-                        if (r == 1) chain_kind = 0;
+                        if (r == 1) {
+                            chain_kind = 0;
+                            // the main chain is done (B made): H's draft from a second chain, its step A.T forced to
+                            // H's token (the steps before it forced to A's drafts: the same inputs as the main chain's)
+                            if (hedge_draft && H.ready && !H.launched && H.T == 1 && S_mtp >= 2 && !hch_live &&
+                                A.T + 1 <= S_mtp + 1 && A.T + 1 < strata::kernels::kVerifyMaxT) {
+                                int32_t f[16] = {};
+                                for (int i = 1; i < A.T; ++i) f[i - 1] = A.tok[i];
+                                f[A.T - 1] = H.tok[0];
+                                if (!mtp.chain_launch(ch_T, ch_tok, ch_p, ch_a, f, A.T, A.T + 1, A.T + 1, err)) return die(err);
+                                hch_live = true;
+                            }
+                        }
                     }
                     // ---- the front stages: A on its next one (never while a wrong window still holds a front stage's
                     // state)
@@ -15143,9 +15206,9 @@ int main(int argc, char** argv) {
                     // ---- the hedge: H behind B on the front stages B has left, from the state B started from there
                     // (A committed whole; its indexer tails as B found them; stage 0's PLE history after A's rows)
                     if (H.ready && !H.fl && H.fr < pl_nf && B.launched && B.fr > H.fr && !doomed &&
-                        !(doomed_h && DH.lane == H.lane)) {
+                        !(doomed_h && DH.lane == H.lane) && !(hch_live && H.fr == 0)) {
                         const int st = H.fr;
-                        if (st == 0 && B.p + 1 > o.max_context) H = PW{};
+                        if (st == 0 && B.p + H.T > o.max_context) H = PW{};
                         else {
                             if (!VF(st, B).idx_tail_restore(err) || (st == 0 && !VF(0, A).ple_hist_restore(A.T, err)) ||
                                 !snap_take(st, H.lane) || !VF(st, H).pl_launch(H.T, H.tok, H.p, err))
@@ -15175,6 +15238,7 @@ int main(int argc, char** argv) {
                     // chain ended long before a verdict that needs a whole stage-1 window.
                     while (chain_kind != 0 && mtp.chain_live())
                         if (mtp.chain_poll(err) < 0) return die(err);
+                    if (!hch_poll(true)) return die(err);
                     if (chain_kind != 0 && !B.launched && !B.made) B = PW{};
                     chain_kind = 0;
                     int a = 0;
@@ -15276,6 +15340,7 @@ int main(int argc, char** argv) {
                         chain_n = std::min(strata::kernels::kVerifyMaxT - 1, B.T + S_mtp - 1);
                         if (!mtp.chain_launch(A.T, outp.data(), A.p, a, B.tok + 1, B.T - 1, chain_n, chain_n, err))
                             return die(err);
+                        ch_note(A.T, outp.data(), A.p, a);
                         chain_kind = 1;
                         tre("CL", A.seq, 1);
                         early_used = false;
@@ -15299,8 +15364,9 @@ int main(int argc, char** argv) {
                         // for a B with no drafts: its bonus guess and the next window's drafts
                         mtp.set_source_R(V1(A).final_R(0));
                         chain_n = std::min(strata::kernels::kVerifyMaxT - 1, H.T + S_mtp - 1);
-                        if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
+                        if (!mtp.chain_launch(A.T, outp.data(), A.p, a, H.tok + 1, H.T - 1, chain_n, chain_n, err))
                             return die(err);
+                        ch_note(A.T, outp.data(), A.p, a);
                         chain_kind = 1;
                         tre("CL", A.seq, 3);
                         early_used = false;
@@ -15340,6 +15406,7 @@ int main(int argc, char** argv) {
                             chain_n = strata::kernels::kVerifyMaxT - 1;
                             if (!mtp.chain_launch(A.T, outp.data(), A.p, a, nullptr, 0, chain_n, chain_n, err))
                                 return die(err);
+                            ch_note(A.T, outp.data(), A.p, a);
                             chain_kind = 2;
                             tre("CL", A.seq, 2);
                             early_used = false;
@@ -15395,8 +15462,9 @@ int main(int argc, char** argv) {
                                  (long long) dec_windows, pl_ms, avg(pl_ms, (double) dec_windows), (long long) pl_spec,
                                  (long long) pl_on, (long long) pl_undo, (long long) pl_gate, theta);
                     if (pl_hedge)
-                        std::fprintf(stderr, "strata pipeline hedge: %lld hedges launched, %lld on the path (pmax %.2f pmin %.2f)\n",
-                                     (long long) pl_hedged, (long long) pl_hedge_on, hedge_pmax, hedge_pmin);
+                        std::fprintf(stderr, "strata pipeline hedge: %lld hedges launched (%lld with a draft), %lld on the path (pmax "
+                                             "%.2f pmin %.2f)\n", (long long) pl_hedged, (long long) pl_hedge_t2,
+                                     (long long) pl_hedge_on, hedge_pmax, hedge_pmin);
                     std::fprintf(stderr, "strata pipeline classes: fresh %.0f windows %.2f ms %.2f tok | speculative %.0f "
                                          "windows %.2f ms %.2f tok | forced-chain disagreements %lld, chain late %lld\n",
                                  cls_n[0], avg(cls_ms[0], cls_n[0]), avg(cls_tok[0], cls_n[0]), cls_n[1],
