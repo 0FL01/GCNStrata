@@ -4510,11 +4510,14 @@ int main(int argc, char** argv) {
     // stage's GDN state (sized from its session where the first card's cache is sized; this is the split search's
     // estimate).  Allocated after the caches, so kept out of them.
     const bool pl_hedge_cfg = o.pipeline_windows >= 2 && hedge_run_env();   // the hedge's third lane (if the pipeline runs)
-    // hedge: a third verifier everywhere (160) and, on a later front stage, a third GDN snapshot (~3 MiB per GDN layer)
-    // (measured on B3: the third verifier takes 80 MiB a card; the snapshot 30-40 MiB on a front stage)
-    const int64_t kPipeWindowMib = o.pipeline_windows > 0 ? (pl_hedge_cfg ? 288 : 160) : 0;
-    const int64_t kPipeSnapMib = o.pipeline_windows >= 2 ? (pl_hedge_cfg ? 144 : 96) : 0;   // ~3 MiB per GDN layer, two (three) copies
-    const int64_t kPipeSnapCopies = pl_hedge_cfg ? 3 : 2;
+    // hedge: the third verifier (measured on B3: 80 MiB a card) and a third GDN snapshot on a front stage (30-40 MiB).
+    // STRATA_GFX906_HEDGE_MIB (default 0): MiB more kept out of every card's expert cache for them; 0 takes them from
+    // the reserve's headroom, so the caches - and every token - stay those of the hedge-off engine
+    static const int64_t hedge_mib = [] { const char* v = std::getenv("STRATA_GFX906_HEDGE_MIB"); return v ? std::max(0, std::atoi(v)) : 0; }();
+    const int64_t hedge_extra = pl_hedge_cfg ? hedge_mib : 0;
+    const int64_t kPipeWindowMib = o.pipeline_windows > 0 ? 160 + hedge_extra : 0;
+    const int64_t kPipeSnapMib = o.pipeline_windows >= 2 ? (hedge_extra > 0 ? 144 : 96) : 0;   // ~3 MiB per GDN layer, two (three) copies
+    const int64_t kPipeSnapCopies = hedge_extra > 0 ? 3 : 2;
     auto gdn_snapshot_bytes = [&](const strata::core::SessionState& s0) -> size_t {
         return (size_t) s0.gdn_alloc * ((size_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size +
                                         (size_t) g.ssm_conv_channels * (g.ssm_d_conv - 1)) * sizeof(float);
