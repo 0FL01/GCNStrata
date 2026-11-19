@@ -119,9 +119,6 @@ int main(int argc, char** argv) {
         cudaMalloc((void**) &dn, 4);
         cudaMalloc((void**) &ddst, (size_t) NE * 4);
         cudaMalloc((void**) &dtok, (size_t) NE * 4);
-        unsigned* dsync = nullptr;   // STRATA_LEGACY_EXP=35's group counters (zero; each call leaves them zero)
-        cudaMalloc((void**) &dsync, K::kNativeExpertSyncWords * sizeof(unsigned));
-        cudaMemset(dsync, 0, K::kNativeExpertSyncWords * sizeof(unsigned));
         for (int g = 0; g < G; ++g) {
             ptr[g] = (unsigned long long) (dblob + (size_t) g * f.bytes);
             start[g] = g ? start[g - 1] + counts[g - 1] : 0;
@@ -141,7 +138,7 @@ int main(int argc, char** argv) {
         K::quantize_q8_1_rows((const float*) dx, NTOK, H, dxq, s);
         auto run = [&](int m, int phase) {
             K::native_expert_set_mode(m, phase);
-            K::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, G + cap_pad, NE, dxq, dscr, dout, s, 0, dsync);
+            K::native_expert_grouped(L, dptr, dstart, dn, ddst, dtok, G + cap_pad, NE, dxq, dscr, dout, s);
         };
         // STRATA_BENCH_LEGACY=<v> [STRATA_BENCH_LEGACY_REF=<v>]: the gfx906 Q4_1 / Q4_0 kernel pair (STRATA_LEGACY_EXP) of the
         // timed side and of the reference side (default 0).  STRATA_LEGACY_EXP=0 alone is not the per-entry kernels for a
