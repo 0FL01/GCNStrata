@@ -3147,20 +3147,18 @@ template<> struct S27<8> {   // Q8_0
 template<> struct S27<3> : Split<3> {};   // Q4_1 (bartowski): the same load / apply
 template<> struct S27<2> : Split<2> {};   // Q4_0 (bartowski)
 
+// one block's rows of s27_gu_kernel for group g (bx = its row block), the activations staged in s_x
 template<int TG, bool LX, int RPW, bool TS>
-__global__ void __launch_bounds__(256) s27_gu_kernel(const unsigned long long* __restrict__ grp_ptr,
-                                                     const int32_t* __restrict__ grp_start,
-                                                     const int32_t* __restrict__ n_groups,
-                                                     const int32_t* __restrict__ ent_tok,
-                                                     const block_q8_1* __restrict__ xq, NativeExpertLayout L,
-                                                     float* __restrict__ gate, float* __restrict__ up) {
+__device__ __forceinline__ void s27_gu_body(int g, int bx, block_q8_1* __restrict__ s_x,
+                                            const unsigned long long* __restrict__ grp_ptr,
+                                            const int32_t* __restrict__ grp_start,
+                                            const int32_t* __restrict__ ent_tok,
+                                            const block_q8_1* __restrict__ xq, const NativeExpertLayout& L,
+                                            float* __restrict__ gate, float* __restrict__ up) {
     using F = Fmt<TG>;
     using S = S27<TG>;
-    __shared__ block_q8_1 s_x[LX ? GRP_NC * S26_XMAX : 1];
-    const int g = blockIdx.y;
-    if (g >= *n_groups) return;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
-    const int row0 = blockIdx.x * GU_ROWS * RPW + warp;
+    const int row0 = bx * GU_ROWS * RPW + warp;
     const bool live = row0 + GU_ROWS * (RPW - 1) < 2 * L.n_ff;
     const uint8_t* blob = (const uint8_t*) grp_ptr[g];
     const uint8_t* wr[RPW];
@@ -3236,6 +3234,19 @@ __global__ void __launch_bounds__(256) s27_gu_kernel(const unsigned long long* _
             for (int c = 0; c < GRP_NC; ++c)
                 if (c < n && lane == c) (upq[q] ? up : gate)[(size_t) (e + c) * L.n_ff + rr[q]] = s[q][c];
     }
+}
+
+template<int TG, bool LX, int RPW, bool TS>
+__global__ void __launch_bounds__(256) s27_gu_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                     const int32_t* __restrict__ grp_start,
+                                                     const int32_t* __restrict__ n_groups,
+                                                     const int32_t* __restrict__ ent_tok,
+                                                     const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                     float* __restrict__ gate, float* __restrict__ up) {
+    __shared__ block_q8_1 s_x[LX ? GRP_NC * S26_XMAX : 1];
+    const int g = blockIdx.y;
+    if (g >= *n_groups) return;
+    s27_gu_body<TG, LX, RPW, TS>(g, (int) blockIdx.x, s_x, grp_ptr, grp_start, ent_tok, xq, L, gate, up);
 }
 
 template<int TD, bool LX, int RPW, bool TS>
@@ -4515,15 +4526,114 @@ struct LegacyArgs {
     int64_t cap_groups, cap_entries, gy;
     bool v1;
     cudaStream_t s;
+    unsigned* sync;   // 2 * cap_groups zeroed words for the fused kernel (null: the separate kernels)
 };
 // gfx906 legacy-quant grouped decode experts: the kernel pair STRATA_LEGACY_EXP=<gate/up><down> selects (see
 // g_legacy_exp); every choice is bitwise the per-entry kernels (native_expert_bench STRATA_BENCH_LEGACY).
+// STRATA_LEGACY_EXP=35 (gfx906, Q4_0 / Q4_1, n_embd 2560, n_ff 640, a call over every group of its capacity): the
+// gate/up (s27, 2 rows per warp), the SwiGLU + q8_1 and the down (8-lane rows) of every expert group in ONE grid.
+// Blocks [0, 80 * cap) are group g's gate/up row blocks (g = b / 80), the rest its down row blocks.  A gate/up block
+// counts itself on sync[g] when its rows are written (release); a down block waits for 80 (acquire), computes the
+// group's SwiGLU + q8_1 itself into LDS - the same values and q8_1_store as swiglu_q8_1_entries_kernel, so the same
+// blocks it would have read from memory - and runs native_down_multi_kernel's rows; the group's last down block
+// resets the two words.  Every wait points at lower block indices (in-order dispatch: no deadlock with any number of
+// resident blocks).  The down weight stream of the first groups overlaps the gate/up of the last ones, and two
+// launch boundaries go.  Bitwise the three kernels (native_expert_bench STRATA_BENCH_LEGACY=35 vs 31).
+constexpr int FX_GU_BLOCKS = 2 * 640 / (GU_ROWS * 2), FX_DN_BLOCKS = 2560 / 32;
+template<int TG, int TD>
+__global__ void __launch_bounds__(256) fused_experts_kernel(const unsigned long long* __restrict__ grp_ptr,
+                                                            const int32_t* __restrict__ grp_start,
+                                                            const int32_t* __restrict__ n_groups,
+                                                            const int32_t* __restrict__ ent_dst,
+                                                            const int32_t* __restrict__ ent_tok,
+                                                            const block_q8_1* __restrict__ xq, NativeExpertLayout L,
+                                                            float* __restrict__ gate, float* __restrict__ up,
+                                                            float* __restrict__ out, int cap, unsigned* __restrict__ sync) {
+    __shared__ block_q8_1 s_buf[GRP_NC * S26_XMAX];   // gate/up: the activations; down: the q8_1 intermediates
+    const int b = (int) blockIdx.x;
+    const int n_gu = FX_GU_BLOCKS * cap;
+    if (b < n_gu) {
+        const int g = b / FX_GU_BLOCKS;
+        if (g >= *n_groups) return;
+        s27_gu_body<TG, true, 2, false>(g, b - g * FX_GU_BLOCKS, s_buf, grp_ptr, grp_start, ent_tok, xq, L, gate, up);
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) __hip_atomic_fetch_add(sync + g, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+        return;
+    }
+    const int d = b - n_gu, g = d / FX_DN_BLOCKS, bx = d - g * FX_DN_BLOCKS;
+    if (g >= *n_groups) return;
+    if (threadIdx.x == 0)
+        while (__hip_atomic_load(sync + g, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT) < (unsigned) FX_GU_BLOCKS)
+            __builtin_amdgcn_s_sleep(1);
+    __syncthreads();
+    __threadfence();
+    const int r = bx * 32 + (threadIdx.x >> 3);
+    const int t = threadIdx.x & 7;
+    const size_t w_off = L.down_off + (size_t) r * L.d_row;
+    const uint8_t* wr = (const uint8_t*) grp_ptr[g] + w_off;
+    const float sd = L.tail_off ? ((const float*) (grp_ptr[g] + L.tail_off))[2] : 1.0f;
+    const block_q8_1* s_hq = s_buf;
+    const int e0 = grp_start[g], e1 = grp_start[g + 1];
+    for (int e = e0; e < e1; e += GRP_NC) {
+        const int n = min(GRP_NC, e1 - e);
+        __syncthreads();
+        {
+#if defined(__HIPCC__)
+#pragma clang fp contract(off)
+#endif
+            const float* gp = gate + (size_t) e * 640;
+            const float* upp = up + (size_t) e * 640;
+            for (int i = threadIdx.x; i < n * 640; i += 256) {   // 640 is a multiple of 32: a 32-lane group is one q8_1 block
+                const float gv = gp[i];
+                const float h = (gv / (1.0f + __expf(-gv))) * upp[i];
+                q8_1_store(h, s_buf, i);
+            }
+        }
+        __syncthreads();
+        if (n == 1) {
+            const int off1[1] = { 0 };
+            float s1[1];
+            row_dot_sub8<TD, 1, true>(wr, s_hq, off1, 1, t, s1);
+            if (t == 0) out[(size_t) ent_dst[e] * L.n_embd + r] = s1[0] * sd;
+        } else if (n == 2) {
+            const int off2[2] = { 0, 20 };
+            float s2[2];
+            row_dot_sub8<TD, 2, true>(wr, s_hq, off2, 2, t, s2);
+            if (t < 2) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s2[t] * sd;
+        } else if (n == 3) {
+            const int off3[3] = { 0, 20, 40 };
+            float s3[3];
+            row_dot_sub8<TD, 3, true>(wr, s_hq, off3, 3, t, s3);
+            if (t < 3) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s3[t] * sd;
+        } else {
+            const int off4[4] = { 0, 20, 40, 60 };
+            float s4[4];
+            row_dot_sub8<TD, 4, true>(wr, s_hq, off4, 4, t, s4);
+            if (t < 4) out[(size_t) ent_dst[e + t] * L.n_embd + r] = s4[t] * sd;
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x == 0 &&
+        __hip_atomic_fetch_add(sync + cap + g, 1u, __ATOMIC_ACQ_REL, __HIP_MEMORY_SCOPE_AGENT) == (unsigned) FX_DN_BLOCKS - 1) {
+        __hip_atomic_store(sync + g, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+        __hip_atomic_store(sync + cap + g, 0u, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+    }
+}
 template<int TG, int TD>
 void legacy_experts(const LegacyArgs& a) {
     const NativeExpertLayout& L = a.L;
     const int vg = g_legacy_exp / 10, vd = g_legacy_exp % 10;
     const unsigned cg = (unsigned) a.cap_groups, gyu = (unsigned) a.gy;
     cudaStream_t s = a.s;
+    if (vg == 3 && vd == 5 && a.sync != nullptr && g_exp_phase == 0 && !a.v1 && a.gy == a.cap_groups &&
+        a.cap_groups <= 256 && env_on("STRATA_HIP_SWIGLU_FUSED")) {
+        const unsigned blocks = (unsigned) ((FX_GU_BLOCKS + FX_DN_BLOCKS) * a.cap_groups);
+        fused_experts_kernel<TG, TD><<<blocks, 256, 0, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.ent_dst, a.ent_tok, a.X, L,
+                                                           a.gate, a.up, a.out, (int) a.cap_groups, a.sync);
+        check("native_expert_grouped/fused legacy");
+        return;
+    }
     if (g_exp_phase != 2) {
         switch (vg) {
             case 1: native_gu_multi_kernel<TG, false, false><<<dim3((unsigned) (2 * L.n_ff / GU_ROWS), gyu), 256, 0, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.ent_tok, a.X, L, a.gate, a.up); break;
@@ -4546,7 +4656,7 @@ void legacy_experts(const LegacyArgs& a) {
     }
     if (g_exp_phase == 1) return;
     switch (vd) {
-        case 1: native_down_multi_kernel<TD, true><<<dim3((unsigned) (L.n_embd / 32), gyu), 256, 0, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.ent_dst, a.hq, L, a.out); break;
+        case 1: case 5: native_down_multi_kernel<TD, true><<<dim3((unsigned) (L.n_embd / 32), gyu), 256, 0, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.ent_dst, a.hq, L, a.out); break;
         case 2: s27_down_kernel<TD, true, 4, false><<<dim3((unsigned) (L.n_embd / 32), cg), 256, 0, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.ent_dst, a.hq, L, a.out); break;
         case 3: s27_down_kernel<TD, true, 2, false><<<dim3((unsigned) (L.n_embd / 16), cg), 256, 0, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.ent_dst, a.hq, L, a.out); break;
         default: native_down_kernel<TD><<<dim3((unsigned) (L.n_embd / 8), gyu), 256, 0, s>>>(a.grp_ptr, a.grp_start, a.n_groups, a.ent_dst, a.hq, L, a.out); break;
@@ -4559,7 +4669,7 @@ void legacy_experts(const LegacyArgs& a) {
 void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr, const int32_t* grp_start,
                            const int32_t* n_groups, const int32_t* ent_dst, const int32_t* ent_tok, int64_t cap_groups,
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
-                           int64_t grid_groups) {
+                           int64_t grid_groups, unsigned* sync) {
     if (cap_groups <= 0 || cap_entries <= 0) return;
     if (L.n_ff % 32 != 0) { std::fprintf(stderr, "native_expert_grouped: n_ff %lld\n", (long long) L.n_ff); std::exit(1); }
     cudaStream_t s = (cudaStream_t) stream;
@@ -4630,7 +4740,7 @@ void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
 #if defined(STRATA_HIP_GFX906)
     if (g_legacy_exp > 0 && !g_old_kernels && L.n_embd == 2560 && L.n_ff == 640) {
         // Q4_1/Q4_1 (bartowski Q4_1), Q4_0/Q4_0 and Q4_0 gate/up + Q4_1 down (bartowski Q4_0, layers 0-5)
-        const LegacyArgs a{L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, cap_groups, cap_entries, gy, v1, s};
+        const LegacyArgs a{L, grp_ptr, grp_start, n_groups, ent_dst, ent_tok, X, gate, up, h, hq, out, cap_groups, cap_entries, gy, v1, s, sync};
         if (L.gu_type == 3 && L.d_type == 3) { legacy_experts<3, 3>(a); return; }
         if (L.gu_type == 2 && L.d_type == 2) { legacy_experts<2, 2>(a); return; }
         if (L.gu_type == 2 && L.d_type == 3) { legacy_experts<2, 3>(a); return; }

@@ -636,6 +636,7 @@ private:
     uint8_t* nat_xq_ = nullptr;   // plan v0.3 P6: q8_1 activations for a native pack's grouped experts
     float* hit_xs_ = nullptr;
     void* hit_scratch_ = nullptr;
+    unsigned* exp_sync_ = nullptr;   // the fused grouped-expert call's group counters (STRATA_LEGACY_EXP=35)
     float *head_mixed_ = nullptr, *head_inj_ = nullptr, *head_logits_ = nullptr;
     uint16_t* sh_bf16_ = nullptr;
     uint8_t* arg_scratch_ = nullptr;   ///< argmax_rows' partials and counters
