@@ -15221,10 +15221,10 @@ int main(int argc, char** argv) {
                         } else if (B.made && !B.sfx) {
                             ++hd_scored;
                             const int32_t y = outp[(size_t) A.T - 1];
+                            const int b1 = B.p0 == B.p0 ? std::min(9, std::max(0, (int) (B.p0 * 10.0f))) : 0;
+                            const int b2 = B.altp[0] == B.altp[0] ? std::min(9, std::max(0, (int) (B.altp[0] * 10.0f))) : 0;
                             if (B.tok[0] == y) ++hd_hit1;
                             else {
-                                const int b1 = B.p0 == B.p0 ? std::min(9, std::max(0, (int) (B.p0 * 10.0f))) : 0;
-                                const int b2 = B.altp[0] == B.altp[0] ? std::min(9, std::max(0, (int) (B.altp[0] * 10.0f))) : 0;
                                 ++hd_miss;
                                 ++hd_miss_p1[b1];
                                 ++hd_miss_p2[b2];
