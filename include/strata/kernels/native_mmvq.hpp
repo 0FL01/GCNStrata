@@ -155,6 +155,11 @@ bool native_mmvq_supported(int ggml_type) noexcept;
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
+/// gfx906 head split: rows [0, n_out) of a Q6_K (type 14) head, `weights` at the first row, outputs y[t * ldy + r]
+/// (ldy >= n_out) - bitwise the same rows of native_mmvq. False (nothing launched) outside its wave X path
+/// (non-gfx906, ncols > 4, STRATA_Q6_PACKED / STRATA_MMVQ_WAVE=0 / STRATA_GFX906_Q6_HEAD_X=0).
+bool native_q6_k_head_rows(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ldy, int ncols,
+                           void* stream);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,

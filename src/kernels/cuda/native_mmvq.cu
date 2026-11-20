@@ -1865,7 +1865,7 @@ bool g_wave_off = std::getenv("STRATA_MMVQ_WAVE") && std::string(std::getenv("ST
 template<typename F, int NCOLS, int R>
 __launch_bounds__(256)
 __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ x,
-                                        float* __restrict__ y, int n_in, int n_out) {
+                                        float* __restrict__ y, int n_in, int n_out, int ldy) {
     constexpr int BPIW = 64 / F::T;
     static_assert(64 % F::T == 0, "a block's threads must tile the wavefront");
     const int lane = int(threadIdx.x) & 63;
@@ -1893,7 +1893,7 @@ __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w,
             float v = tmp[j][i];
 #pragma unroll
             for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
-            if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * n_out + row0 + i] = v;
+            if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * ldy + row0 + i] = v;
         }
 }
 // Indexed MTP head component only. Existing wave kernel and dispatch stay unchanged.
@@ -1934,24 +1934,25 @@ __global__ void native_q5_k_mtp_head_indexed_wave_kernel(const typename F::Block
 }
 
 template<typename F, int NCOLS, int R = 1>
-void wave_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s) {
+void wave_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, cudaStream_t s, int ldy = 0) {
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     const unsigned blocks = unsigned((std::size_t(n_out) + 4 * R - 1) / (4 * R));
-    native_mmvq_wave_kernel<F, NCOLS, R><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out);
+    native_mmvq_wave_kernel<F, NCOLS, R><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out, ldy > 0 ? ldy : n_out);
 }
 template<typename F, int R = 1>
-void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream) {
+void wave_launch(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols, void* stream,
+                 int ldy = 0) {
     const auto s = static_cast<cudaStream_t>(stream);
     switch (ncols) {
-        case 1: wave_launch_n<F, 1, R>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 2: wave_launch_n<F, 2, R>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 3: wave_launch_n<F, 3, R>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 4: wave_launch_n<F, 4, R>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 5: wave_launch_n<F, 5, R>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 6: wave_launch_n<F, 6, R>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 7: wave_launch_n<F, 7, R>(weights, x_q8_1, y, n_in, n_out, s); break;
-        case 8: wave_launch_n<F, 8, R>(weights, x_q8_1, y, n_in, n_out, s); break;
+        case 1: wave_launch_n<F, 1, R>(weights, x_q8_1, y, n_in, n_out, s, ldy); break;
+        case 2: wave_launch_n<F, 2, R>(weights, x_q8_1, y, n_in, n_out, s, ldy); break;
+        case 3: wave_launch_n<F, 3, R>(weights, x_q8_1, y, n_in, n_out, s, ldy); break;
+        case 4: wave_launch_n<F, 4, R>(weights, x_q8_1, y, n_in, n_out, s, ldy); break;
+        case 5: wave_launch_n<F, 5, R>(weights, x_q8_1, y, n_in, n_out, s, ldy); break;
+        case 6: wave_launch_n<F, 6, R>(weights, x_q8_1, y, n_in, n_out, s, ldy); break;
+        case 7: wave_launch_n<F, 7, R>(weights, x_q8_1, y, n_in, n_out, s, ldy); break;
+        case 8: wave_launch_n<F, 8, R>(weights, x_q8_1, y, n_in, n_out, s, ldy); break;
         default: throw std::invalid_argument("native MMVQ (wave) requires 1 <= ncols <= 8");
     }
 }
@@ -2888,6 +2889,24 @@ void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
     validate_stream(stream);
     native_quantize_q8_1(x, scratch_q8_1, n_in, ncols, stream);
     native_q4_k_mmvq(weights, scratch_q8_1, y, n_in, n_out, ncols, stream);
+}
+
+// gfx906 head split (STRATA_GFX906_HEAD_SPLIT): rows [0, n_out) of a Q6_K head (weights = the first row) with the
+// outputs column-strided by ldy (y[t * ldy + r]) - exactly native_q6_k_mmvq's wave X path, whose row sums depend only
+// on the row (bitwise). False (nothing launched) where native_q6_k_mmvq would take another path.
+bool native_q6_k_head_rows(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ldy, int ncols,
+                           void* stream) {
+#if defined(STRATA_HIP_GFX906)
+    if (g_wave_off || n_in != 2560 || n_out < 32768 || ncols < 1 || ncols > 4 || !q6_head_x() || ldy < n_out) return false;
+    if (std::getenv("STRATA_Q6_PACKED") != nullptr && std::string(std::getenv("STRATA_Q6_PACKED")) == "1") return false;
+    if (ncols == 2) wave_launch<Q6KTraitsX, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream, ldy);
+    else wave_launch<Q6KTraitsX, 2>(weights, x_q8_1, y, n_in, n_out, ncols, stream, ldy);
+    launch_check();
+    return true;
+#else
+    (void) weights; (void) x_q8_1; (void) y; (void) n_in; (void) n_out; (void) ldy; (void) ncols; (void) stream;
+    return false;
+#endif
 }
 
 void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
