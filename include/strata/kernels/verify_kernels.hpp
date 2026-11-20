@@ -196,7 +196,7 @@ void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_str
 /// kernel. A peer copies the input into its memory (head_split_peer_in), computes its rows into a local buffer, writes
 /// them into A's staging and the window number into its slot's flag on A (head_split_peer_out). A, after its own rows,
 /// waits for every slot's number and copies the staging into the logits (head_split_gather). Flags and staging on A are
-/// hipDeviceMallocUncached VRAM (kernel P2P on gfx906 sees nothing else). A wait over 30 s sets *err (mapped) and gives
+/// hipDeviceMallocUncached VRAM (kernel P2P on gfx906 sees nothing else). A wait over 15 s sets *err (mapped) and gives
 /// up. Non-gfx906 builds: the launchers throw.
 inline constexpr int kHeadSplitMaxSlots = 2;
 struct HeadSplitLinks {

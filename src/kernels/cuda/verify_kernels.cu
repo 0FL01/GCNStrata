@@ -1717,7 +1717,7 @@ bool pdl_launch_ok(const void* kernel, cudaStream_t stream) {
 namespace {
 __device__ inline uint32_t hs_ld(const uint32_t* p) { return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM); }
 __device__ inline void hs_st(uint32_t* p, uint32_t v) { __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM); }
-constexpr uint64_t kHsTimeout = 3000000000ull;   // 30 s of the 100 MHz s_memrealtime
+constexpr uint64_t kHsTimeout = 375000000ull;   // 15 s of s_memrealtime (25 MHz on gfx906), inside the 20 s window watchdog
 __global__ void head_split_publish_kernel(const uint4* __restrict__ xq, int n16, uint4* hin, uint32_t* hseq,
                                           uint32_t* ctr) {
     const uint32_t seq = ctr[0] + 1;

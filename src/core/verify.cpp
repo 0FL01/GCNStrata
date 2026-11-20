@@ -500,6 +500,10 @@ bool Verifier::release_gpu_waits(int timeout_ms) {
     for (cudaStream_t s : {cs_, copy_}) {
         if (s == nullptr) continue;
         while (cudaStreamQuery(s) == cudaErrorNotReady) {
+            if (hs_triggered_ < hs_launched_) {   // STRATA_GFX906_HEAD_SPLIT: a released window's head still needs its slots
+                std::string e2;
+                (void) hs_poll(e2);
+            }
             if (ms_since(t0) > timeout_ms) {
                 trace_ev("RELEASE-NOT-DRAINED", -1, -1, (int64_t) ms_since(t0));
                 return false;
@@ -2391,9 +2395,11 @@ bool Verifier::hs_setup(std::string& err) {
         return true;
     };
     const int N = (int) g_->n_embd, MT = kHsMaxT, xqb = MT * (N / 32) * 36;
-    auto unc = [](void** p, size_t bytes) {
+    // (zero fills on a stream of their own, synced alone: a device-wide sync here could wait for a window that waits for
+    // this thread, e.g. a prelaunched stage of an overlapped split)
+    auto unc = [](void** p, size_t bytes, cudaStream_t s) {
         if (hipExtMallocWithFlags(p, bytes, hipDeviceMallocUncached) != hipSuccess) { (void) hipGetLastError(); *p = nullptr; return false; }
-        return hipMemset(*p, 0, bytes) == hipSuccess;
+        return hipMemsetAsync(*p, 0, bytes, s) == hipSuccess;
     };
     auto host = [](size_t bytes, void** h) {
         if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) { *h = nullptr; return false; }
@@ -2402,14 +2408,17 @@ bool Verifier::hs_setup(std::string& err) {
     };
     {
         const OnDevice on(device_);
-        if (!unc((void**) &hs_done_, 64 * (size_t) sp.m) ||
-            !unc((void**) &hs_stage_, sizeof(float) * MT * (size_t) (n_vocab_ - sp.b[0])) ||
-            cudaMalloc((void**) &hs_ctr_, 64) != cudaSuccess || cudaMemset(hs_ctr_, 0, 64) != cudaSuccess ||
-            !host((size_t) xqb, (void**) &hs_in_h_) || !host(64, (void**) &hs_seq_h_) || !host(64, (void**) &hs_err_h_) ||
-            cudaHostGetDevicePointer(&hs_in_d_, hs_in_h_, 0) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &hs_seq_d_, hs_seq_h_, 0) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &hs_err_d_, hs_err_h_, 0) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)
-            return fail(device_, "buffers");
+        cudaStream_t zs = nullptr;
+        const bool ok = cudaStreamCreateWithFlags(&zs, cudaStreamNonBlocking) == cudaSuccess &&
+            unc((void**) &hs_done_, 64 * (size_t) sp.m, zs) &&
+            unc((void**) &hs_stage_, sizeof(float) * MT * (size_t) (n_vocab_ - sp.b[0]), zs) &&
+            cudaMalloc((void**) &hs_ctr_, 64) == cudaSuccess && cudaMemsetAsync(hs_ctr_, 0, 64, zs) == cudaSuccess &&
+            host((size_t) xqb, (void**) &hs_in_h_) && host(64, (void**) &hs_seq_h_) && host(64, (void**) &hs_err_h_) &&
+            cudaHostGetDevicePointer(&hs_in_d_, hs_in_h_, 0) == cudaSuccess &&
+            cudaHostGetDevicePointer((void**) &hs_seq_d_, hs_seq_h_, 0) == cudaSuccess &&
+            cudaHostGetDevicePointer((void**) &hs_err_d_, hs_err_h_, 0) == cudaSuccess && cudaStreamSynchronize(zs) == cudaSuccess;
+        if (zs) cudaStreamDestroy(zs);
+        if (!ok) return fail(device_, "buffers");
     }
     int max_rows = 0;
     for (int j = 0; j < sp.m; ++j) max_rows = std::max(max_rows, sp.b[j + 1] - sp.b[j]);
@@ -2420,9 +2429,9 @@ bool Verifier::hs_setup(std::string& err) {
         if (cudaStreamCreateWithFlags(&p.s, cudaStreamNonBlocking) != cudaSuccess ||
             cudaMalloc((void**) &p.xq, (size_t) xqb) != cudaSuccess ||
             cudaMalloc((void**) &p.y, sizeof(float) * MT * (size_t) max_rows) != cudaSuccess ||
-            cudaMalloc((void**) &p.words, 128) != cudaSuccess || cudaMemset(p.words, 0, 128) != cudaSuccess ||
+            cudaMalloc((void**) &p.words, 128) != cudaSuccess || cudaMemsetAsync(p.words, 0, 128, p.s) != cudaSuccess ||
             cudaHostGetDevicePointer(&p.hin_d, hs_in_h_, 0) != cudaSuccess ||
-            cudaHostGetDevicePointer((void**) &p.hseq_d, hs_seq_h_, 0) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)
+            cudaHostGetDevicePointer((void**) &p.hseq_d, hs_seq_h_, 0) != cudaSuccess || cudaStreamSynchronize(p.s) != cudaSuccess)
             return fail(sp.dev[k], "buffers");
         for (int j = 0; j < sp.m; ++j)
             for (int T = 1; T <= kHsMaxT; ++T) {
@@ -2493,7 +2502,7 @@ bool Verifier::hs_poll(std::string& err) {
 
 bool Verifier::hs_failed(std::string& err) const {
     if (hs_n_ == 0 || hs_err_h_ == nullptr || *(const volatile uint32_t*) hs_err_h_ == 0) return false;
-    err = "verify: the split head (STRATA_GFX906_HEAD_SPLIT) waited 30 s for a peer; the window was not used";
+    err = "verify: the split head (STRATA_GFX906_HEAD_SPLIT) waited 15 s for a peer; the window was not used";
     return true;
 }
 
