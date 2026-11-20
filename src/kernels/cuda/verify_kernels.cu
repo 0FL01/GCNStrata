@@ -1727,16 +1727,22 @@ __global__ void head_split_publish_kernel(const uint4* __restrict__ xq, int n16,
     if (threadIdx.x == 0) { ctr[0] = seq; hs_st(hseq, seq); }
 }
 __global__ void head_split_gather_kernel(HeadSplitLinks L, const uint32_t* ctr, const float* stage, int MT,
-                                         float* logits, int T, int vocab, uint32_t* err) {
+                                         float* logits, int T, int vocab, uint32_t* err, unsigned long long* stat) {
     __shared__ int ok;
-    if (threadIdx.x == 0) ok = 1;
-    __syncthreads();
-    if (int(threadIdx.x) < L.n) {
+    if (threadIdx.x == 0) {
+        ok = 1;
         const uint32_t want = ctr[0];
         const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
-        while (hs_ld(L.done[threadIdx.x]) != want) {
-            __builtin_amdgcn_s_sleep(1);
-            if (__builtin_amdgcn_s_memrealtime() - t0 > kHsTimeout) { *(volatile uint32_t*) err = 1u; ok = 0; break; }
+        for (int k = 0; k < L.n && ok; ++k)
+            while (hs_ld(L.done[k]) != want) {
+                __builtin_amdgcn_s_sleep(1);
+                if (__builtin_amdgcn_s_memrealtime() - t0 > kHsTimeout) { *(volatile uint32_t*) err = 1u; ok = 0; break; }
+            }
+        if (blockIdx.x == 0 && stat != nullptr) {   // the wait of this window (s_memrealtime ticks): sum, max, count
+            const unsigned long long w = __builtin_amdgcn_s_memrealtime() - t0;
+            atomicAdd(&stat[0], w);
+            atomicMax(&stat[1], w);
+            atomicAdd(&stat[2], 1ull);
         }
     }
     __syncthreads();
@@ -1773,9 +1779,9 @@ void head_split_publish(const void* xq, int bytes, void* hin, uint32_t* hseq, ui
                                                                               static_cast<uint4*>(hin), hseq, ctr);
 }
 void head_split_gather(const HeadSplitLinks& links, const uint32_t* ctr, const float* stage, int max_t, float* logits,
-                       int T, int vocab, uint32_t* err, void* stream) {
+                       int T, int vocab, uint32_t* err, unsigned long long* stat, void* stream) {
     head_split_gather_kernel<<<120, 256, 0, static_cast<cudaStream_t>(stream)>>>(links, ctr, stage, max_t, logits, T,
-                                                                               vocab, err);
+                                                                               vocab, err, stat);
 }
 void head_split_peer_in(const void* hin, const uint32_t* hseq, void* xq, int bytes, uint32_t* seen, void* stream) {
     head_split_peer_in_kernel<<<1, 256, 0, static_cast<cudaStream_t>(stream)>>>(
@@ -1788,7 +1794,7 @@ void head_split_peer_out(const float* y, int n, int T, float* dst, const uint32_
 }
 #else
 void head_split_publish(const void*, int, void*, uint32_t*, uint32_t*, void*) { throw std::runtime_error("head split: gfx906 only"); }
-void head_split_gather(const HeadSplitLinks&, const uint32_t*, const float*, int, float*, int, int, uint32_t*, void*) { throw std::runtime_error("head split: gfx906 only"); }
+void head_split_gather(const HeadSplitLinks&, const uint32_t*, const float*, int, float*, int, int, uint32_t*, unsigned long long*, void*) { throw std::runtime_error("head split: gfx906 only"); }
 void head_split_peer_in(const void*, const uint32_t*, void*, int, uint32_t*, void*) { throw std::runtime_error("head split: gfx906 only"); }
 void head_split_peer_out(const float*, int, int, float*, const uint32_t*, uint32_t*, uint32_t*, void*) { throw std::runtime_error("head split: gfx906 only"); }
 #endif

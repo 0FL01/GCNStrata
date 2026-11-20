@@ -207,8 +207,9 @@ struct HeadSplitLinks {
 /// xq -> hin (mapped host, `bytes`), then ++ctr[0] -> *hseq (mapped host)
 void head_split_publish(const void* xq, int bytes, void* hin, uint32_t* hseq, uint32_t* ctr, void* stream);
 /// `stage`: slot j's rows at stage + (b[j] - b[0]) * max_t, [T][b[j+1] - b[j]]; into logits[t * vocab + row]
+/// `stat` (device, optional): [0] += this window's wait for the slots, [1] = max, [2] += 1 (s_memrealtime ticks)
 void head_split_gather(const HeadSplitLinks& links, const uint32_t* ctr, const float* stage, int max_t, float* logits,
-                       int T, int vocab, uint32_t* err, void* stream);
+                       int T, int vocab, uint32_t* err, unsigned long long* stat, void* stream);
 /// hin (mapped host) -> xq; *hseq -> seen[0]
 void head_split_peer_in(const void* hin, const uint32_t* hseq, void* xq, int bytes, uint32_t* seen, void* stream);
 /// y: [T][n] local; dst: A's staging for the slot ([T][n]); count: a zeroed device word; done <- seen[0]

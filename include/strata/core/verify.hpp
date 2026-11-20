@@ -123,6 +123,8 @@ public:
     static bool nan_guard_on();
     /// The most tokens one window holds (`init`'s `max_t`; 0 before it).
     int max_t() const { return max_t_; }
+    /// gfx906 STRATA_GFX906_HEAD_SPLIT: this verifier's split-head counters ("" when the head is not split here)
+    std::string head_split_report() const;
     /// The sampling the verify window's head applies (temperature / top_p / top_k / seed).  Set per
     /// request; greedy by default.  The sampling itself runs OUTSIDE the captured graph - its
     /// parameters would otherwise be baked forever - so this can change between requests freely.
@@ -583,6 +585,10 @@ private:
     uint64_t hs_launched_ = 0, hs_triggered_ = 0;   ///< split windows launched / their slots launched
     int hs_T_ = 0;
     int64_t hs_busy_picks_ = 0;          ///< slots that had to go to a card with a window in flight
+    unsigned long long* hs_stat_ = nullptr;   ///< device: the gather's waits (head_split_gather)
+    double hs_gap_sum_ = 0, hs_gap_max_ = 0;  ///< ms between the host's polls while a head was pending
+    int64_t hs_gaps_ = 0;
+    std::chrono::steady_clock::time_point hs_last_poll_{};
     bool hs_tried_ = false;
     bool hs_setup(std::string& err);
     void hs_free();

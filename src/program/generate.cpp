@@ -15498,6 +15498,12 @@ int main(int argc, char** argv) {
                 if (aov)
                     std::fprintf(stderr, "strata decode adapt overlap: %lld windows took swaps still landing, a layer waited %.2f ms in all so far\n",
                                  (long long) aov_flips, ver.ms_gate);
+                {   // gfx906 STRATA_GFX906_HEAD_SPLIT: both verifiers of the last stage (counters since the start)
+                    for (int par = 0; par < 2; ++par) {
+                        const std::string h0 = stage_ver_p(n_stages - 1, par).head_split_report();
+                        if (!h0.empty()) std::fprintf(stderr, "strata decode head split (parity %d): %s\n", par, h0.c_str());
+                    }
+                }
                 for (int st = 0; st < n_stages; ++st) {   // every stage's GPU profile, not only the first card's
                     const std::string pr = stage_ver(st).profile_report();
                     if (pr.empty()) continue;

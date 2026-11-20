@@ -2267,7 +2267,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                                                 (int) n_vocab_, T, cs))
                         throw std::runtime_error("the split head's own rows did not launch");
                     strata::kernels::head_split_gather(L, hs_ctr_, hs_stage_, kHsMaxT, head_logits_, T, (int) n_vocab_,
-                                                       hs_err_d_, cs);
+                                                       hs_err_d_, hs_stat_, cs);
                 } else
                 if (g_mmvq_il() && strata::kernels::native_mmvq_il_supported(head_->type(), (int) T, (int) n_vocab_)) {
                     if (T >= 2) strata::kernels::native_q8_1_interleave(xq_, xil_, (int) N, (int) T, cs);
@@ -2368,8 +2368,9 @@ void Verifier::hs_free() {
         }
         p = HeadSplitPeer{};
     }
-    for (void* d : {(void*) hs_done_, (void*) hs_stage_, (void*) hs_ctr_})
+    for (void* d : {(void*) hs_done_, (void*) hs_stage_, (void*) hs_ctr_, (void*) hs_stat_})
         if (d) cudaFree(d);
+    hs_stat_ = nullptr;
     for (void* h : {(void*) hs_in_h_, (void*) hs_seq_h_, (void*) hs_err_h_})
         if (h) cudaFreeHost(h);
     hs_done_ = nullptr; hs_stage_ = nullptr; hs_ctr_ = nullptr;
@@ -2413,6 +2414,7 @@ bool Verifier::hs_setup(std::string& err) {
             unc((void**) &hs_done_, 64 * (size_t) sp.m, zs) &&
             unc((void**) &hs_stage_, sizeof(float) * MT * (size_t) (n_vocab_ - sp.b[0]), zs) &&
             cudaMalloc((void**) &hs_ctr_, 64) == cudaSuccess && cudaMemsetAsync(hs_ctr_, 0, 64, zs) == cudaSuccess &&
+            cudaMalloc((void**) &hs_stat_, 64) == cudaSuccess && cudaMemsetAsync(hs_stat_, 0, 64, zs) == cudaSuccess &&
             host((size_t) xqb, (void**) &hs_in_h_) && host(64, (void**) &hs_seq_h_) && host(64, (void**) &hs_err_h_) &&
             cudaHostGetDevicePointer(&hs_in_d_, hs_in_h_, 0) == cudaSuccess &&
             cudaHostGetDevicePointer((void**) &hs_seq_d_, hs_seq_h_, 0) == cudaSuccess &&
@@ -2472,7 +2474,17 @@ bool Verifier::hs_card_busy(int dev) const {
 // candidates without a window in flight first
 bool Verifier::hs_poll(std::string& err) {
 #if defined(STRATA_HIP_GFX906)
-    if (hs_triggered_ >= hs_launched_ || *(volatile uint32_t*) hs_seq_h_ != (uint32_t) (hs_triggered_ + 1)) return true;
+    if (hs_triggered_ >= hs_launched_) return true;
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (hs_last_poll_.time_since_epoch().count() != 0) {
+            const double g = std::chrono::duration<double, std::milli>(now - hs_last_poll_).count();
+            if (g < 50.0) { hs_gap_sum_ += g; hs_gap_max_ = std::max(hs_gap_max_, g); ++hs_gaps_; }
+        }
+        hs_last_poll_ = now;
+    }
+    if (*(volatile uint32_t*) hs_seq_h_ != (uint32_t) (hs_triggered_ + 1)) return true;
+    hs_last_poll_ = {};
     const NativeHead::Split& sp = head_->split();
     int pick[2] = {-1, -1}, np = 0;
     for (int pass = 0; pass < 2 && np < hs_m_; ++pass)
@@ -2498,6 +2510,21 @@ bool Verifier::hs_poll(std::string& err) {
     (void) err;
     return true;
 #endif
+}
+
+std::string Verifier::head_split_report() const {
+    if (hs_n_ == 0) return std::string();
+    unsigned long long st[3] = {0, 0, 0};
+    if (hs_stat_ != nullptr) {
+        const OnDevice on(device_);
+        if (cudaMemcpy(st, hs_stat_, sizeof st, cudaMemcpyDeviceToHost) != cudaSuccess) (void) cudaGetLastError();
+    }
+    char b[256];
+    std::snprintf(b, sizeof b, "%llu heads, %lld slots on busy cards, gather wait avg %.1f max %.1f us, host poll gap "
+                  "avg %.2f max %.2f ms", (unsigned long long) hs_triggered_, (long long) hs_busy_picks_,
+                  st[2] ? (double) st[0] / (double) st[2] / 25.0 : 0.0, (double) st[1] / 25.0,
+                  hs_gaps_ ? hs_gap_sum_ / (double) hs_gaps_ : 0.0, hs_gap_max_);
+    return b;
 }
 
 bool Verifier::hs_failed(std::string& err) const {
