@@ -2255,12 +2255,10 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (hs_n_ > 0 && !batch_rec_ && T <= kHsMaxT) {   // STRATA_GFX906_HEAD_SPLIT: bitwise the rows below
                     const NativeHead::Split& sp = head_->split();
                     strata::kernels::HeadSplitLinks L;
-                    L.n = hs_n_;
-                    for (int k = 0; k <= hs_n_; ++k) L.b[k] = sp.b[k];
-                    for (int k = 0; k < hs_n_; ++k) {
-                        L.inbox[k] = hs_[k].inbox; L.inflag[k] = hs_[k].inflag; L.done[k] = hs_done_ + 16 * k;
-                    }
-                    strata::kernels::head_split_publish(xq_, (int) T * (int) (N / 32) * 36, L, hs_ctr_, cs);
+                    L.n = hs_m_;
+                    for (int k = 0; k <= hs_m_; ++k) L.b[k] = sp.b[k];
+                    for (int k = 0; k < hs_m_; ++k) L.done[k] = hs_done_ + 16 * k;
+                    strata::kernels::head_split_publish(xq_, (int) T * (int) (N / 32) * 36, hs_in_d_, hs_seq_d_, hs_ctr_, cs);
                     if (!strata::kernels::native_q6_k_head_rows(head_->weights(), xq_, head_logits_, (int) N, sp.b[0],
                                                                 (int) n_vocab_, T, cs))
                         throw std::runtime_error("the split head's own rows did not launch");
@@ -2354,68 +2352,138 @@ void Verifier::hs_free() {
     const NativeHead::Split* sp = head_ != nullptr ? &head_->split() : nullptr;
     for (int k = 0; k < 3; ++k) {
         HeadSplitPeer& p = hs_[k];
-        if (sp == nullptr || k >= sp->n) continue;
-        const OnDevice on(sp->dev[k]);
-        if (p.s) cudaStreamSynchronize(p.s);
-        for (auto& e : p.exec)
-            if (e) cudaGraphExecDestroy(e);
-        for (void* d : {p.inbox, (void*) p.inflag, (void*) p.xq, (void*) p.y, (void*) p.words})
-            if (d) cudaFree(d);
-        if (p.err_h) cudaFreeHost(p.err_h);
-        if (p.s) cudaStreamDestroy(p.s);
+        if (sp != nullptr && k < sp->n) {
+            const OnDevice on(sp->dev[k]);
+            if (p.s) cudaStreamSynchronize(p.s);
+            for (auto& row : p.exec)
+                for (auto& e : row)
+                    if (e) cudaGraphExecDestroy(e);
+            for (void* d : {(void*) p.xq, (void*) p.y, (void*) p.words})
+                if (d) cudaFree(d);
+            if (p.s) cudaStreamDestroy(p.s);
+        }
         p = HeadSplitPeer{};
     }
     for (void* d : {(void*) hs_done_, (void*) hs_stage_, (void*) hs_ctr_})
         if (d) cudaFree(d);
-    if (hs_err_h_) cudaFreeHost(hs_err_h_);
-    hs_done_ = nullptr; hs_stage_ = nullptr; hs_ctr_ = nullptr; hs_err_h_ = hs_err_d_ = nullptr;
-    hs_n_ = 0;
+    for (void* h : {(void*) hs_in_h_, (void*) hs_seq_h_, (void*) hs_err_h_})
+        if (h) cudaFreeHost(h);
+    hs_done_ = nullptr; hs_stage_ = nullptr; hs_ctr_ = nullptr;
+    hs_in_h_ = nullptr; hs_in_d_ = nullptr; hs_seq_h_ = hs_seq_d_ = nullptr; hs_err_h_ = hs_err_d_ = nullptr;
+    hs_n_ = hs_m_ = 0;
 }
 
-// gfx906 STRATA_GFX906_HEAD_SPLIT: the split head's buffers, on the last stage's card and its peers (once, before the
-// first capture). A failed allocation leaves the head unsplit (said once).
+// gfx906 STRATA_GFX906_HEAD_SPLIT: the split head's buffers and every slot's peer graphs (once, before the first
+// capture). A failure leaves the head unsplit (said once).
 bool Verifier::hs_setup(std::string& err) {
+    (void) err;
 #if defined(STRATA_HIP_GFX906)
     if (hs_tried_ || head_ == nullptr || !head_->loaded() || head_->split().n == 0 || le_ < g_->n_layers ||
         head_->device() != device_)
         return true;
     hs_tried_ = true;
-    auto fail = [&](int dev) {
+    const NativeHead::Split& sp = head_->split();
+    auto fail = [&](int dev, const char* what) {
         (void) cudaGetLastError();
         hs_free();
-        std::fprintf(stderr, "strata verify: the split head's buffers on CUDA%d failed: this window keeps the head on CUDA%d\n",
-                     dev, device_);
+        std::fprintf(stderr, "strata verify: the split head on CUDA%d failed (%s): the head stays on CUDA%d\n", dev,
+                     what, device_);
         return true;
     };
-    const NativeHead::Split& sp = head_->split();
-    const int MT = kHsMaxT, xqb = MT * (int) (g_->n_embd / 32) * 36;
+    const int N = (int) g_->n_embd, MT = kHsMaxT, xqb = MT * (N / 32) * 36;
     auto unc = [](void** p, size_t bytes) {
         if (hipExtMallocWithFlags(p, bytes, hipDeviceMallocUncached) != hipSuccess) { (void) hipGetLastError(); *p = nullptr; return false; }
         return hipMemset(*p, 0, bytes) == hipSuccess;
     };
+    auto host = [](size_t bytes, void** h) {
+        if (cudaHostAlloc(h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) { *h = nullptr; return false; }
+        std::memset(*h, 0, bytes);
+        return true;
+    };
     {
         const OnDevice on(device_);
-        if (!unc((void**) &hs_done_, 64 * (size_t) sp.n) ||
+        if (!unc((void**) &hs_done_, 64 * (size_t) sp.m) ||
             !unc((void**) &hs_stage_, sizeof(float) * MT * (size_t) (n_vocab_ - sp.b[0])) ||
             cudaMalloc((void**) &hs_ctr_, 64) != cudaSuccess || cudaMemset(hs_ctr_, 0, 64) != cudaSuccess ||
-            !mapped(64, (void**) &hs_err_h_, (void**) &hs_err_d_) || cudaDeviceSynchronize() != cudaSuccess)
-            return fail(device_);   // (synced: the zero fills land before any graph of a nonblocking stream reads them)
+            !host((size_t) xqb, (void**) &hs_in_h_) || !host(64, (void**) &hs_seq_h_) || !host(64, (void**) &hs_err_h_) ||
+            cudaHostGetDevicePointer(&hs_in_d_, hs_in_h_, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &hs_seq_d_, hs_seq_h_, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &hs_err_d_, hs_err_h_, 0) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)
+            return fail(device_, "buffers");
     }
+    int max_rows = 0;
+    for (int j = 0; j < sp.m; ++j) max_rows = std::max(max_rows, sp.b[j + 1] - sp.b[j]);
+    const size_t rb = head_->row_bytes();
     for (int k = 0; k < sp.n; ++k) {
         const OnDevice on(sp.dev[k]);
         HeadSplitPeer& p = hs_[k];
-        int lo = 0, hi = 0;
-        const size_t rows = (size_t) (sp.b[k + 1] - sp.b[k]);
-        const bool ok = hipDeviceGetStreamPriorityRange(&lo, &hi) == hipSuccess &&
-                        hipStreamCreateWithPriority(&p.s, hipStreamNonBlocking, hi) == hipSuccess &&
-                        unc(&p.inbox, (size_t) xqb) && unc((void**) &p.inflag, 64) &&
-                        cudaMalloc((void**) &p.xq, (size_t) xqb) == cudaSuccess &&
-                        cudaMalloc((void**) &p.y, sizeof(float) * MT * rows) == cudaSuccess &&
-                        cudaMalloc((void**) &p.words, 128) == cudaSuccess && cudaMemset(p.words, 0, 128) == cudaSuccess &&
-                        mapped(64, (void**) &p.err_h, (void**) &p.err_d) && cudaDeviceSynchronize() == cudaSuccess;
-        if (!ok) return fail(sp.dev[k]);
+        if (cudaStreamCreateWithFlags(&p.s, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaMalloc((void**) &p.xq, (size_t) xqb) != cudaSuccess ||
+            cudaMalloc((void**) &p.y, sizeof(float) * MT * (size_t) max_rows) != cudaSuccess ||
+            cudaMalloc((void**) &p.words, 128) != cudaSuccess || cudaMemset(p.words, 0, 128) != cudaSuccess ||
+            cudaHostGetDevicePointer(&p.hin_d, hs_in_h_, 0) != cudaSuccess ||
+            cudaHostGetDevicePointer((void**) &p.hseq_d, hs_seq_h_, 0) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)
+            return fail(sp.dev[k], "buffers");
+        for (int j = 0; j < sp.m; ++j)
+            for (int T = 1; T <= kHsMaxT; ++T) {
+                const int rows = sp.b[j + 1] - sp.b[j];
+                if (cudaStreamBeginCapture(p.s, cudaStreamCaptureModeThreadLocal) != cudaSuccess) return fail(sp.dev[k], "capture");
+                bool ok = true;
+                try {
+                    strata::kernels::head_split_peer_in(p.hin_d, p.hseq_d, p.xq, T * (N / 32) * 36, p.words, p.s);
+                    ok = strata::kernels::native_q6_k_head_rows((const uint8_t*) sp.w[k] + rb * (size_t) (sp.b[j] - sp.b[0]),
+                                                                p.xq, p.y, N, rows, rows, T, p.s);
+                    strata::kernels::head_split_peer_out(p.y, rows, T, hs_stage_ + (size_t) (sp.b[j] - sp.b[0]) * MT,
+                                                         p.words, p.words + 16, hs_done_ + 16 * j, p.s);
+                } catch (const std::exception&) {
+                    ok = false;
+                }
+                cudaGraph_t graph = nullptr;
+                const cudaError_t ce = cudaStreamEndCapture(p.s, &graph);
+                const bool inst = ok && ce == cudaSuccess && cudaGraphInstantiate(&p.exec[j][T], graph, nullptr, nullptr, 0) == cudaSuccess;
+                if (graph) cudaGraphDestroy(graph);
+                if (!inst) { p.exec[j][T] = nullptr; return fail(sp.dev[k], "peer graph"); }
+            }
     }
     hs_n_ = sp.n;
+    hs_m_ = sp.m;
+    return true;
+#else
+    return true;
+#endif
+}
+
+bool Verifier::hs_card_busy(int dev) const {
+    for (auto& slot : g_live)
+        if (const Verifier* v = slot.load(); v != nullptr && v != this && v->device_ == dev && v->fl_active_) return true;
+    return false;
+}
+
+// the host side: once the window graph has published its head input, every slot's graph on its own candidate, the
+// candidates without a window in flight first
+bool Verifier::hs_poll(std::string& err) {
+#if defined(STRATA_HIP_GFX906)
+    if (hs_triggered_ >= hs_launched_ || *(volatile uint32_t*) hs_seq_h_ != (uint32_t) (hs_triggered_ + 1)) return true;
+    const NativeHead::Split& sp = head_->split();
+    int pick[2] = {-1, -1}, np = 0;
+    for (int pass = 0; pass < 2 && np < hs_m_; ++pass)
+        for (int k = 0; k < hs_n_ && np < hs_m_; ++k) {
+            if (pick[0] == k) continue;
+            if (hs_card_busy(sp.dev[k]) != (pass == 1)) continue;
+            pick[np++] = k;
+            if (pass == 1) ++hs_busy_picks_;
+        }
+    for (int j = 0; j < hs_m_; ++j) {
+        HeadSplitPeer& p = hs_[pick[j]];
+        const OnDevice on(sp.dev[pick[j]]);
+        const cudaError_t le = cudaGraphLaunch(p.exec[j][hs_T_], p.s);
+        if (le != cudaSuccess) {
+            err = std::string("verify: split head: peer launch: ") + cudaGetErrorString(le);
+            return false;
+        }
+        (void) cudaStreamQuery(p.s);
+    }
+    ++hs_triggered_;
     return true;
 #else
     (void) err;
@@ -2423,64 +2491,10 @@ bool Verifier::hs_setup(std::string& err) {
 #endif
 }
 
-// before every launch of a window graph that holds the split head: each peer's part (captured on first use per T)
-bool Verifier::hs_launch_peers(int T, std::string& err) {
-#if defined(STRATA_HIP_GFX906)
-    if (hs_n_ == 0 || T > kHsMaxT) return true;
-    const NativeHead::Split& sp = head_->split();
-    const int xqb = T * (int) (g_->n_embd / 32) * 36;
-    for (int k = 0; k < hs_n_; ++k) {   // every peer's graph first: a failed capture launches none of them
-        HeadSplitPeer& p = hs_[k];
-        if (p.exec[T] != nullptr) continue;
-        const OnDevice on(sp.dev[k]);
-        const int rows = sp.b[k + 1] - sp.b[k];
-        if (cudaStreamBeginCapture(p.s, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
-            err = "verify: split head: begin capture failed";
-            return false;
-        }
-        bool ok = true;
-        try {
-            strata::kernels::head_split_peer_in(p.inbox, p.inflag, p.xq, xqb, p.words, p.err_d, p.s);
-            ok = strata::kernels::native_q6_k_head_rows(sp.w[k], p.xq, p.y, (int) g_->n_embd, rows, rows, T, p.s);
-            strata::kernels::head_split_peer_out(p.y, rows, T, hs_stage_ + (size_t) (sp.b[k] - sp.b[0]) * kHsMaxT,
-                                                 p.words, p.words + 16, hs_done_ + 16 * k, p.s);
-        } catch (const std::exception&) {
-            ok = false;
-        }
-        cudaGraph_t graph = nullptr;
-        const cudaError_t ce = cudaStreamEndCapture(p.s, &graph);
-        if (!ok || ce != cudaSuccess || cudaGraphInstantiate(&p.exec[T], graph, nullptr, nullptr, 0) != cudaSuccess) {
-            if (graph) cudaGraphDestroy(graph);
-            (void) cudaGetLastError();
-            p.exec[T] = nullptr;
-            err = "verify: split head: the peer graph on CUDA" + std::to_string(sp.dev[k]) + " failed";
-            return false;
-        }
-        cudaGraphDestroy(graph);
-    }
-    for (int k = 0; k < hs_n_; ++k) {
-        HeadSplitPeer& p = hs_[k];
-        const OnDevice on(sp.dev[k]);
-        const cudaError_t le = cudaGraphLaunch(p.exec[T], p.s);
-        if (le != cudaSuccess) {
-            err = std::string("verify: split head: peer launch: ") + cudaGetErrorString(le);
-            return false;
-        }
-        (void) cudaStreamQuery(p.s);
-    }
-    return true;
-#else
-    (void) T; (void) err;
-    return true;
-#endif
-}
-
 bool Verifier::hs_failed(std::string& err) const {
-    if (hs_n_ == 0) return false;
-    bool bad = hs_err_h_ != nullptr && *(const volatile uint32_t*) hs_err_h_ != 0;
-    for (int k = 0; k < hs_n_; ++k) bad = bad || (hs_[k].err_h != nullptr && *(const volatile uint32_t*) hs_[k].err_h != 0);
-    if (bad) err = "verify: the split head (STRATA_GFX906_HEAD_SPLIT) waited 30 s for a card; the window was not used";
-    return bad;
+    if (hs_n_ == 0 || hs_err_h_ == nullptr || *(const volatile uint32_t*) hs_err_h_ == 0) return false;
+    err = "verify: the split head (STRATA_GFX906_HEAD_SPLIT) waited 30 s for a peer; the window was not used";
+    return true;
 }
 
 bool Verifier::capture(int T, std::string& err) {
@@ -2883,10 +2897,10 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
     // 0.1.43: the same gate run() applies before it launches (the adaptive tier's copies land first)
     if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
         !adapt_gate_wait((int32_t) g_->n_layers, err)) return false;
-    if (!hs_launch_peers(T, err)) return false;
     const cudaError_t le = cudaGraphLaunch(exec_t, cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    hs_note_launch(T);
     (void) cudaStreamQuery(cs_);
     prelaunched_ = T;
     return true;
@@ -2960,11 +2974,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
                          [this] { (void) release_gpu_waits(5000); });
         const cudaError_t le = launch_o->status();
 #else
-        if (!hs_launch_peers(T, err)) return false;
         const cudaError_t le = cudaGraphLaunch(ar_off_ ? exec_nr_[T] : exec_[T], cs_);
 #endif
         trace_ev("LAUNCHED", -1, -1, (int64_t) le);
         if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+        hs_note_launch(T);
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
         (void) launch_o->query();
 #else
@@ -3152,6 +3166,11 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         return false;
     }
 #endif
+    while (hs_triggered_ < hs_launched_) {   // STRATA_GFX906_HEAD_SPLIT: the slots launch once the head input is out
+        if (!hs_poll(err)) return false;
+        if (hs_triggered_ < hs_launched_ && cudaStreamQuery(cs_) != cudaErrorNotReady) break;
+        _mm_pause();
+    }
     trace_ev("SYNC", -1, -1, 0);
     const cudaError_t se = cudaStreamSynchronize(cs_);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
@@ -4388,10 +4407,10 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW (pipelined)", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
-    if (!hs_launch_peers(T, err)) return false;
     const cudaError_t le = cudaGraphLaunch(exec_[T], cs_);
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
+    hs_note_launch(T);
     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
     if (cudaEventRecord(ev_done_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
     (void) cudaStreamQuery(cs_);   // WDDM: submit now
@@ -4401,6 +4420,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
 }
 
 int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
+    if (hs_triggered_ != hs_launched_ && !hs_poll(err)) return -1;
     if (!fl_active_) return 1;
     if (fl_k_ >= fl_total_) return 1;
     // Nothing rang yet and neither the WDDM flush nor the timeout below is due: return before any CUDA call.  The
@@ -4494,6 +4514,7 @@ int Verifier::service(PoolMultiFn pool, void* user, std::string& err) {
 }
 
 bool Verifier::done(std::string& err) {
+    if (hs_triggered_ != hs_launched_ && !hs_poll(err)) return false;
     if (!fl_active_ || fl_k_ < fl_total_) return false;
     const OnDevice on_device(device_);
     const cudaError_t q = cudaEventQuery(ev_done_);

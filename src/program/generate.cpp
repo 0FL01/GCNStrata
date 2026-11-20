@@ -6499,11 +6499,11 @@ int main(int argc, char** argv) {
     if (multi_gpu)
         std::fprintf(stderr, "strata generate: layer split: CUDA0 runs layers 0-%lld\n", (long long) (split_at[0] - 1));
 #if defined(STRATA_HIP_GFX906)
-    // STRATA_GFX906_HEAD_SPLIT=<peer cards, e.g. 1,2> (off by default; "0" alone means off): the verify head's rows over
-    // the head's card and those peers, bitwise (NativeHead::load_split, Verifier::hs_*). Loaded after the expert caches
-    // are sized, from the room they leave, so the placement of the experts (and the texts) stays that of the unsplit
-    // head. STRATA_GFX906_HEAD_SPLIT_SHARE: the head card's share of the rows (default by peer count, head_split_bench
-    // on MI50: 0.56 / 0.42 / 0.32)
+    // STRATA_GFX906_HEAD_SPLIT=<candidate peer cards, e.g. 0,1,2> (off by default; "0" alone means off): the verify
+    // head's rows over the head's card and up to two idle candidates per window, bitwise (NativeHead::load_split,
+    // Verifier::hs_*). Loaded after the expert caches are sized, from the room they leave, so the placement of the
+    // experts (and the texts) stays that of the unsplit head. STRATA_GFX906_HEAD_SPLIT_SHARE: the head card's share of
+    // the rows (default 0.56 with one candidate, 0.42 with two slots; head_split_bench on MI50)
     if (const char* hv = std::getenv("STRATA_GFX906_HEAD_SPLIT");
         multi_gpu && !stages.empty() && stages.back()->head.loaded() && hv != nullptr && *hv != 0 && std::string(hv) != "0") {
         GpuStage& st = *stages.back();
@@ -6516,7 +6516,7 @@ int main(int argc, char** argv) {
             peers.push_back((int) d);
             c = *end == ',' ? end + 1 : end;
         }
-        const double def_share = peers.size() == 1 ? 0.56 : peers.size() == 2 ? 0.42 : 0.32;
+        const double def_share = peers.size() == 1 ? 0.56 : 0.42;
         const char* sv = std::getenv("STRATA_GFX906_HEAD_SPLIT_SHARE");
         const double share = sv != nullptr && *sv != 0 ? std::atof(sv) : def_share;
         std::string serr;

@@ -31,16 +31,18 @@ public:
     int device() const { return device_; }
     /// Bytes of one vocabulary row.
     size_t row_bytes() const { return n_out_ > 0 ? (size_t) (bytes_ / (uint64_t) n_out_) : 0; }
-    /// gfx906 STRATA_GFX906_HEAD_SPLIT: copies of rows [b[k], b[k+1]) on peer card dev[k] (k < n), for the verify
-    /// window's head (Verifier); this card keeps every row (the paths that do not split read them all).
+    /// gfx906 STRATA_GFX906_HEAD_SPLIT: a copy of rows [b[0], vocab) on each candidate peer card dev[k] (k < n); per
+    /// window the Verifier has m = min(n, 2) idle candidates compute slot j's rows [b[j], b[j+1]) (b[m] = vocab). This
+    /// card keeps every row (the paths that do not split read them all).
     struct Split {
-        int n = 0;
-        int b[4] = {};     ///< b[0]: the rows this card computes alone; b[n] = the vocabulary
+        int n = 0;          ///< candidate peers
+        int m = 0;          ///< slots: peers computing at once
+        int b[3] = {};      ///< b[0]: the rows this card computes alone
         int dev[3] = {};
-        void* w[3] = {};
+        void* w[3] = {};    ///< rows [b[0], vocab) on dev[k]
     };
-    /// After load: the peers (distinct CUDA devices other than device()) and this card's share of the rows; false
-    /// with `err` when the head, the card or the peers cannot split (nothing changed then).
+    /// After load: the candidate peers (distinct CUDA devices other than device()) and this card's share of the rows;
+    /// false with `err` when the head, the card or the peers cannot split (nothing changed then).
     bool load_split(const std::vector<int>& peers, double own_share, std::string& err);
     const Split& split() const { return split_; }
 

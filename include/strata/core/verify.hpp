@@ -555,32 +555,40 @@ private:
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
     // gfx906 STRATA_GFX906_HEAD_SPLIT (NativeHead::Split): the head's rows over this card and peers for windows of
-    // up to kHsMaxT tokens. Each peer runs its part as its own graph on a high-priority stream (ROCm gives each
-    // priority level its own hardware queues, so the waiting graph never blocks the peer's stage work), launched by the
-    // host beside this card's window graph (hs_launch_peers).
+    // up to kHsMaxT tokens. The window graph publishes its head input to mapped host memory; the host (hs_poll, from
+    // service / done / run) then launches the slots' graphs on candidates whose cards have no window in flight, so a
+    // peer's hardware queue never holds a waiting kernel (ROCm shares the few queues of a card between its streams).
     static constexpr int kHsMaxT = 4;
     struct HeadSplitPeer {
         cudaStream_t s = nullptr;
-        void* inbox = nullptr;           ///< uncached, on the peer: the q8_1 input
-        uint32_t* inflag = nullptr;      ///< uncached, on the peer
         uint8_t* xq = nullptr;           ///< on the peer
-        float* y = nullptr;              ///< on the peer: [T][rows]
-        uint32_t* words = nullptr;       ///< on the peer: [0] the last window number seen, [16] the blocks' count
-        uint32_t* err_h = nullptr;       ///< mapped: a wait timed out
-        uint32_t* err_d = nullptr;
-        cudaGraphExec_t exec[kHsMaxT + 1] = {};
+        float* y = nullptr;              ///< on the peer: [T][a slot's rows]
+        uint32_t* words = nullptr;       ///< on the peer: [0] the window number, [16] the blocks' count
+        void* hin_d = nullptr;           ///< the mapped input / number, as the peer addresses them
+        uint32_t* hseq_d = nullptr;
+        cudaGraphExec_t exec[2][kHsMaxT + 1] = {};   ///< [slot][T]
     };
-    int hs_n_ = 0;                       ///< peers; 0: the head is not split here
+    int hs_n_ = 0;                       ///< candidates; 0: the head is not split here
+    int hs_m_ = 0;                       ///< slots
     HeadSplitPeer hs_[3];
-    uint32_t* hs_done_ = nullptr;        ///< uncached, this card: peer k's window number at [16 k]
-    float* hs_stage_ = nullptr;          ///< uncached, this card: the peers' rows
+    uint32_t* hs_done_ = nullptr;        ///< uncached, this card: slot j's window number at [16 j]
+    float* hs_stage_ = nullptr;          ///< uncached, this card: the slots' rows
     uint32_t* hs_ctr_ = nullptr;         ///< this card: the window number
+    uint8_t* hs_in_h_ = nullptr;         ///< mapped: the head input (kHsMaxT columns of q8_1)
+    void* hs_in_d_ = nullptr;
+    uint32_t* hs_seq_h_ = nullptr;       ///< mapped: the window number, after the input
+    uint32_t* hs_seq_d_ = nullptr;
     uint32_t* hs_err_h_ = nullptr;       ///< mapped: this card's wait timed out
     uint32_t* hs_err_d_ = nullptr;
+    uint64_t hs_launched_ = 0, hs_triggered_ = 0;   ///< split windows launched / their slots launched
+    int hs_T_ = 0;
+    int64_t hs_busy_picks_ = 0;          ///< slots that had to go to a card with a window in flight
     bool hs_tried_ = false;
     bool hs_setup(std::string& err);
     void hs_free();
-    bool hs_launch_peers(int T, std::string& err);
+    void hs_note_launch(int T) { if (hs_n_ > 0 && T <= kHsMaxT && !batch_rec_) { hs_T_ = T; ++hs_launched_; } }
+    bool hs_poll(std::string& err);
+    bool hs_card_busy(int dev) const;
     bool hs_failed(std::string& err) const;
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention

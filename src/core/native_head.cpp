@@ -53,11 +53,12 @@ bool NativeHead::load_split(const std::vector<int>& peers, double own_share, std
     }
     Split s;
     s.n = n;
+    s.m = n < 2 ? n : 2;
     const int own = ((int) (own_share * n_out_) / 64) * 64;
     s.b[0] = own;
-    for (int k = 1; k < n; ++k) s.b[k] = own + ((int) ((double) (n_out_ - own) * k / n) / 64) * 64;
-    s.b[n] = n_out_;
-    for (int k = 0; k <= n; ++k) {   // every part on the head kernel's row-range path (32768+ rows), at 1-4 columns
+    if (s.m == 2) s.b[1] = own + ((n_out_ - own) / 2 / 64) * 64;
+    s.b[s.m] = n_out_;
+    for (int k = 0; k <= s.m; ++k) {   // every part on the head kernel's row-range path (32768+ rows), at 1-4 columns
         const int rows = k == 0 ? s.b[0] : s.b[k] - s.b[k - 1];
         for (int c = 1; c <= 4; ++c)
             if (!strata::kernels::native_q6_k_head_rows_supported(n_in_, rows, c)) {
@@ -80,14 +81,14 @@ bool NativeHead::load_split(const std::vector<int>& peers, double own_share, std
             }
             (void) cudaGetLastError();
         }
-        const size_t bytes = rb * (size_t) (s.b[k + 1] - s.b[k]);
+        const size_t bytes = rb * (size_t) (n_out_ - s.b[0]);
         cudaError_t e;
         {
             const OnDevice on(peers[k]);
             e = cudaMalloc(&s.w[k], bytes);
         }
         if (e == cudaSuccess)
-            e = cudaMemcpyPeer(s.w[k], peers[k], (const uint8_t*) weights_ + rb * (size_t) s.b[k], device_, bytes);
+            e = cudaMemcpyPeer(s.w[k], peers[k], (const uint8_t*) weights_ + rb * (size_t) s.b[0], device_, bytes);
         if (e != cudaSuccess) {
             (void) cudaGetLastError();
             err = std::string("head split: the rows on CUDA") + std::to_string(peers[k]) + ": " + cudaGetErrorString(e);
@@ -97,11 +98,11 @@ bool NativeHead::load_split(const std::vector<int>& peers, double own_share, std
         }
     }
     split_ = s;
-    std::fprintf(stderr, "strata: head split (STRATA_GFX906_HEAD_SPLIT): rows [0, %d) on CUDA%d", s.b[0], device_);
+    std::fprintf(stderr, "strata: head split (STRATA_GFX906_HEAD_SPLIT): rows [0, %d) on CUDA%d, %d slot(s) of [%d, %d) "
+                         "on idle candidates", s.b[0], device_, s.m, s.b[0], n_out_);
     for (int k = 0; k < n; ++k)
-        std::fprintf(stderr, ", [%d, %d) on CUDA%d (%.1f MiB)", s.b[k], s.b[k + 1], s.dev[k],
-                     (double) (rb * (size_t) (s.b[k + 1] - s.b[k])) / 1048576.0);
-    std::fprintf(stderr, "\n");
+        std::fprintf(stderr, " CUDA%d", s.dev[k]);
+    std::fprintf(stderr, " (%.1f MiB each)\n", (double) (rb * (size_t) (n_out_ - s.b[0])) / 1048576.0);
     return true;
 #else
     (void) peers; (void) own_share;
