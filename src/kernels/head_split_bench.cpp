@@ -11,7 +11,9 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/verify_kernels.hpp"
 
+#include <chrono>
 #include <cstdint>
+#include <unistd.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -49,14 +51,14 @@ struct Peers {
 };
 
 // A, 1 block: next window number, the input to every peer, then each peer's flag
-__global__ void k_publish(const uint4* __restrict__ xq, int n16, Peers P, unsigned* ctr) {
+__global__ void k_publish(const uint4* __restrict__ xq, int n16, Peers P, unsigned* ctr, unsigned* hseq) {
     const unsigned seq = ctr[0] + 1;
     for (int p = 0; p < P.n; ++p)
         for (int i = threadIdx.x; i < n16; i += blockDim.x) P.inbox[p][i] = xq[i];
     __threadfence_system();
     __syncthreads();
     if (int(threadIdx.x) < P.n) st_sys(P.inflag[threadIdx.x], seq);
-    if (threadIdx.x == 0) ctr[0] = seq;
+    if (threadIdx.x == 0) { ctr[0] = seq; st_sys(hseq, seq); }
 }
 // A, 1 block: every peer's rows are in
 __global__ void k_wait_done(Peers P, const unsigned* ctr, unsigned* err) {
@@ -146,6 +148,8 @@ int main(int argc, char** argv) {
     const int unc_logits = argc > 6 ? std::atoi(argv[6]) : 0;
     const int busy_us = argc > 7 ? std::atoi(argv[7]) : 0;      // per iteration: each peer's 8 normal streams busy
     const int peer_prio = argc > 8 ? std::atoi(argv[8]) : 0;    // 1: the peers' head streams at the highest priority
+    const int host_trig = argc > 9 ? std::atoi(argv[9]) : 0;    // 1: the peers launched by the host once A published
+    const int idle_ms = argc > 10 ? std::atoi(argv[10]) : 0;    // sleep before each iteration (idle cards)
     const int NP = int(peers.size());
     if (T < 1 || T > 4 || NP < 1 || NP > MAXP) { std::fprintf(stderr, "T 1..4, 1..3 peers\n"); return 1; }
 
@@ -197,6 +201,7 @@ int main(int argc, char** argv) {
     CK(hipMalloc(&ctrA, 4)); CK(hipMemset(ctrA, 0, 4));
     CK(hipHostMalloc(&bad, 16, hipHostMallocMapped)); std::memset(bad, 0, 16);
     CK(hipHostMalloc(&err, 16, hipHostMallocMapped)); std::memset(err, 0, 16);
+    unsigned* hseq; CK(hipHostMalloc(&hseq, 64, hipHostMallocMapped | hipHostMallocPortable)); std::memset(hseq, 0, 64);
     for (int k = 0; k < KX; ++k) {
         K::native_mmvq(14, wA, xq + std::size_t(k) * XQB * T, ref + std::size_t(k) * T * V, N, V, T, sA);
         K::argmax_rows_nf(ref + std::size_t(k) * T * V, T, V, scr, ref_ids + 8 * k, nf, sA);
@@ -249,7 +254,7 @@ int main(int argc, char** argv) {
         K::argmax_rows_nf(logits, T, V, scr, ids, nf, sA);
         CK(hipStreamEndCapture(sA, &g)); CK(hipGraphInstantiate(&g1[k], g, nullptr, nullptr, 0));
         CK(hipStreamBeginCapture(sA, hipStreamCaptureModeRelaxed));
-        k_publish<<<1, 256, 0, sA>>>(reinterpret_cast<const uint4*>(x), XQB * T / 16, P, ctrA);
+        k_publish<<<1, 256, 0, sA>>>(reinterpret_cast<const uint4*>(x), XQB * T / 16, P, ctrA, hseq);
         if (!K::native_q6_k_head_rows(wA, x, logits, N, XA, V, T, sA)) { std::fprintf(stderr, "head_rows refused\n"); return 1; }
         if (unc_logits == 2) {
             Rows R{}; R.XA = XA; for (int j = 0; j <= NP; ++j) R.b[j] = b[j];
@@ -262,12 +267,15 @@ int main(int argc, char** argv) {
     double sum[2] = {0, 0};
     float mn[2] = {1e9f, 1e9f};
     unsigned bad_l[2] = {0, 0}, bad_i[2] = {0, 0};
+    unsigned seq_host = 0;
+    double trig_us = 0;
     for (int it = 0; it < iters + 10; ++it) {
         for (int arm = 0; arm < 2; ++arm) {
             const int k = it % KX;
+            if (idle_ms > 0) usleep(idle_ms * 1000);
             CK(hipSetDevice(A));
             k_poison<<<240, 256, 0, sA>>>(logits, T * V, -1.0f);   // a stale or missing row shows
-            if (arm == 1)
+            if (arm == 1 && !host_trig)
                 for (int p = 0; p < NP; ++p) {
                     CK(hipSetDevice(peers[p]));
                     if (busy_us > 0) for (auto& bs : ps[p].busy) k_busy<<<1, 64, 0, bs>>>(busy_us);
@@ -277,6 +285,14 @@ int main(int argc, char** argv) {
             CK(hipEventRecord(e0, sA));
             CK(hipGraphLaunch(arm ? g2[k] : g1[k], sA));
             CK(hipEventRecord(e1, sA));
+            if (arm == 1 && host_trig) {   // as the engine's hs_poll: wait for A's number, then launch the peers
+                ++seq_host;
+                while (__atomic_load_n(hseq, __ATOMIC_ACQUIRE) != seq_host) {}
+                const auto t0 = std::chrono::steady_clock::now();
+                for (int p = 0; p < NP; ++p) { CK(hipSetDevice(peers[p])); CK(hipGraphLaunch(ps[p].g, ps[p].s)); }
+                CK(hipSetDevice(A));
+                if (it >= 10) trig_us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+            }
             bad[0] = bad[1] = 0;
             k_cmp<<<240, 256, 0, sA>>>(logits, ref + std::size_t(k) * T * V, T * V, bad);
             k_cmp_i<<<1, 64, 0, sA>>>(ids, ref_ids + 8 * k, T, bad + 1);
@@ -287,6 +303,7 @@ int main(int argc, char** argv) {
             if (*err) { std::fprintf(stderr, "spin timeout at it %d arm %d\n", it, arm); return 2; }
         }
     }
+    if (host_trig) std::printf("host launch of the peers: %.1f us a window\n", trig_us / iters);
     std::printf("one-card head+pick: avg %.4f min %.4f ms | split: avg %.4f min %.4f ms | saved %.4f ms | "
                 "mismatch logits %u/%u ids %u/%u (of %d iters)\n",
                 sum[0] / iters, mn[0], sum[1] / iters, mn[1], (sum[0] - sum[1]) / iters, bad_l[0], bad_l[1], bad_i[0],
