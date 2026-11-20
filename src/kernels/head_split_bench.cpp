@@ -216,7 +216,12 @@ int main(int argc, char** argv) {
         CK(hipSetDevice(d));
         PeerSt& q = ps[k];
         for (auto& bs : q.busy) CK(hipStreamCreateWithFlags(&bs, hipStreamNonBlocking));
-        if (peer_prio) { int lo, hi; CK(hipDeviceGetStreamPriorityRange(&lo, &hi)); CK(hipStreamCreateWithPriority(&q.s, hipStreamNonBlocking, hi)); }
+        if (peer_prio == 2) {   // a CU-masked stream (every CU): ROCm gives it a hardware queue of its own
+            hipDeviceProp_t pr; CK(hipGetDeviceProperties(&pr, d));
+            std::vector<uint32_t> m((pr.multiProcessorCount + 31) / 32, 0u);
+            for (int c = 0; c < pr.multiProcessorCount; ++c) m[c / 32] |= 1u << (c % 32);
+            CK(hipExtStreamCreateWithCUMask(&q.s, uint32_t(m.size()), m.data()));
+        } else if (peer_prio) { int lo, hi; CK(hipDeviceGetStreamPriorityRange(&lo, &hi)); CK(hipStreamCreateWithPriority(&q.s, hipStreamNonBlocking, hi)); }
         else CK(hipStreamCreateWithFlags(&q.s, hipStreamNonBlocking));
         CK(hipMalloc(&q.w, ROWB * n)); CK(hipMemcpy(q.w, hw.data() + ROWB * b[k], ROWB * n, hipMemcpyHostToDevice));
         CK(hipExtMallocWithFlags((void**) &P.inbox[k], XQB * T, hipDeviceMallocUncached));
