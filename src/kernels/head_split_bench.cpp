@@ -67,7 +67,8 @@ __global__ void k_peer_in(const uint4* inbox, const unsigned* inflag, uint4* xq,
                           unsigned* err) {
     if (threadIdx.x == 0) spin_ge(inflag, ctr[0] + 1, err);
     __syncthreads();
-    for (int i = threadIdx.x; i < n16; i += blockDim.x) xq[i] = __builtin_nontemporal_load(inbox + i);
+    const volatile unsigned* in = reinterpret_cast<const volatile unsigned*>(inbox);   // uncached: from memory
+    for (int i = threadIdx.x; i < n16; i += blockDim.x) xq[i] = make_uint4(in[4 * i], in[4 * i + 1], in[4 * i + 2], in[4 * i + 3]);
 }
 // peer: its rows (T columns of n floats, local) into A's logits at column stride V from row r0; the last block flags A
 __global__ void k_peer_out(const float4* __restrict__ y, int n4, int T, float* a_logits, int r0, unsigned* ctr,
