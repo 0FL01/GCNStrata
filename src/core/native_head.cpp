@@ -57,6 +57,15 @@ bool NativeHead::load_split(const std::vector<int>& peers, double own_share, std
     s.b[0] = own;
     for (int k = 1; k < n; ++k) s.b[k] = own + ((int) ((double) (n_out_ - own) * k / n) / 64) * 64;
     s.b[n] = n_out_;
+    for (int k = 0; k <= n; ++k) {   // every part on the head kernel's row-range path (32768+ rows), at 1-4 columns
+        const int rows = k == 0 ? s.b[0] : s.b[k] - s.b[k - 1];
+        for (int c = 1; c <= 4; ++c)
+            if (!strata::kernels::native_q6_k_head_rows_supported(n_in_, rows, c)) {
+                err = "head split: a part of " + std::to_string(rows) + " rows is off the head kernel's path "
+                      "(32768+ rows; STRATA_GFX906_Q6_HEAD_X / STRATA_MMVQ_WAVE / STRATA_Q6_PACKED)";
+                return false;
+            }
+    }
     const size_t rb = row_bytes();
     for (int k = 0; k < n; ++k) {
         s.dev[k] = peers[k];

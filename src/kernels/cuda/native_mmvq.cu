@@ -2894,11 +2894,19 @@ void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
 // gfx906 head split (STRATA_GFX906_HEAD_SPLIT): rows [0, n_out) of a Q6_K head (weights = the first row) with the
 // outputs column-strided by ldy (y[t * ldy + r]) - exactly native_q6_k_mmvq's wave X path, whose row sums depend only
 // on the row (bitwise). False (nothing launched) where native_q6_k_mmvq would take another path.
+bool native_q6_k_head_rows_supported(int n_in, int n_out, int ncols) {
+#if defined(STRATA_HIP_GFX906)
+    if (g_wave_off || n_in != 2560 || n_out < 32768 || ncols < 1 || ncols > 4 || !q6_head_x()) return false;
+    return !(std::getenv("STRATA_Q6_PACKED") != nullptr && std::string(std::getenv("STRATA_Q6_PACKED")) == "1");
+#else
+    (void) n_in; (void) n_out; (void) ncols;
+    return false;
+#endif
+}
 bool native_q6_k_head_rows(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ldy, int ncols,
                            void* stream) {
 #if defined(STRATA_HIP_GFX906)
-    if (g_wave_off || n_in != 2560 || n_out < 32768 || ncols < 1 || ncols > 4 || !q6_head_x() || ldy < n_out) return false;
-    if (std::getenv("STRATA_Q6_PACKED") != nullptr && std::string(std::getenv("STRATA_Q6_PACKED")) == "1") return false;
+    if (!native_q6_k_head_rows_supported(n_in, n_out, ncols) || ldy < n_out) return false;
     if (ncols == 2) wave_launch<Q6KTraitsX, 4>(weights, x_q8_1, y, n_in, n_out, ncols, stream, ldy);
     else wave_launch<Q6KTraitsX, 2>(weights, x_q8_1, y, n_in, n_out, ncols, stream, ldy);
     launch_check();

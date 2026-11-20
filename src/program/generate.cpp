@@ -5252,7 +5252,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 #if defined(STRATA_HIP_GFX906)
-        // STRATA_GFX906_HEAD_SPLIT=<peer cards, e.g. 1,2> (off by default): the verify head's rows over the head's card
+        // STRATA_GFX906_HEAD_SPLIT=<peer cards, e.g. 1,2> (off by default; "0" alone means off): the verify head's rows over the head's card
         // and those peers, bitwise (NativeHead::load_split, Verifier::hs_*); STRATA_GFX906_HEAD_SPLIT_SHARE: the head
         // card's share of the rows (default by peer count, head_split_bench on MI50: 0.56 / 0.42 / 0.32)
         if (const char* hv = std::getenv("STRATA_GFX906_HEAD_SPLIT");

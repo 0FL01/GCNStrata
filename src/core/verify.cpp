@@ -2398,8 +2398,8 @@ bool Verifier::hs_setup(std::string& err) {
         if (!unc((void**) &hs_done_, 64 * (size_t) sp.n) ||
             !unc((void**) &hs_stage_, sizeof(float) * MT * (size_t) (n_vocab_ - sp.b[0])) ||
             cudaMalloc((void**) &hs_ctr_, 64) != cudaSuccess || cudaMemset(hs_ctr_, 0, 64) != cudaSuccess ||
-            !mapped(64, (void**) &hs_err_h_, (void**) &hs_err_d_))
-            return fail(device_);
+            !mapped(64, (void**) &hs_err_h_, (void**) &hs_err_d_) || cudaDeviceSynchronize() != cudaSuccess)
+            return fail(device_);   // (synced: the zero fills land before any graph of a nonblocking stream reads them)
     }
     for (int k = 0; k < sp.n; ++k) {
         const OnDevice on(sp.dev[k]);
@@ -2412,7 +2412,7 @@ bool Verifier::hs_setup(std::string& err) {
                         cudaMalloc((void**) &p.xq, (size_t) xqb) == cudaSuccess &&
                         cudaMalloc((void**) &p.y, sizeof(float) * MT * rows) == cudaSuccess &&
                         cudaMalloc((void**) &p.words, 128) == cudaSuccess && cudaMemset(p.words, 0, 128) == cudaSuccess &&
-                        mapped(64, (void**) &p.err_h, (void**) &p.err_d);
+                        mapped(64, (void**) &p.err_h, (void**) &p.err_d) && cudaDeviceSynchronize() == cudaSuccess;
         if (!ok) return fail(sp.dev[k]);
     }
     hs_n_ = sp.n;
@@ -2429,35 +2429,38 @@ bool Verifier::hs_launch_peers(int T, std::string& err) {
     if (hs_n_ == 0 || T > kHsMaxT) return true;
     const NativeHead::Split& sp = head_->split();
     const int xqb = T * (int) (g_->n_embd / 32) * 36;
+    for (int k = 0; k < hs_n_; ++k) {   // every peer's graph first: a failed capture launches none of them
+        HeadSplitPeer& p = hs_[k];
+        if (p.exec[T] != nullptr) continue;
+        const OnDevice on(sp.dev[k]);
+        const int rows = sp.b[k + 1] - sp.b[k];
+        if (cudaStreamBeginCapture(p.s, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
+            err = "verify: split head: begin capture failed";
+            return false;
+        }
+        bool ok = true;
+        try {
+            strata::kernels::head_split_peer_in(p.inbox, p.inflag, p.xq, xqb, p.words, p.err_d, p.s);
+            ok = strata::kernels::native_q6_k_head_rows(sp.w[k], p.xq, p.y, (int) g_->n_embd, rows, rows, T, p.s);
+            strata::kernels::head_split_peer_out(p.y, rows, T, hs_stage_ + (size_t) (sp.b[k] - sp.b[0]) * kHsMaxT,
+                                                 p.words, p.words + 16, hs_done_ + 16 * k, p.s);
+        } catch (const std::exception&) {
+            ok = false;
+        }
+        cudaGraph_t graph = nullptr;
+        const cudaError_t ce = cudaStreamEndCapture(p.s, &graph);
+        if (!ok || ce != cudaSuccess || cudaGraphInstantiate(&p.exec[T], graph, nullptr, nullptr, 0) != cudaSuccess) {
+            if (graph) cudaGraphDestroy(graph);
+            (void) cudaGetLastError();
+            p.exec[T] = nullptr;
+            err = "verify: split head: the peer graph on CUDA" + std::to_string(sp.dev[k]) + " failed";
+            return false;
+        }
+        cudaGraphDestroy(graph);
+    }
     for (int k = 0; k < hs_n_; ++k) {
         HeadSplitPeer& p = hs_[k];
         const OnDevice on(sp.dev[k]);
-        const int rows = sp.b[k + 1] - sp.b[k];
-        if (p.exec[T] == nullptr) {
-            if (cudaStreamBeginCapture(p.s, cudaStreamCaptureModeThreadLocal) != cudaSuccess) {
-                err = "verify: split head: begin capture failed";
-                return false;
-            }
-            bool ok = true;
-            try {
-                strata::kernels::head_split_peer_in(p.inbox, p.inflag, p.xq, xqb, p.words, p.err_d, p.s);
-                ok = strata::kernels::native_q6_k_head_rows(sp.w[k], p.xq, p.y, (int) g_->n_embd, rows, rows, T, p.s);
-                strata::kernels::head_split_peer_out(p.y, rows, T, hs_stage_ + (size_t) (sp.b[k] - sp.b[0]) * kHsMaxT,
-                                                     p.words, p.words + 16, hs_done_ + 16 * k, p.s);
-            } catch (const std::exception&) {
-                ok = false;
-            }
-            cudaGraph_t graph = nullptr;
-            const cudaError_t ce = cudaStreamEndCapture(p.s, &graph);
-            if (!ok || ce != cudaSuccess || cudaGraphInstantiate(&p.exec[T], graph, nullptr, nullptr, 0) != cudaSuccess) {
-                if (graph) cudaGraphDestroy(graph);
-                (void) cudaGetLastError();
-                p.exec[T] = nullptr;
-                err = "verify: split head: the peer graph on CUDA" + std::to_string(sp.dev[k]) + " failed";
-                return false;
-            }
-            cudaGraphDestroy(graph);
-        }
         const cudaError_t le = cudaGraphLaunch(p.exec[T], p.s);
         if (le != cudaSuccess) {
             err = std::string("verify: split head: peer launch: ") + cudaGetErrorString(le);

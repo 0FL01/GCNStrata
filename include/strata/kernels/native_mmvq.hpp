@@ -160,6 +160,8 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
 /// (non-gfx906, ncols > 4, STRATA_Q6_PACKED / STRATA_MMVQ_WAVE=0 / STRATA_GFX906_Q6_HEAD_X=0).
 bool native_q6_k_head_rows(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ldy, int ncols,
                            void* stream);
+/// Whether native_q6_k_head_rows takes this shape (the same checks, nothing launched).
+bool native_q6_k_head_rows_supported(int n_in, int n_out, int ncols);
 /// S26 STRATA_LFUSE: native_mmvq(w1 -> y1) and native_mmvq(w2 -> y2), same type / shape / input, in ONE launch,
 /// bitwise the two calls. Returns false (nothing launched) where that is not the case (Q8_0, 2-8 columns only).
 bool native_mmvq_pair(int ggml_type, const void* w1, const void* w2, const void* x_q8_1, float* y1, float* y2,

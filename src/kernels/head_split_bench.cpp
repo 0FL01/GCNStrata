@@ -273,5 +273,5 @@ int main(int argc, char** argv) {
                 "mismatch logits %u/%u ids %u/%u (of %d iters)\n",
                 sum[0] / iters, mn[0], sum[1] / iters, mn[1], (sum[0] - sum[1]) / iters, bad_l[0], bad_l[1], bad_i[0],
                 bad_i[1], iters);
-    return 0;
+    return bad_l[1] != 0 || bad_i[1] != 0 ? 3 : 0;
 }
