@@ -106,6 +106,11 @@ __global__ void k_peer_out(const float4* __restrict__ y, int n4, int T, float* d
         }
     }
 }
+// a 1-block kernel that keeps its queue busy for `us` microseconds (100 MHz s_memrealtime)
+__global__ void k_busy(int us) {
+    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    while (__builtin_amdgcn_s_memrealtime() - t0 < uint64_t(us) * 100) __builtin_amdgcn_s_sleep(2);
+}
 __global__ void k_cmp(const float* a, const float* b, int n, unsigned* bad) {
     unsigned c = 0;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x)
@@ -139,6 +144,8 @@ int main(int argc, char** argv) {
     const double fracA = argc > 4 ? std::atof(argv[4]) : 0.55;
     const int iters = argc > 5 ? std::atoi(argv[5]) : 200;
     const int unc_logits = argc > 6 ? std::atoi(argv[6]) : 0;
+    const int busy_us = argc > 7 ? std::atoi(argv[7]) : 0;      // per iteration: each peer's 8 normal streams busy
+    const int peer_prio = argc > 8 ? std::atoi(argv[8]) : 0;    // 1: the peers' head streams at the highest priority
     const int NP = int(peers.size());
     if (T < 1 || T > 4 || NP < 1 || NP > MAXP) { std::fprintf(stderr, "T 1..4, 1..3 peers\n"); return 1; }
 
@@ -150,7 +157,7 @@ int main(int argc, char** argv) {
     b[NP] = V;
     std::printf("T=%d A=%d peers=", T, A);
     for (int k = 0; k < NP; ++k) std::printf("%d[%d,%d) ", peers[k], b[k], b[k + 1]);
-    std::printf("A rows %d (%.3f) uncached_logits=%d\n", XA, double(XA) / V, unc_logits);
+    std::printf("A rows %d (%.3f) uncached_logits=%d busy_us=%d peer_prio=%d\n", XA, double(XA) / V, unc_logits, busy_us, peer_prio);
 
     // weights: random Q6_K blocks with small positive scales d
     std::vector<uint8_t> hw(ROWB * V);
@@ -202,13 +209,15 @@ int main(int argc, char** argv) {
     for (int k = 0; k < NP; ++k) { CK(hipExtMallocWithFlags((void**) &doneA[k], 256, hipDeviceMallocUncached)); CK(hipMemset(doneA[k], 0, 256)); P.done[k] = doneA[k]; }
 
     // ---- peers
-    struct PeerSt { hipStream_t s; uint8_t* w; uint4* xq; float* y; unsigned *ctr, *count; hipGraphExec_t g; };
+    struct PeerSt { hipStream_t s; hipStream_t busy[8]; uint8_t* w; uint4* xq; float* y; unsigned *ctr, *count; hipGraphExec_t g; };
     std::vector<PeerSt> ps(NP);
     for (int k = 0; k < NP; ++k) {
         const int d = peers[k], n = b[k + 1] - b[k];
         CK(hipSetDevice(d));
         PeerSt& q = ps[k];
-        CK(hipStreamCreateWithFlags(&q.s, hipStreamNonBlocking));
+        for (auto& bs : q.busy) CK(hipStreamCreateWithFlags(&bs, hipStreamNonBlocking));
+        if (peer_prio) { int lo, hi; CK(hipDeviceGetStreamPriorityRange(&lo, &hi)); CK(hipStreamCreateWithPriority(&q.s, hipStreamNonBlocking, hi)); }
+        else CK(hipStreamCreateWithFlags(&q.s, hipStreamNonBlocking));
         CK(hipMalloc(&q.w, ROWB * n)); CK(hipMemcpy(q.w, hw.data() + ROWB * b[k], ROWB * n, hipMemcpyHostToDevice));
         CK(hipExtMallocWithFlags((void**) &P.inbox[k], XQB * T, hipDeviceMallocUncached));
         CK(hipExtMallocWithFlags((void**) &P.inflag[k], 256, hipDeviceMallocUncached)); CK(hipMemset(P.inflag[k], 0, 256));
@@ -254,7 +263,11 @@ int main(int argc, char** argv) {
             CK(hipSetDevice(A));
             k_poison<<<240, 256, 0, sA>>>(logits, T * V, -1.0f);   // a stale or missing row shows
             if (arm == 1)
-                for (int p = 0; p < NP; ++p) { CK(hipSetDevice(peers[p])); CK(hipGraphLaunch(ps[p].g, ps[p].s)); }
+                for (int p = 0; p < NP; ++p) {
+                    CK(hipSetDevice(peers[p]));
+                    if (busy_us > 0) for (auto& bs : ps[p].busy) k_busy<<<1, 64, 0, bs>>>(busy_us);
+                    CK(hipGraphLaunch(ps[p].g, ps[p].s));
+                }
             CK(hipSetDevice(A));
             CK(hipEventRecord(e0, sA));
             CK(hipGraphLaunch(arm ? g2[k] : g1[k], sA));
@@ -263,7 +276,7 @@ int main(int argc, char** argv) {
             k_cmp<<<240, 256, 0, sA>>>(logits, ref + std::size_t(k) * T * V, T * V, bad);
             k_cmp_i<<<1, 64, 0, sA>>>(ids, ref_ids + 8 * k, T, bad + 1);
             CK(hipStreamSynchronize(sA));
-            for (int p = 0; arm == 1 && p < NP; ++p) { CK(hipSetDevice(peers[p])); CK(hipStreamSynchronize(ps[p].s)); }
+            for (int p = 0; arm == 1 && p < NP; ++p) { CK(hipSetDevice(peers[p])); CK(hipDeviceSynchronize()); }
             float ms; CK(hipEventElapsedTime(&ms, e0, e1));
             if (it >= 10) { sum[arm] += ms; mn[arm] = std::min(mn[arm], ms); bad_l[arm] += bad[0]; bad_i[arm] += bad[1]; }
             if (*err) { std::fprintf(stderr, "spin timeout at it %d arm %d\n", it, arm); return 2; }
