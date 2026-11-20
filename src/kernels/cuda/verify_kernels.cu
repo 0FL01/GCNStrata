@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <mutex>
 #include <utility>
+#include <stdexcept>
 #include <vector>
 
 namespace strata::kernels {
@@ -1708,6 +1709,97 @@ bool pdl_launch_ok(const void* kernel, cudaStream_t stream) {
     return true;
 #endif
 }
+#endif
+
+
+// ---- gfx906 STRATA_GFX906_HEAD_SPLIT (see the header)
+#if defined(STRATA_HIP_GFX906)
+namespace {
+__device__ inline uint32_t hs_ld(const uint32_t* p) { return __hip_atomic_load(p, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM); }
+__device__ inline void hs_st(uint32_t* p, uint32_t v) { __hip_atomic_store(p, v, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM); }
+constexpr uint64_t kHsTimeout = 3000000000ull;   // 30 s of the 100 MHz s_memrealtime
+// wait while *f == v (ne) / until *f == v (!ne); false after the timeout (then *err = 1)
+__device__ inline bool hs_wait(const uint32_t* f, uint32_t v, bool ne, uint32_t* err) {
+    const uint64_t t0 = __builtin_amdgcn_s_memrealtime();
+    while ((hs_ld(f) == v) == ne) {
+        __builtin_amdgcn_s_sleep(2);
+        if (__builtin_amdgcn_s_memrealtime() - t0 > kHsTimeout) { *(volatile uint32_t*) err = 1u; return false; }
+    }
+    return true;
+}
+__global__ void head_split_publish_kernel(const uint4* __restrict__ xq, int n16, HeadSplitLinks L, uint32_t* ctr) {
+    const uint32_t seq = ctr[0] + 1;
+    for (int p = 0; p < L.n; ++p)
+        for (int i = threadIdx.x; i < n16; i += blockDim.x) static_cast<uint4*>(L.inbox[p])[i] = xq[i];
+    __threadfence_system();
+    __syncthreads();
+    if (int(threadIdx.x) < L.n) hs_st(L.inflag[threadIdx.x], seq);
+    if (threadIdx.x == 0) ctr[0] = seq;
+}
+__global__ void head_split_gather_kernel(HeadSplitLinks L, const uint32_t* ctr, const float* stage, int MT,
+                                         float* logits, int T, int vocab, uint32_t* err) {
+    __shared__ int ok;
+    if (threadIdx.x == 0) ok = 1;
+    __syncthreads();
+    if (int(threadIdx.x) < L.n && !hs_wait(L.done[threadIdx.x], ctr[0], false, err)) ok = 0;
+    __syncthreads();
+    if (!ok) return;
+    for (int k = 0; k < L.n; ++k) {
+        const int n4 = (L.b[k + 1] - L.b[k]) / 4, total = n4 * T;
+        const float4* src = reinterpret_cast<const float4*>(stage + (size_t) (L.b[k] - L.b[0]) * MT);
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
+            const int t = i / n4, j = i - t * n4;
+            reinterpret_cast<float4*>(logits + (size_t) t * vocab + L.b[k])[j] = src[i];   // uncached: from memory
+        }
+    }
+}
+__global__ void head_split_peer_in_kernel(const uint32_t* inbox, const uint32_t* inflag, uint4* xq, int n16,
+                                          uint32_t* seen, uint32_t* err) {
+    if (threadIdx.x == 0) {
+        const uint32_t last = seen[0];
+        if (hs_wait(inflag, last, true, err)) seen[0] = hs_ld(inflag);
+    }
+    __syncthreads();
+    const volatile uint32_t* in = inbox;   // uncached: from memory
+    for (int i = threadIdx.x; i < n16; i += blockDim.x)
+        xq[i] = make_uint4(in[4 * i], in[4 * i + 1], in[4 * i + 2], in[4 * i + 3]);
+}
+__global__ void head_split_peer_out_kernel(const float4* __restrict__ y, int total, float4* dst, const uint32_t* seen,
+                                           uint32_t* count, uint32_t* done) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) dst[i] = y[i];
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0 && atomicAdd(count, 1u) == gridDim.x - 1) {
+        *count = 0;
+        __threadfence_system();
+        hs_st(done, seen[0]);
+    }
+}
+}  // namespace
+void head_split_publish(const void* xq, int bytes, const HeadSplitLinks& links, uint32_t* ctr, void* stream) {
+    head_split_publish_kernel<<<1, 256, 0, static_cast<cudaStream_t>(stream)>>>(static_cast<const uint4*>(xq),
+                                                                              bytes / 16, links, ctr);
+}
+void head_split_gather(const HeadSplitLinks& links, const uint32_t* ctr, const float* stage, int max_t, float* logits,
+                       int T, int vocab, uint32_t* err, void* stream) {
+    head_split_gather_kernel<<<120, 256, 0, static_cast<cudaStream_t>(stream)>>>(links, ctr, stage, max_t, logits, T,
+                                                                               vocab, err);
+}
+void head_split_peer_in(const void* inbox, const uint32_t* inflag, void* xq, int bytes, uint32_t* seen, uint32_t* err,
+                        void* stream) {
+    head_split_peer_in_kernel<<<1, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const uint32_t*>(inbox), inflag, static_cast<uint4*>(xq), bytes / 16, seen, err);
+}
+void head_split_peer_out(const float* y, int n, int T, float* dst, const uint32_t* seen, uint32_t* count,
+                         uint32_t* done, void* stream) {
+    head_split_peer_out_kernel<<<120, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        reinterpret_cast<const float4*>(y), n / 4 * T, reinterpret_cast<float4*>(dst), seen, count, done);
+}
+#else
+void head_split_publish(const void*, int, const HeadSplitLinks&, uint32_t*, void*) { throw std::runtime_error("head split: gfx906 only"); }
+void head_split_gather(const HeadSplitLinks&, const uint32_t*, const float*, int, float*, int, int, uint32_t*, void*) { throw std::runtime_error("head split: gfx906 only"); }
+void head_split_peer_in(const void*, const uint32_t*, void*, int, uint32_t*, uint32_t*, void*) { throw std::runtime_error("head split: gfx906 only"); }
+void head_split_peer_out(const float*, int, int, float*, const uint32_t*, uint32_t*, uint32_t*, void*) { throw std::runtime_error("head split: gfx906 only"); }
 #endif
 
 }  // namespace strata::kernels

@@ -1,4 +1,5 @@
 #include "strata/core/native_head.hpp"
+#include "strata/core/on_device.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -9,6 +10,8 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <string>
+#include <utility>
 
 namespace strata::core {
 
@@ -17,11 +20,85 @@ NativeHead::~NativeHead() {
 }
 
 void NativeHead::unload() {
+    for (int k = 0; k < split_.n; ++k)
+        if (split_.w[k]) { const OnDevice on(split_.dev[k]); cudaFree(split_.w[k]); }
+    split_ = Split{};
     if (weights_) strata::kernels::native_q6_k_unpack(weights_);
     if (scratch_) cudaFree(scratch_);
     if (weights_) cudaFree(weights_);
     scratch_ = nullptr;
     weights_ = nullptr;
+}
+
+bool NativeHead::load_split(const std::vector<int>& peers, double own_share, std::string& err) {
+#if defined(STRATA_HIP_GFX906)
+    if (!loaded() || split_.n > 0) { err = "head split: the head is not loaded, or already split"; return false; }
+    const int n = (int) peers.size();
+    if (n < 1 || n > 3) { err = "head split: 1 to 3 peer cards"; return false; }
+    if (type_ != 14 || n_in_ != 2560 || strata::kernels::native_q6_k_packed_enabled()) {
+        err = "head split: needs the unpacked Q6_K head of 2560 inputs";
+        return false;
+    }
+    if (!(own_share > 0.05 && own_share < 0.95)) { err = "head split: the head card's share must be in (0.05, 0.95)"; return false; }
+    for (int k = 0; k < n; ++k) {
+        int a = 0, b = 0;
+        if (peers[k] == device_ || cudaDeviceCanAccessPeer(&a, device_, peers[k]) != cudaSuccess ||
+            cudaDeviceCanAccessPeer(&b, peers[k], device_) != cudaSuccess || !a || !b) {
+            (void) cudaGetLastError();
+            err = "head split: CUDA" + std::to_string(peers[k]) + " is not a peer of CUDA" + std::to_string(device_);
+            return false;
+        }
+        for (int j = 0; j < k; ++j)
+            if (peers[j] == peers[k]) { err = "head split: a peer is listed twice"; return false; }
+    }
+    Split s;
+    s.n = n;
+    const int own = ((int) (own_share * n_out_) / 64) * 64;
+    s.b[0] = own;
+    for (int k = 1; k < n; ++k) s.b[k] = own + ((int) ((double) (n_out_ - own) * k / n) / 64) * 64;
+    s.b[n] = n_out_;
+    const size_t rb = row_bytes();
+    for (int k = 0; k < n; ++k) {
+        s.dev[k] = peers[k];
+        for (const auto& [from, to] : {std::pair<int, int>{device_, peers[k]}, std::pair<int, int>{peers[k], device_}}) {
+            const OnDevice on(from);
+            const cudaError_t e = cudaDeviceEnablePeerAccess(to, 0);
+            if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) {
+                (void) cudaGetLastError();
+                err = std::string("head split: peer access: ") + cudaGetErrorString(e);
+                for (int j = 0; j < k; ++j) { const OnDevice o(s.dev[j]); cudaFree(s.w[j]); }
+                return false;
+            }
+            (void) cudaGetLastError();
+        }
+        const size_t bytes = rb * (size_t) (s.b[k + 1] - s.b[k]);
+        cudaError_t e;
+        {
+            const OnDevice on(peers[k]);
+            e = cudaMalloc(&s.w[k], bytes);
+        }
+        if (e == cudaSuccess)
+            e = cudaMemcpyPeer(s.w[k], peers[k], (const uint8_t*) weights_ + rb * (size_t) s.b[k], device_, bytes);
+        if (e != cudaSuccess) {
+            (void) cudaGetLastError();
+            err = std::string("head split: the rows on CUDA") + std::to_string(peers[k]) + ": " + cudaGetErrorString(e);
+            for (int j = 0; j <= k; ++j)
+                if (s.w[j]) { const OnDevice o(s.dev[j]); cudaFree(s.w[j]); }
+            return false;
+        }
+    }
+    split_ = s;
+    std::fprintf(stderr, "strata: head split (STRATA_GFX906_HEAD_SPLIT): rows [0, %d) on CUDA%d", s.b[0], device_);
+    for (int k = 0; k < n; ++k)
+        std::fprintf(stderr, ", [%d, %d) on CUDA%d (%.1f MiB)", s.b[k], s.b[k + 1], s.dev[k],
+                     (double) (rb * (size_t) (s.b[k + 1] - s.b[k])) / 1048576.0);
+    std::fprintf(stderr, "\n");
+    return true;
+#else
+    (void) peers; (void) own_share;
+    err = "head split: gfx906 only";
+    return false;
+#endif
 }
 
 bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {

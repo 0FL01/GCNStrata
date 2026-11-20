@@ -31,6 +31,18 @@ public:
     int device() const { return device_; }
     /// Bytes of one vocabulary row.
     size_t row_bytes() const { return n_out_ > 0 ? (size_t) (bytes_ / (uint64_t) n_out_) : 0; }
+    /// gfx906 STRATA_GFX906_HEAD_SPLIT: copies of rows [b[k], b[k+1]) on peer card dev[k] (k < n), for the verify
+    /// window's head (Verifier); this card keeps every row (the paths that do not split read them all).
+    struct Split {
+        int n = 0;
+        int b[4] = {};     ///< b[0]: the rows this card computes alone; b[n] = the vocabulary
+        int dev[3] = {};
+        void* w[3] = {};
+    };
+    /// After load: the peers (distinct CUDA devices other than device()) and this card's share of the rows; false
+    /// with `err` when the head, the card or the peers cannot split (nothing changed then).
+    bool load_split(const std::vector<int>& peers, double own_share, std::string& err);
+    const Split& split() const { return split_; }
 
 private:
     void* weights_ = nullptr;
@@ -39,6 +51,7 @@ private:
     int n_in_ = 0, n_out_ = 0;
     int type_ = -1;
     int device_ = -1;
+    Split split_;
 };
 
 /// Plan v0.3 P6: `token_embd.weight` in its GGUF form (the IQ model files), in mapped pinned host memory: a row

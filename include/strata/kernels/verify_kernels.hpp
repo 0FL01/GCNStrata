@@ -190,4 +190,30 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
 /// last `window` cells: ids[q * ids_stride + j] = max(0, n_kv - window) + j and the record's width = the count.
 void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream);
 
+/// gfx906 STRATA_GFX906_HEAD_SPLIT: the verify head's rows over the head's card ("A") and up to three peers. A sends
+/// the window's q8_1 input to each peer's inbox and its window number to the peer's flag (head_split_publish), computes
+/// rows [0, a_rows) itself, then waits for every peer's number and copies the peers' rows from its staging into the
+/// logits (head_split_gather). A peer copies the input into cached memory (head_split_peer_in), computes its rows
+/// [b[k], b[k+1]) into a local buffer, then writes them into A's staging and its number into A's flag
+/// (head_split_peer_out). Flags, inboxes and the staging are hipDeviceMallocUncached VRAM (kernel P2P on gfx906 sees
+/// nothing else); window numbers live in device words, so all of it is graph-capturable. A wait that lasts 30 s sets
+/// *err (host-mapped) and gives up. Non-gfx906 builds: the launchers throw.
+inline constexpr int kHeadSplitMaxPeers = 3;
+struct HeadSplitLinks {
+    int n = 0;                                          ///< peers
+    int b[kHeadSplitMaxPeers + 1] = {};                 ///< peer k: rows [b[k], b[k+1]); b[0] = A's rows, b[n] = vocab
+    void* inbox[kHeadSplitMaxPeers] = {};               ///< on peer k: the q8_1 input
+    uint32_t* inflag[kHeadSplitMaxPeers] = {};          ///< on peer k: A's window number
+    const uint32_t* done[kHeadSplitMaxPeers] = {};      ///< on A: peer k's window number once its rows are in
+};
+void head_split_publish(const void* xq, int bytes, const HeadSplitLinks& links, uint32_t* ctr, void* stream);
+/// `stage`: peer k's rows at stage + (b[k] - b[0]) * max_t, [T][b[k+1] - b[k]]; into logits[t * vocab + row]
+void head_split_gather(const HeadSplitLinks& links, const uint32_t* ctr, const float* stage, int max_t, float* logits,
+                       int T, int vocab, uint32_t* err, void* stream);
+void head_split_peer_in(const void* inbox, const uint32_t* inflag, void* xq, int bytes, uint32_t* seen, uint32_t* err,
+                        void* stream);
+/// y: [T][n] local; dst: A's staging for this peer ([T][n]); count: a zeroed device word
+void head_split_peer_out(const float* y, int n, int T, float* dst, const uint32_t* seen, uint32_t* count,
+                         uint32_t* done, void* stream);
+
 }  // namespace strata::kernels

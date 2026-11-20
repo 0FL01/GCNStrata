@@ -554,6 +554,34 @@ private:
     cudaEvent_t df_join_[2] = {};
     cudaGraphExec_t exec_[9] = {};
     cudaGraphExec_t exec_nr_[9] = {};   // #871: the doorbell variant of a stage that is all-resident otherwise
+    // gfx906 STRATA_GFX906_HEAD_SPLIT (NativeHead::Split): the head's rows over this card and peers for windows of
+    // up to kHsMaxT tokens. Each peer runs its part as its own graph on a high-priority stream (ROCm gives each
+    // priority level its own hardware queues, so the waiting graph never blocks the peer's stage work), launched by the
+    // host beside this card's window graph (hs_launch_peers).
+    static constexpr int kHsMaxT = 4;
+    struct HeadSplitPeer {
+        cudaStream_t s = nullptr;
+        void* inbox = nullptr;           ///< uncached, on the peer: the q8_1 input
+        uint32_t* inflag = nullptr;      ///< uncached, on the peer
+        uint8_t* xq = nullptr;           ///< on the peer
+        float* y = nullptr;              ///< on the peer: [T][rows]
+        uint32_t* words = nullptr;       ///< on the peer: [0] the last window number seen, [16] the blocks' count
+        uint32_t* err_h = nullptr;       ///< mapped: a wait timed out
+        uint32_t* err_d = nullptr;
+        cudaGraphExec_t exec[kHsMaxT + 1] = {};
+    };
+    int hs_n_ = 0;                       ///< peers; 0: the head is not split here
+    HeadSplitPeer hs_[3];
+    uint32_t* hs_done_ = nullptr;        ///< uncached, this card: peer k's window number at [16 k]
+    float* hs_stage_ = nullptr;          ///< uncached, this card: the peers' rows
+    uint32_t* hs_ctr_ = nullptr;         ///< this card: the window number
+    uint32_t* hs_err_h_ = nullptr;       ///< mapped: this card's wait timed out
+    uint32_t* hs_err_d_ = nullptr;
+    bool hs_tried_ = false;
+    bool hs_setup(std::string& err);
+    void hs_free();
+    bool hs_launch_peers(int T, std::string& err);
+    bool hs_failed(std::string& err) const;
     // fork 34a35db (STRATA_SIDE_MIXER=1): the GDN gates and the QSA indexer on a branch of the window's graph beside the
     // mixer's projections, joined before the recurrence / the attention
     cudaStream_t side_ = nullptr;

@@ -5251,6 +5251,28 @@ int main(int argc, char** argv) {
                          wo_s == nullptr ? "" : vram_free_note().c_str());
             return 1;
         }
+#if defined(STRATA_HIP_GFX906)
+        // STRATA_GFX906_HEAD_SPLIT=<peer cards, e.g. 1,2> (off by default): the verify head's rows over the head's card
+        // and those peers, bitwise (NativeHead::load_split, Verifier::hs_*); STRATA_GFX906_HEAD_SPLIT_SHARE: the head
+        // card's share of the rows (default by peer count, head_split_bench on MI50: 0.56 / 0.42 / 0.32)
+        if (const char* hv = std::getenv("STRATA_GFX906_HEAD_SPLIT");
+            last && st.head.loaded() && hv != nullptr && *hv != 0 && std::string(hv) != "0") {
+            std::vector<int> peers;
+            for (const char* c = hv; *c != 0;) {
+                char* end = nullptr;
+                const long d = std::strtol(c, &end, 10);
+                if (end == c) break;
+                peers.push_back((int) d);
+                c = *end == ',' ? end + 1 : end;
+            }
+            const double def_share = peers.size() == 1 ? 0.56 : peers.size() == 2 ? 0.42 : 0.32;
+            const char* sv = std::getenv("STRATA_GFX906_HEAD_SPLIT_SHARE");
+            const double share = sv != nullptr && *sv != 0 ? std::atof(sv) : def_share;
+            std::string serr;
+            if (!st.head.load_split(peers, share, serr))
+                std::fprintf(stderr, "strata generate: %s; the head stays on CUDA%d\n", serr.c_str(), st.dev);
+        }
+#endif
         size_t fb = 0, tb = 0;
         cudaMemGetInfo(&fb, &tb);
         std::fprintf(stderr, "strata generate: layer split: CUDA%d holds its weights, session [%lld, %lld)%s; "
