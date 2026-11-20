@@ -62,6 +62,22 @@ __global__ void k_publish(const uint4* __restrict__ xq, int n16, Peers P, unsign
 __global__ void k_wait_done(Peers P, const unsigned* ctr, unsigned* err) {
     if (int(threadIdx.x) < P.n) spin_ge(P.done[threadIdx.x], ctr[0], err);
 }
+// A (mode 2): every block waits for the peers' flags, then copies the peers' rows from the uncached staging (peer k:
+// [T][n_k] at T * (b[k] - XA)) into the cached logits
+struct Rows { int XA, b[MAXP + 1]; };
+__global__ void k_wait_gather(Peers P, const unsigned* ctr, unsigned* err, const float* stage, float* logits, int T,
+                              Rows R) {
+    if (int(threadIdx.x) < P.n) spin_ge(P.done[threadIdx.x], ctr[0], err);
+    __syncthreads();
+    for (int k = 0; k < P.n; ++k) {
+        const int n4 = (R.b[k + 1] - R.b[k]) / 4, total = n4 * T;
+        const float4* src = reinterpret_cast<const float4*>(stage + std::size_t(T) * (R.b[k] - R.XA));
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
+            const int t = i / n4, j = i - t * n4;
+            reinterpret_cast<float4*>(logits + std::size_t(t) * V + R.b[k])[j] = src[i];   // uncached: from memory
+        }
+    }
+}
 // peer, 1 block: wait for A's input, copy it into cached local memory
 __global__ void k_peer_in(const uint4* inbox, const unsigned* inflag, uint4* xq, int n16, const unsigned* ctr,
                           unsigned* err) {
@@ -71,12 +87,12 @@ __global__ void k_peer_in(const uint4* inbox, const unsigned* inflag, uint4* xq,
     for (int i = threadIdx.x; i < n16; i += blockDim.x) xq[i] = make_uint4(in[4 * i], in[4 * i + 1], in[4 * i + 2], in[4 * i + 3]);
 }
 // peer: its rows (T columns of n floats, local) into A's logits at column stride V from row r0; the last block flags A
-__global__ void k_peer_out(const float4* __restrict__ y, int n4, int T, float* a_logits, int r0, unsigned* ctr,
+__global__ void k_peer_out(const float4* __restrict__ y, int n4, int T, float* dst, int ld, unsigned* ctr,
                            unsigned* count, unsigned* done) {
     const int total = n4 * T;
     for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total; i += gridDim.x * blockDim.x) {
         const int t = i / n4, k = i - t * n4;
-        reinterpret_cast<float4*>(a_logits + std::size_t(t) * V + r0)[k] = y[i];
+        reinterpret_cast<float4*>(dst + std::size_t(t) * ld)[k] = y[i];
     }
     __threadfence_system();
     __syncthreads();
@@ -161,9 +177,10 @@ int main(int argc, char** argv) {
     }
     uint8_t* xq; CK(hipMalloc(&xq, std::size_t(XQB) * T * KX));
     for (int k = 0; k < KX; ++k) K::native_quantize_q8_1(xf + std::size_t(k) * T * N, xq + std::size_t(k) * XQB * T, N, T, sA);
-    float *ref, *logits;
+    float *ref, *logits, *stage = nullptr;
+    if (unc_logits == 2) CK(hipExtMallocWithFlags((void**) &stage, sizeof(float) * T * (V - XA), hipDeviceMallocUncached));
     CK(hipMalloc(&ref, sizeof(float) * T * V * KX));
-    if (unc_logits) CK(hipExtMallocWithFlags((void**) &logits, sizeof(float) * T * V, hipDeviceMallocUncached));
+    if (unc_logits == 1) CK(hipExtMallocWithFlags((void**) &logits, sizeof(float) * T * V, hipDeviceMallocUncached));
     else CK(hipMalloc(&logits, sizeof(float) * T * V));
     void* scr; const std::size_t scr_b = K::argmax_rows_scratch_bytes(T);
     CK(hipMalloc(&scr, scr_b)); CK(hipMemset(scr, 0, scr_b));
@@ -201,7 +218,9 @@ int main(int argc, char** argv) {
         CK(hipStreamBeginCapture(q.s, hipStreamCaptureModeRelaxed));
         k_peer_in<<<1, 256, 0, q.s>>>(P.inbox[k], P.inflag[k], q.xq, XQB * T / 16, q.ctr, err);
         if (!K::native_q6_k_head_rows(q.w, q.xq, q.y, N, n, n, T, q.s)) { std::fprintf(stderr, "head_rows refused\n"); return 1; }
-        k_peer_out<<<120, 256, 0, q.s>>>(reinterpret_cast<const float4*>(q.y), n / 4, T, logits, b[k], q.ctr, q.count, doneA[k]);
+        float* dst = unc_logits == 2 ? stage + std::size_t(T) * (b[k] - XA) : logits + b[k];
+        k_peer_out<<<120, 256, 0, q.s>>>(reinterpret_cast<const float4*>(q.y), n / 4, T, dst, unc_logits == 2 ? n : V,
+                                         q.ctr, q.count, doneA[k]);
         hipGraph_t g; CK(hipStreamEndCapture(q.s, &g)); CK(hipGraphInstantiate(&q.g, g, nullptr, nullptr, 0));
     }
 
@@ -218,7 +237,10 @@ int main(int argc, char** argv) {
         CK(hipStreamBeginCapture(sA, hipStreamCaptureModeRelaxed));
         k_publish<<<1, 256, 0, sA>>>(reinterpret_cast<const uint4*>(x), XQB * T / 16, P, ctrA);
         if (!K::native_q6_k_head_rows(wA, x, logits, N, XA, V, T, sA)) { std::fprintf(stderr, "head_rows refused\n"); return 1; }
-        k_wait_done<<<1, 64, 0, sA>>>(P, ctrA, err);
+        if (unc_logits == 2) {
+            Rows R{}; R.XA = XA; for (int j = 0; j <= NP; ++j) R.b[j] = b[j];
+            k_wait_gather<<<120, 256, 0, sA>>>(P, ctrA, err, stage, logits, T, R);
+        } else k_wait_done<<<1, 64, 0, sA>>>(P, ctrA, err);
         K::argmax_rows_nf(logits, T, V, scr, ids, nf, sA);
         CK(hipStreamEndCapture(sA, &g)); CK(hipGraphInstantiate(&g2[k], g, nullptr, nullptr, 0));
     }
