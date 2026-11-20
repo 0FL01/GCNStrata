@@ -2521,7 +2521,7 @@ std::string Verifier::head_split_report() const {
     }
     char b[256];
     std::snprintf(b, sizeof b, "%llu heads, %lld slots on busy cards, gather wait avg %.1f max %.1f us, host poll gap "
-                  "avg %.2f max %.2f ms", (unsigned long long) hs_triggered_, (long long) hs_busy_picks_,
+                  "(gaps under 50 ms) avg %.2f max %.2f ms", (unsigned long long) hs_triggered_, (long long) hs_busy_picks_,
                   st[2] ? (double) st[0] / (double) st[2] / 25.0 : 0.0, (double) st[1] / 25.0,
                   hs_gaps_ ? hs_gap_sum_ / (double) hs_gaps_ : 0.0, hs_gap_max_);
     return b;

@@ -15500,8 +15500,8 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata decode adapt overlap: %lld windows took swaps still landing, a layer waited %.2f ms in all so far\n",
                                  (long long) aov_flips, ver.ms_gate);
                 {   // gfx906 STRATA_GFX906_HEAD_SPLIT: both verifiers of the last stage (counters since the start)
-                    for (int par = 0; par < 2; ++par) {
-                        const std::string h0 = stage_ver_p(n_stages - 1, par).head_split_report();
+                    for (int par = 0; par < (pipe ? 2 : 1); ++par) {   // (stage_ver: a same-GPU split's second verifier)
+                        const std::string h0 = (par == 0 ? stage_ver(n_stages - 1) : stage_ver_p(n_stages - 1, 1)).head_split_report();
                         if (!h0.empty()) std::fprintf(stderr, "strata decode head split (parity %d): %s\n", par, h0.c_str());
                     }
                 }
