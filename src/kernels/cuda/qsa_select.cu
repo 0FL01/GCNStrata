@@ -1536,6 +1536,9 @@ int scores_thread_arch() {
         arch = 0;
         if (cudaGetDeviceProperties(&properties, device) == cudaSuccess)
             arch = gfx_arch_is_gfx12(properties.gcnArchName) ? 2 : gfx_arch_is(properties.gcnArchName, "gfx1100") ? 1 : 0;
+#if defined(STRATA_HIP_GFX906)
+        if (properties.warpSize == 64 && gfx_arch_is(properties.gcnArchName, "gfx906")) arch = 3;
+#endif
         cached_device = device;
         cudaGetLastError();
     }
@@ -2057,8 +2060,12 @@ void qsa_block_scores(const float* pooled, const float* dead, const float* q_idx
         return value == nullptr ? -1 : (std::atoi(value) == 1 ? 1 : 0);
     }();
     // The bound is the ACTUAL live extent. A reserved 256K context never enables this by itself.
-    if (thread_env != 0 && active_blocks >= 16385 && active_blocks <= max_blocks && nq >= 64 &&
-        (scores_thread_arch() == 2 || (thread_env == 1 && scores_thread_arch() == 1))) {
+    // Four gfx906: at 256 rows the exact scorer crosses over between 4K and 16K cells.
+    // Use the live block count, not the configured capacity. Preserve the other HIP backends' rule.
+    const bool mi50 = thread_env != 0 && nq == 256 && active_blocks >= 4097 && active_blocks <= 16385 &&
+                      scores_thread_arch() == 3;
+    if (thread_env != 0 && active_blocks <= max_blocks && (mi50 || (active_blocks >= 16385 && nq >= 64 &&
+        (scores_thread_arch() == 2 || (thread_env == 1 && scores_thread_arch() == 1))))) {
         static thread_local bool logged = false;
         if (!logged && (thread_env == -1 || std::getenv("STRATA_SCORES_THREAD_TRACE"))) {
             std::fprintf(stderr, "qsa exact thread: the prompt's block scorer runs as the four-lanes-per-query kernel (nq=%lld active_blocks=%lld "
