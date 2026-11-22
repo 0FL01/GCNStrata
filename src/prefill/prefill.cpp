@@ -2905,6 +2905,20 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             const char* v = std::getenv("STRATA_PREFILL_ISSUER");
             return v == nullptr || std::atoi(v) != 0;
         }();
+        // A long prompt still streams ahead of its router. Once the host has counted a layer's
+        // routes, omit its remaining *pinned* uploads for experts that no row will read. Keep the
+        // sequence indices and ring credits unchanged; never drop a job owned by the host stager.
+#if defined(STRATA_HIP_GFX906)
+        static const bool routed_ring = [] {
+            const char* v = std::getenv("STRATA_GFX906_ROUTED_RING");
+            return !v || std::atoi(v) != 0;
+        }();
+#else
+        constexpr bool routed_ring = false;
+#endif
+        const bool prune = routed_ring && stream_all && issuer_on && !ps_on && !m.fused_bufs;
+        std::vector<uint8_t> picked(prune ? seq.size() : 0, 1);
+        std::atomic<size_t> known{0};   // immutable entries [0, known), published once per routed layer
         std::atomic<size_t> a_issued{0}, a_consumed{0};
         std::atomic<bool> a_stop{false};
         double iss_ms = 0;
@@ -2926,6 +2940,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         std::this_thread::yield();
                     }
                     const StreamEntry& en = seq[idx];
+                    if (prune && en.job < 0 && idx < known.load(std::memory_order_acquire) && !picked[idx]) {
+                        a_issued.store(idx + 1, std::memory_order_release);
+                        continue;   // no DMA, no copy event; no consumer will wait for this entry
+                    }
                     const int sl = (int) (idx % (size_t) m.ring);
                     const auto th = Clock::now();
                     const size_t bytes = (size_t) lay0.blob_bytes(en.l);
@@ -2953,7 +2971,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (!threaded_issue) return;
             while (a_issued.load(std::memory_order_acquire) <= k) std::this_thread::yield();
         };
+        size_t released = 0;
         auto give_back = [&](size_t upto) {
+            released = upto;
             if (threaded_issue) a_consumed.store(upto, std::memory_order_release);
             else issue_until(upto + (size_t) m.ring);
         };
@@ -3745,6 +3765,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const int32_t e = ids_h[(size_t) i];
                             if (e < 0 || e >= m.g->n_expert) { err = "prefill: routed id out of range"; return false; }
                             ++m.cnt[(size_t) e];
+                        }
+                        if (prune) {
+                            const size_t end = seq_start[(size_t) l + 1];
+                            for (size_t x = seq_start[(size_t) l]; x < end; ++x)
+                                picked[x] = m.cnt[(size_t) seq[x].e] != 0;
+                            known.store(end, std::memory_order_release);
                         }
                         if (cpu_maybe) {
                             std::vector<std::pair<int32_t, int32_t>> cand;   // (tokens, expert)
@@ -4583,12 +4609,16 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const size_t kend = seq_start[(size_t) l + 1];
                             auto release_to = [&](int32_t e_stop) {
                                 while (k < kend && seq[k].e < e_stop) {
-                                    if (gg_nslots > 0) flush(0);   // the open group's slots get their event first
+                                    if (gg_nslots > 0 && (!prune || k - released >= (size_t) m.ring)) flush(0);
                                     const int sl = (int) (k % (size_t) m.ring);
-                                    cudaEventRecord(m.used[sl], m.cs);
-                                    m.used_of[sl] = sl;
+                                    // No compute read was enqueued for this entry. Its copy is ordered on
+                                    // m.copy; the prior reader's used_of event still protects the slot.
+                                    if (!prune) {
+                                        cudaEventRecord(m.used[sl], m.cs);
+                                        m.used_of[sl] = sl;
+                                    }
                                     consumed = ++k;
-                                    give_back(consumed);
+                                    if (!prune || gg_nslots == 0) give_back(consumed);
                                 }
                             };
                             for (size_t j = 0; j < order.size(); ++j) {
@@ -4596,6 +4626,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 release_to(e);
                                 if (k < kend && seq[k].e == e) {
                                     const int sl = (int) (k % (size_t) m.ring);
+                                    // An open gather must not wait on a producer stalled for its credits.
+                                    if (prune && gg_nslots && k - released >= (size_t) m.ring) {
+                                        flush(0);
+                                        give_back(k);
+                                    }
                                     wait_issued(k);
                                     if (!group_gather) {
                                         pt.mark(kPfWaitCopy, cs);
