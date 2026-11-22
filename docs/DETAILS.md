@@ -1927,7 +1927,9 @@ the pairs in which the switched arm won). They are here so you can try them on y
   Both use ggml's complete product tile. Only the final 64 down rows of each direct expert are copied
   (23,040 or 25,600 bytes) into unused group scratch with 80 zero bytes after them. The last compact
   matrix has its own separate zero tail. Only the final down row tile selects this alternate address;
-  GU has no such branch. Streamed/peer entries are gathered. Mode 0/unset or mode 2 selects the
+  GU has no such branch. Peer entries are gathered. With `STRATA_MMQ_RING_DIRECT=1` the local threaded
+  stream-all ring can also read a group in place when its remaining entries fit the published issuer window.
+  Compute waits for upload and releases the slots after down, otherwise it gathers. Mode 0/unset or mode 2 of `STRATA_MMQ_DIRECT` selects the
   ordinary gather. STRATA_MMQ_DIRECT_LOG=1 reports cumulative local candidates, reads in place,
   fallback gathers and avoided payload bytes (net of copied shadow rows). Opt-in; qualify on B3.
 - **`STRATA_MMQ_DIRECT=1`: the prompt's MMQ reads resident experts in their cache slots** (CUDA, native packs; needs an

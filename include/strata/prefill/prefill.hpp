@@ -39,6 +39,7 @@ struct PrefillStats {
     int64_t mmq_direct_eligible = 0; ///< local slot in a direct-capable layer, before alignment and guard checks
     int64_t mmq_direct_fallback = 0; ///< gathered entries in those layers, including streamed and peer experts
     int64_t mmq_direct_bytes = 0;    ///< expert payload bytes omitted from gather
+    int64_t mmq_ring_direct = 0, mmq_ring_gather = 0, mmq_ring_bytes = 0; ///< selected local stream-all entries (R&D)
     int64_t experts_cpu = 0;        ///< ...computed on the CPU pool instead of streamed (STRATA_PREFILL_CPU_SHARE)
     double cpu_share = 0;           ///< ...the share of the streamed ones it took last (measured by default)
     double ms_ple = 0;
