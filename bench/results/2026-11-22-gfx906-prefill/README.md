@@ -1,6 +1,8 @@
 # Production prefill baseline — amude, 2026-11-22
 
-Use engine commit `dc790de9021ea26cbf49aed1dab116d5946e3bc4` for subsequent comparisons on four gfx906 cards. The deployed ELF SHA-256 is `a1328ef7946f43365ede095c6f99de02ae48c0b204a953f16cd701de254e6155`. Model: B3 Q4_0; config: `orcarouter-qwen38-b3-abliterated-q4_0-nvme-prod-pp3000-hs-20261121.json`, SHA-256 `f6d2eee14be9b33047b957641f5deb811fd1c98f9d9d752341c08e835c3e2ddb`. Keep `--prefill-pipe 3000`, ring 96, head split `0,1,2` and `--adapt-every 4` for speed measurements.
+**Current release:** see [453e60db qualification](after-direct/README.md). The numbers below are the earlier reference.
+
+Previous engine commit `dc790de9021ea26cbf49aed1dab116d5946e3bc4` was qualified on four gfx906 cards. The deployed ELF SHA-256 is `a1328ef7946f43365ede095c6f99de02ae48c0b204a953f16cd701de254e6155`. Model: B3 Q4_0; config: `orcarouter-qwen38-b3-abliterated-q4_0-nvme-prod-pp3000-hs-20261121.json`, SHA-256 `f6d2eee14be9b33047b957641f5deb811fd1c98f9d9d752341c08e835c3e2ddb`. Keep `--prefill-pipe 3000`, ring 96, head split `0,1,2` and `--adapt-every 4` for speed measurements.
 
 | Input | Old TTFT (`5d6ae32a`), s | Baseline TTFT, s | Baseline server prefill, tok/s |
 |---|---:|---:|---:|
