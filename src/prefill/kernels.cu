@@ -1351,11 +1351,14 @@ __global__ void __launch_bounds__(QTH) gdn_rec_quad_pp_kernel(float* __restrict_
 // ---- C2: two columns per lane (a wave: 4 row groups x 8 lanes x 2 columns = 16 columns; a block of 4 waves 64
 // columns).  A lane's two columns share the k / q rows it reads from LDS (half the LDS reads and shuffles per column
 // and two independent dependency chains in each wave).  Per column the same arithmetic in the same order.
-constexpr int C2CB = 64;                          // columns per block
-constexpr int C2PF = HT * 2 * S / 4 / QTH;        // float4 of q/k each thread prefetches per chunk (2)
-__global__ void __launch_bounds__(QTH) gdn_rec_quad2c_kernel(float* __restrict__ state, const float* __restrict__ h,
+constexpr int C2CB = QTH / 2;  // default columns per block
+template <int Threads = QTH, int Tokens = HT>
+__global__ void __launch_bounds__(Threads) gdn_rec_quad2c_kernel(float* __restrict__ state, const float* __restrict__ h,
                                                              const float* __restrict__ gate, const float* __restrict__ beta,
                                                              float* __restrict__ oc_out, int64_t T) {
+    constexpr int QTH = Threads, HT = Tokens, C2CB = Threads / 2;
+    constexpr int C2PF = HT * 2 * S / 4 / QTH;
+    static_assert(S % C2CB == 0 && (HT * 2 * S / 4) % QTH == 0);
     __shared__ __align__(16) float sqk[2][HT][2][4 * QRS];
     __shared__ float sgb[2][2][HT];
     __shared__ float sv[2][HT][C2CB];
@@ -2484,6 +2487,23 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
     gdn_l2_kernel<<<dim3(2 * HK, (unsigned) T), S, 0, (cudaStream_t) stream>>>(h, eps);
     check("gdn_conv");
 }
+#if defined(STRATA_HIP_GFX906)
+static bool gdn_quad2c_wide_ok() {
+    static const bool enabled = [] { const char* e = std::getenv("STRATA_GFX906_GDN_256X16"); return !e || e[0] == '1'; }();
+    if (!enabled) return false;
+    static thread_local int last_device = -1;
+    static thread_local bool ok = false;
+    int dev = -1;
+    if (cudaGetDevice(&dev) != cudaSuccess) return false;
+    if (dev != last_device) {
+        cudaDeviceProp p{};
+        if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) return false;
+        ok = strata::kernels::gfx_arch_is(p.gcnArchName, "gfx906") && p.warpSize == 64 && p.sharedMemPerBlock >= 53504;
+        last_device = dev;
+    }
+    return ok;
+}
+#endif
 void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
                             void* stream, int64_t ld16) {
@@ -2521,6 +2541,12 @@ void gdn_recurrence_variant(int variant, float* state, const float* h, const flo
     if (variant == 1) {
         if (T > 0) {
             static const int pp = [] { const char* v = std::getenv("STRATA_GDN_PP"); return v ? std::atoi(v) : 0; }();
+#if defined(STRATA_HIP_GFX906)
+            // 48 blocks, 128 columns per block. Keep the release's logical 32-lane shuffles and reduction order.
+            if (pp == 2 && T >= 165 && gdn_quad2c_wide_ok())
+                gdn_rec_quad2c_kernel<256, 16><<<HV, 256, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+            else
+#endif
             if (pp == 2)
                 gdn_rec_quad2c_kernel<<<HV * (S / C2CB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
             else if (pp)
