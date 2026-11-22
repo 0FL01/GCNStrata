@@ -4477,6 +4477,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 gu.w = m.grp_gu; gu.type = mmq_gt; gu.w_rows = 1280; gu.w_cols = N; gu.expert_bytes = mmq_gub;
                                 gu.n = ngx; gu.xq = m.Xq; gu.bounds = m.bounds_dev + j0; gu.ids = m.ids_identity;
                                 gu.total_rows = T * K; gu.max_rows = maxr; gu.dst = m.GU; gu.ld_dst = 1280;
+#if defined(STRATA_HIP_GFX906)
+                                // The largest expert sizes the grid, but overstates the useful width of a skewed
+                                // Q4 group. Both projections have the same counts (not the same absolute bounds).
+                                static const bool q4_tiles = [] {
+                                    const char* v = std::getenv("STRATA_GFX906_Q4_GROUP_TILE");
+                                    return !v || std::atoi(v) != 0;
+                                }();
+                                if (q4_tiles && !direct && mmq_gt == 2 && (mmq_dt == 2 || mmq_dt == 3) &&
+                                    T >= 512 && T <= 4096)
+                                    gu.tile_hint = nr <= 24 * ngx ? 16 : nr <= 52 * ngx ? 24 : nr <= 112 * ngx ? 32 : 48;
+#endif
                                 gu.y_scale = mmq::fp4_activations(mmq_gt) ? m.Xscale : nullptr;
                                 if (direct) gu.tab = &tgu;
 #if defined(STRATA_GFX906_PREFILL_J48_BUILT) && STRATA_GFX906_PREFILL_J48_BUILT == 1 && defined(STRATA_HIP_GFX906)
@@ -4495,6 +4506,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.n = ngx; dn.xq = m.Hq; dn.bounds = m.bounds_dev + n + 1 + g * (MMQ_GROUP + 1);
                                 dn.ids = m.ids_identity; dn.total_rows = nr; dn.max_rows = maxr; dn.dst = m.Dm + r0 * N;
                                 dn.ld_dst = N;
+                                dn.tile_hint = gu.tile_hint;
                                 dn.y_scale = mmq::fp4_activations(mmq_dt) ? m.Hscale : nullptr;
                                 if (direct) dn.tab = &td;
 #if defined(STRATA_GFX906_PREFILL_J48_BUILT) && STRATA_GFX906_PREFILL_J48_BUILT == 1 && defined(STRATA_HIP_GFX906)

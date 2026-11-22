@@ -480,7 +480,7 @@ void Context::run(const Product& p, void* stream) {
                         p.w_cols, p.w_rows, p.total_rows, bpr, p.total_rows, p.ld_dst,
                         p.n, p.n, p.tab ? 0 : (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                         1, 1, 0, 0, 0,
-                        p.max_rows, prefill_j48_opt(p)};
+                        p.max_rows, p.tile_hint > 0 ? p.tile_hint : prefill_j48_opt(p)};
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
     if (p.tab) {

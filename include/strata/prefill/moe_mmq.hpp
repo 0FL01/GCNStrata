@@ -83,6 +83,7 @@ struct Product {
     const WeightTab* tab = nullptr;
     // Host provenance: only the original local, full-routing FP32 expert prefill calls set this.
     bool local_full_routing_prefill = false;
+    int tile_hint = 0;  ///< Optional tile-selection width. max_rows still bounds the grid for the largest expert.
 };
 
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
