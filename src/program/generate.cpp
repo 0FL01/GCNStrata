@@ -13572,8 +13572,10 @@ int main(int argc, char** argv) {
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
             int64_t seg_lend = 0;   // the loan the last lend left (the largest participant's chunk; 0: none)
+            int64_t pipe_loan_chunk = 0;   // planned before a smaller loan, rather than against the relaid buffers
             auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
                 seg_lend = 0;
+                pipe_loan_chunk = 0;
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
@@ -13584,7 +13586,26 @@ int main(int argc, char** argv) {
                                        : split_small > 0 && tokens <= split_small_max ? std::min(want_full, split_small)
                                                                                      : want_full;
                 // `exact`: a planned segment read on - the loan it was read with (what is left would size another)
-                const int64_t want = exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
+                int64_t want = exact > 0 ? std::min(exact, o.prefill_chunk) : want_seg;
+#if defined(STRATA_HIP_GFX906)
+                // With a calibrated pipe, the chunk a fresh segment actually reads can be much smaller than
+                // the ordinary loan. Keep those surplus experts resident through the read and its refill.
+                // Resume uses the recorded loan/plan; batch pieces and special cache layouts keep their policy.
+                using strata::prefill::Prefill;
+                static const bool pipe_loan = [] {
+                    const char* v = std::getenv("STRATA_GFX906_PIPE_LOAN");
+                    return !v || std::atoi(v) != 0;
+                }();
+                if (pipe_loan && exact == 0 && o.batch == 0 && !fixed26 && !reserve512.enabled && !split_small &&
+                    !o.prefill_head_alias && req_imgs.empty() && sp.stage_count() == 4 && Prefill::pipe_setting() > 1) {
+                    const int64_t c = Prefill::pipeline_chunk(tokens, want, sp.stage_count(), Prefill::pipe_setting());
+                    if (c < std::min(tokens, want) && std::all_of(pf_parts.begin(), pf_parts.end(), [&](const PfPart& p) {
+                        if (p.first < 0 || !p.lent.empty()) return false;
+                        const int64_t need = part_slots(p, c);
+                        return need > 0 && need <= p.cache->slots() - std::max<int32_t>(128, p.first) && need < part_slots(p, want);
+                    })) want = pipe_loan_chunk = c;
+                }
+#endif
                 if (want <= 0) {
                     e = "prefill: cannot lend buffers for an empty request segment";
                     return false;
@@ -13776,7 +13797,7 @@ int main(int argc, char** argv) {
                         resume_plan = {};   // the first segment only
                     }
                     if (plan.chunk <= 0) {
-                        const int64_t c = sp.plan_chunk(b0 - a0);
+                        const int64_t c = pipe_loan_chunk > 0 ? pipe_loan_chunk : sp.plan_chunk(b0 - a0);
                         if (c > 0) {
                             plan.chunk = c;
                             plan.from = a0;
@@ -13784,7 +13805,7 @@ int main(int argc, char** argv) {
                             plan.lend = seg_lend;
                             plan.pipe = strata::prefill::Prefill::pipe_setting();
                             plan.single = b0 - a0 <= c;
-                            plan.chunked = c < std::min(b0 - a0, sp.chunk());
+                            plan.chunked = pipe_loan_chunk > 0 || c < std::min(b0 - a0, sp.chunk());
                             if (plan.chunked) strata::prefill::Prefill::log_plan(b0 - a0, c, sp.stage_count());
                         }
                     }
