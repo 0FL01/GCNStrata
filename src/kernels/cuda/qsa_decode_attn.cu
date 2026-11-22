@@ -120,7 +120,7 @@ __device__ __forceinline__ int reduce12_head_of_lane(int lane) {
 // The chunk kernel's body; `p` is the query's KV pools (the call's one set, or blockIdx.z's slot's set).
 // (the body is a device function so the batch window's rows kernel below can run it over each query's own pools without
 // the default kernel's signature, or the function-pointer types the pre-sm_75 / HIP selections build, changing)
-template <int KV_MODE, bool LANE_CELL, bool QUERY_SWIZZLE, bool REDUCE12>
+template <int KV_MODE, bool LANE_CELL, bool QUERY_SWIZZLE, bool REDUCE12, bool PROMPT_V = false>
 __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, QsaAttnPools p,
                                                 const int32_t* __restrict__ ids, const int32_t* __restrict__ step,
                                                 int n_kv_heads, int page_size, float scale,
@@ -243,18 +243,70 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
         }
     }
     __syncthreads();
+#if defined(STRATA_HIP_GFX906)
+    // sq is dead after all scores are staged. Three adjacent heads' probabilities and
+    // one scale for a 64-dimension group use the four words of each cell/team entry.
+    auto* const meta = reinterpret_cast<float4*>(&sq[0][0]);
+    if constexpr (PROMPT_V) {
+        static_assert(KV_MODE == 1 && REDUCE12 && QUERY_SWIZZLE && HD == 256 && KV_Q8_GROUP == 64);
+        const long long row = srow[t / 4];
+        meta[t].w = row >= 0 ? __half2float(__ushort_as_half(p.v_scale[row * 4 + t % 4])) : 0.0f;
+    }
+#endif
     // per-head chunk max and exp-sum: warp w handles heads w and w+8.
     for (int h = warp; h < G; h += WARPS) {
         const float a = sp[h][lane], b = sp[h][lane + 32];
         const float m = warp_max(fmaxf(a, b));
         const float ea = (lane < n_here && srow[lane] >= 0) ? __expf(a - m) : 0.0f;
         const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0) ? __expf(b - m) : 0.0f;
-        sp[h][lane] = ea;
-        sp[h][lane + 32] = eb;
+#if defined(STRATA_HIP_GFX906)
+        if constexpr (PROMPT_V) {
+            reinterpret_cast<float*>(meta + lane * 4 + h / 3)[h % 3] = ea;
+            reinterpret_cast<float*>(meta + (lane + 32) * 4 + h / 3)[h % 3] = eb;
+        } else
+#endif
+        {
+            sp[h][lane] = ea;
+            sp[h][lane + 32] = eb;
+        }
         const float l = warp_sum(ea + eb);
         if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
     }
     __syncthreads();
+#if defined(STRATA_HIP_GFX906)
+    if constexpr (PROMPT_V) {
+        // Each wave owns 64 dimensions. Its four 16-lane teams each own three heads,
+        // four adjacent dimensions per lane. One dword VMEM fetches FOUR cells' slices:
+        // exchange it between the head teams, folding the same cells in the original order.
+        const int wave = t / 64, group = (t % 64) / 16, col = t % 16;
+        const int d = wave * 64 + col * 4;
+        float a[3][4] = {};
+        for (int c = 0; c < n_here; c += 4) {
+            // CHUNK is a multiple of four; srow[] entries beyond n_here were set to -1.
+            const long long row = srow[c + group];
+            const int raw = row >= 0 ? *reinterpret_cast<const int*>(p.v_q + row * HD + d) : 0;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int code = __shfl(raw, col + 16 * j, 64);
+                if (srow[c + j] < 0) continue;
+                const float sc = meta[(c + j) * 4 + wave].w;
+                const float4 m = meta[(c + j) * 4 + group];
+                const float pr[3] = {m.x, m.y, m.z};
+#pragma unroll
+                for (int k = 0; k < 4; ++k) {
+                    const float v = float(static_cast<int8_t>(unsigned(code) >> (8 * k))) * sc;
+#pragma unroll
+                    for (int h = 0; h < 3; ++h) a[h][k] = fmaf(pr[h], v, a[h][k]);
+                }
+            }
+        }
+#pragma unroll
+        for (int h = 0; h < 3; ++h)
+            *reinterpret_cast<float4*>(part_acc + ((size_t) slot * G + group * 3 + h) * HD + d) =
+                make_float4(a[h][0], a[h][1], a[h][2], a[h][3]);
+        return;
+    }
+#endif
     // values: thread t owns dimension t for all 12 heads.
     float acc[G];
 #pragma unroll
@@ -285,14 +337,14 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
 }
 
-template <int KV_MODE, bool LANE_CELL = false, bool QUERY_SWIZZLE = false, bool REDUCE12 = false>
+template <int KV_MODE, bool LANE_CELL = false, bool QUERY_SWIZZLE = false, bool REDUCE12 = false, bool PROMPT_V = false>
 __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                              const int32_t* __restrict__ ids,
                                                              const int32_t* __restrict__ step, int n_kv_heads,
                                                              int page_size, float scale, float* __restrict__ part_acc,
                                                              float* __restrict__ part_m, float* __restrict__ part_l,
                                                              int n_chunks, int cap = 0, long long scratch_stride = 0) {
-    attn_chunk_body<KV_MODE, LANE_CELL, QUERY_SWIZZLE, REDUCE12>(q, p, ids, step, n_kv_heads, page_size, scale,
+    attn_chunk_body<KV_MODE, LANE_CELL, QUERY_SWIZZLE, REDUCE12, PROMPT_V>(q, p, ids, step, n_kv_heads, page_size, scale,
                                                                  part_acc, part_m, part_l, n_chunks, cap,
                                                                  scratch_stride);
 }
@@ -983,6 +1035,15 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
             return v && v[0] == '1' && v[1] == '\0';
         }();
         if (reduce12) {
+            static const bool prompt_v = [] {
+                const char* e = std::getenv("STRATA_GFX906_PROMPT_V4");
+                return !e || std::strcmp(e, "1") == 0;
+            }();
+            if (kernel == -2 && prompt_v) {
+                attn_chunk_kernel<1, false, true, true, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps,
+                    (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+                return;
+            }
             attn_chunk_kernel<1, false, true, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps,
                 (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
             static const bool trace = [] {
@@ -1038,8 +1099,8 @@ void launch_merge_batch(const int32_t* steps, int64_t cap, const QsaShapes& s, c
 
 }  // namespace
 
-void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
-                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+static void attn_batch_impl(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream, bool prompt) {
     if (n_q <= 0) return;
     if (s.head_dim != HD || s.n_head != (int64_t) G * s.n_head_kv || cap <= 0 || !scratch || !ids || !steps ||
         !pools.page_table || n_q > 65535) {
@@ -1047,7 +1108,7 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         std::exit(1);
     }
     cudaStream_t st = (cudaStream_t) stream;
-    launch_chunks_batch(q, pools, ids, steps, cap, s, scratch, n_q, st, -1);
+    launch_chunks_batch(q, pools, ids, steps, cap, s, scratch, n_q, st, prompt ? -2 : -1);
 #if defined(STRATA_HIP_GFX906)
     // gfx906 STRATA_GFX906_MERGE_V2_DECODE (default on; 0: STRATA_ATTN_MERGE_V2 decides): decode-sized calls (the verify
     // window's QSA rows, the drafter's dense window) merge with attn_merge_v2_kernel - bitwise attn_merge_kernel (same
@@ -1065,6 +1126,18 @@ void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int3
         std::exit(1);
     }
 }
+
+void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+    attn_batch_impl(q, pools, ids, steps, cap, s, scratch, attn, n_q, stream, false);
+}
+#if defined(STRATA_HIP_GFX906)
+void qsa_prompt_fallback_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {
+    attn_batch_impl(q, pools, ids, steps, cap, s, scratch, attn, n_q, stream, true);
+}
+#endif
+
 
 bool qsa_decode_attn_slots(const float* q, const QsaAttnSlotPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream) {

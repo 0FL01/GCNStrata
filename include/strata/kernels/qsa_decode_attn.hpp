@@ -50,6 +50,12 @@ void qsa_decode_attn_step(const float* q, const QsaAttnPools& pools, const int32
 void qsa_decode_attn_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
                            int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
 
+#if defined(STRATA_HIP_GFX906)
+/// Explicit prompt site: verification and drafter batches retain qsa_decode_attn_batch.
+void qsa_prompt_fallback_batch(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps,
+                           int64_t cap, const QsaShapes& s, float* scratch, float* attn, int64_t n_q, void* stream);
+#endif
+
 /// Up to this many queries of different slots in one qsa_decode_attn_slots call.
 constexpr int kQsaAttnMaxSlots = 8;
 
