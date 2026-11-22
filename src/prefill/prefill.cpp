@@ -100,6 +100,9 @@ bool whole_tiles(int, int64_t, int) { return false; }
 int direct_mode() { return 0; }
 size_t direct_slot_guard() { return 0; }
 void prep_group(const GuardTab&, size_t, void*, void*, size_t, void*) {}
+#if defined(STRATA_HIP_GFX906)
+void q4_down_shadows(const WeightTab&, unsigned, int, int, void*, size_t, WeightTab&, void*) {}
+#endif
 }  // namespace strata::prefill::mmq
 #endif
 #ifndef STRATA_PREFILL_FUSED
@@ -1203,12 +1206,22 @@ const MmqPlan& mmq_plan() {
                 if (!p.layer[(size_t) l]) continue;
                 const auto& f = lay.fmt[(size_t) l];
                 const int gt = f.gu_type, dt = f.d_type;
+#if defined(STRATA_HIP_GFX906)
+                // Only the B3 native Q4 pair: literal [gate|up|down], with no scales or pack tail.
+                if (gt != 2 || (dt != 2 && dt != 3) || f.n_embd != N || f.n_ff != 640 || f.tail_off) continue;
+#endif
                 if (!mmq::tab_fits(gt, 1280) || !mmq::tab_fits(dt, N)) continue;
+#if defined(STRATA_HIP_GFX906)
+                if (mmq::overread_bytes(gt, N) != 0 || mmq::overread_bytes(dt, 640) != (dt == 2 ? 72 : 80)) continue;
+#else
                 if (mmq::overread_bytes(gt, N) != 0 || mmq::overread_bytes(dt, 640) > mmq::kSlotGuard) continue;
+#endif
                 if (f.up_off != mmq::matrix_bytes(gt, 1280, N) / 2 || f.down_off != 2 * f.up_off) continue;
                 if (mmq::matrix_bytes(dt, N, 640) != f.bytes - f.down_off) continue;
                 p.direct[(size_t) l] = 1;
+#if !defined(STRATA_HIP_GFX906)
                 p.d_over[(size_t) l] = (uint32_t) mmq::overread_bytes(dt, 640);
+#endif
                 ++nd;
             }
             std::fprintf(stderr, "strata: prompt MMQ reads resident experts in place (STRATA_MMQ_DIRECT=1): %lld of %lld "
@@ -4399,6 +4412,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const bool direct = use_mmq && lay.native && m.cache && mmq_plan().direct[(size_t) l];
                         mmq::WeightTab tgu, td;
                         mmq::GuardTab gd;
+#if defined(STRATA_HIP_GFX906)
+                        unsigned shadow_mask = 0;
+#endif
                         int ns = 0;
                         // `zero`: the MMQ tail zeroed after the gathered experts (the group's last flush); a direct
                         // group's tail is zeroed by prep_group
@@ -4443,15 +4459,24 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 const bool last_of_group = q + 1 == MMQ_GROUP || j + 1 == order.size();
                                 if (direct) {
                                     const auto& f = lay.fmt[(size_t) l];
+                                    stats_.mmq_direct_eligible += cslot >= 0;
                                     uint8_t* gp = cslot >= 0 && ((uintptr_t) blob_dev | (uintptr_t) f.down_off) % 16 == 0
                                                       ? m.cache->slot_tail(cslot, f.bytes, mmq_plan().d_over[(size_t) l])
                                                       : nullptr;
-                                    if (gp) {   // read in its slot: the guard after the blob is zeroed at the group end
+                                    if (gp) {   // gfx906 checks only the payload extent; never touch cache slack
                                         tgu.p[q] = blob_dev;
                                         td.p[q] = blob_dev + f.down_off;
+#if defined(STRATA_HIP_GFX906)
+                                        shadow_mask |= 1u << q;
+                                        ++gd.n;
+                                        stats_.mmq_direct_bytes += f.bytes - mmq_db / 40; // the last 64 down rows are copied
+#else
                                         gd.p[gd.n++] = gp;
+                                        stats_.mmq_direct_bytes += f.bytes;
+#endif
                                         ++stats_.experts_direct;
                                     } else {
+                                        ++stats_.mmq_direct_fallback;
                                         const int c = ns++;
                                         tgu.p[q] = m.grp_gu + (size_t) c * mmq_gub;
                                         td.p[q] = m.grp_d + (size_t) c * mmq_db;
@@ -4462,13 +4487,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         } else {
                                             mmq::gather_native(blob_dev, blob_dev + f.up_off, mmq_gub / 2, blob_dev + f.down_off,
                                                                mmq_db, m.grp_gu + (size_t) c * mmq_gub,
-                                                               m.grp_d + (size_t) c * mmq_db, m.cs);
+                                                               m.grp_d + (size_t) c * mmq_db, m.cs, nullptr, nullptr,
+                                                               last_of_group && !gd.n ? MMQ_TAIL : 0);
                                         }
                                     }
                                     if (slot >= 0 && !gg_now) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
                                     if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                                     if (gg_now) {   // also when the last entry was direct (a no-op without gathers)
-                                        flush(0);
+                                        flush(gd.n ? 0 : MMQ_TAIL);
                                         gg = mmq::GatherGroup{};
                                     }
                                 } else {
@@ -4503,13 +4529,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 int64_t maxr = 0;
                                 for (size_t i = j0; i <= j; ++i) maxr = std::max<int64_t>(maxr, m.cnt[(size_t) order[i]]);
                                 pt.mark(kPfGemmGU, cs);
-                                if (direct) {
+                                // No local slot in this group: all gathers were contiguous, including the tail.
+                                const bool table = direct && gd.n != 0;
+#if !defined(STRATA_HIP_GFX906)
+                                if (table) {
                                     // one launch: the direct experts' guards (their down over-read) and the zeroed tail
                                     // after the last gathered expert (see MMQ_TAIL)
                                     mmq::prep_group(gd, mmq_plan().d_over[(size_t) l],
                                                     ns ? m.grp_gu + (size_t) ns * mmq_gub : nullptr,
                                                     ns ? m.grp_d + (size_t) ns * mmq_db : nullptr, MMQ_TAIL, m.cs);
                                 }
+#endif
 #if defined(STRATA_GFX906_PREFILL_J48_BUILT) && STRATA_GFX906_PREFILL_J48_BUILT == 1 && defined(STRATA_HIP_GFX906)
                                 // Only these two original local expert calls can carry this provenance.
                                 const bool local_full_routing_prefill =
@@ -4532,12 +4562,12 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     const char* v = std::getenv("STRATA_GFX906_Q4_GROUP_TILE");
                                     return !v || std::atoi(v) != 0;
                                 }();
-                                if (q4_tiles && !direct && mmq_gt == 2 && (mmq_dt == 2 || mmq_dt == 3) &&
+                                if (q4_tiles && mmq_gt == 2 && (mmq_dt == 2 || mmq_dt == 3) &&
                                     ((T >= 512 && T <= 4096) || T == 8192))
                                     gu.tile_hint = T == 8192 ? 32 : nr <= 24 * ngx ? 16 : nr <= 52 * ngx ? 24 : nr <= 112 * ngx ? 32 : 48;
 #endif
                                 gu.y_scale = mmq::fp4_activations(mmq_gt) ? m.Xscale : nullptr;
-                                if (direct) gu.tab = &tgu;
+                                if (table) gu.tab = &tgu;
 #if defined(STRATA_GFX906_PREFILL_J48_BUILT) && STRATA_GFX906_PREFILL_J48_BUILT == 1 && defined(STRATA_HIP_GFX906)
                                 gu.local_full_routing_prefill = local_full_routing_prefill;
 #endif
@@ -4556,7 +4586,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 dn.ld_dst = N;
                                 dn.tile_hint = gu.tile_hint;
                                 dn.y_scale = mmq::fp4_activations(mmq_dt) ? m.Hscale : nullptr;
-                                if (direct) dn.tab = &td;
+                                if (table) dn.tab = &td;
+#if defined(STRATA_HIP_GFX906)
+                                mmq::WeightTab last;
+                                if (table) {
+                                    // After the last gather, on this group's compute stream, and before down reads it.
+                                    mmq::q4_down_shadows(td, shadow_mask, ngx, ns, m.grp_d, mmq_db, last, m.cs);
+                                    dn.last_tile = &last;
+                                }
+#endif
 #if defined(STRATA_GFX906_PREFILL_J48_BUILT) && STRATA_GFX906_PREFILL_J48_BUILT == 1 && defined(STRATA_HIP_GFX906)
                                 dn.local_full_routing_prefill = local_full_routing_prefill;
 #endif
@@ -4567,6 +4605,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     tgu = mmq::WeightTab{};
                                     td = mmq::WeightTab{};
                                     gd = mmq::GuardTab{};
+#if defined(STRATA_HIP_GFX906)
+                                    shadow_mask = 0;
+#endif
                                     ns = 0;
                                 }
                                 return true;
@@ -5112,9 +5153,12 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
         static const bool log = [] { const char* v = std::getenv("STRATA_MMQ_DIRECT_LOG"); return v && std::atoi(v) != 0; }();
         for (const Prefill* p = this; log && p != nullptr; p = p->next_)
             std::fprintf(stderr, "strata prefill: layers %lld..%lld: %lld of %lld resident experts read in place, %lld "
-                                 "streamed (STRATA_MMQ_DIRECT, totals)\n", (long long) p->stage_lb_,
+                                 "streamed (STRATA_MMQ_DIRECT, totals): eligible=%lld direct=%lld fallback=%lld "
+                                 "gather_bytes_skipped=%lld\n", (long long) p->stage_lb_,
                          (long long) p->stage_le_, (long long) p->stats_.experts_direct,
-                         (long long) p->stats_.experts_resident, (long long) p->stats_.experts_streamed);
+                         (long long) p->stats_.experts_resident, (long long) p->stats_.experts_streamed,
+                         (long long) p->stats_.mmq_direct_eligible, (long long) p->stats_.experts_direct,
+                         (long long) p->stats_.mmq_direct_fallback, (long long) p->stats_.mmq_direct_bytes);
     }
     return true;
 }

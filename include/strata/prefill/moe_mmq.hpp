@@ -78,12 +78,13 @@ struct Product {
     float* dst = nullptr;
     int64_t ld_dst = 0;
     const float* y_scale = nullptr;     ///< NVFP4 w4a4: the per-row activation scales (fp4_activations)
-    /// set: expert z's matrix starts at tab->p[z] (w and expert_bytes are not used for addressing).  CUDA only,
+    /// set: expert z's matrix starts at tab->p[z] (w and expert_bytes are not used for addressing),
     /// and only where `tab_fits` said so.
     const WeightTab* tab = nullptr;
     // Host provenance: only the original local, full-routing FP32 expert prefill calls set this.
     bool local_full_routing_prefill = false;
     int tile_hint = 0;  ///< Optional tile-selection width. max_rows still bounds the grid for the largest expert.
+    const WeightTab* last_tile = nullptr; ///< gfx906 direct down only: start of the final 64 rows for each expert
 };
 
 /// The launch context (llama.cpp's MMQ keeps a small scratch pool for its stream-k fixup).  One per prompt path.
@@ -140,11 +141,10 @@ void f16_to_f32(const uint16_t* x, float* y, int64_t n, void* stream);
 void set_bounds(int32_t* dst, int32_t rows, void* stream);
 
 // ---- STRATA_MMQ_DIRECT: the prompt MMQ reads resident experts in place (docs/DETAILS.md, "STRATA_MMQ_DIRECT") ----
-/// This build has the pointer-table MMQ (CUDA, the build option STRATA_MMQ_TAB on - off by default - and the
-/// llama.cpp tree matched the mirrored scheduler's fingerprint).  false under HIP, gfx906, SYCL and builds without MMQ.
+/// This build has the pointer-table MMQ: gfx906 Q4, or CUDA with STRATA_MMQ_TAB and a matching scheduler.
 bool tab_built();
 /// `tab_built`, `fits`, rows a multiple of 128 (no fallback tiles) and a pointer-table instance for the type (the
-/// native packs' nine: Q2_0 IQ2_XXS IQ2_XS IQ2_S IQ3_XXS IQ3_S IQ4_NL IQ4_XS Q8_0; not Q5_0 or the K-quants).
+/// nine native types on CUDA; Q4_0 and Q4_1 on gfx906 with its non-stream-k wave64 tiles).
 bool tab_fits(int ggml_type, int64_t w_rows);
 /// The bytes past a [rows, cols] matrix that its last row's final K tile reads (the largest over-read of any
 /// config on any visible GPU): 72 for IQ4_NL and 136 for Q8_0 at 640 columns, 0 for IQ3_S at 2560 (sm_86).  0 without MMQ.
@@ -169,5 +169,11 @@ struct GuardTab {
 /// One launch: zeroes `guard_bytes` at each g.p[i] and `tail_bytes` at tail_gu and tail_d (null: skipped).  It
 /// replaces the two tail memsets of a group in direct mode.  Nothing is launched when there is nothing to zero.
 void prep_group(const GuardTab& g, size_t guard_bytes, void* tail_gu, void* tail_d, size_t tail_bytes, void* stream);
+#if defined(STRATA_HIP_GFX906)
+/// Copy only direct experts' last 64 down rows to unused compact scratch. last[q] addresses those rows
+/// for every expert, whether copied here or already gathered. No read or write past a cache slot.
+void q4_down_shadows(const WeightTab& down, unsigned mask, int n, int ns, void* compact, size_t matrix,
+                     WeightTab& last, void* stream);
+#endif
 
 }  // namespace strata::prefill::mmq

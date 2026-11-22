@@ -1922,6 +1922,14 @@ the pairs in which the switched arm won). They are here so you can try them on y
   `STRATA_ADAPT_NOWAIT` or `STRATA_DMA_BATCH`; otherwise the log says why it is off. RTX A4000, 6 interleaved pairs each,
   decode median tok/s: Q2_0 16 GB 62.5 -> 66.2 (+5.9%), Q2_0 as a 12 GB card 51.3 -> 54.2 (+5.7%), IQ3_XXS 16 GB 48.6 -> 52.6 (+8.3%),
   IQ3_XXS as 12 GB 39.3 -> 41.5 (+5.5%), 6/6 pairs faster every time.
+- **gfx906 B3 native Q4 expert prefill:** set `STRATA_Q4_0_MMQ=1` and `STRATA_MMQ_DIRECT=1` to read
+  local cache slots in place, with the original cache/loan layout. GU is Q4_0; down is Q4_0 or Q4_1.
+  Both use ggml's complete product tile. Only the final 64 down rows of each direct expert are copied
+  (23,040 or 25,600 bytes) into unused group scratch with 80 zero bytes after them. The last compact
+  matrix has its own separate zero tail. Only the final down row tile selects this alternate address;
+  GU has no such branch. Streamed/peer entries are gathered. Mode 0/unset or mode 2 selects the
+  ordinary gather. STRATA_MMQ_DIRECT_LOG=1 reports cumulative local candidates, reads in place,
+  fallback gathers and avoided payload bytes (net of copied shadow rows). Opt-in; qualify on B3.
 - **`STRATA_MMQ_DIRECT=1`: the prompt's MMQ reads resident experts in their cache slots** (CUDA, native packs; needs an
   engine built with `-DSTRATA_MMQ_TAB=ON`, which is off by default). The prompt path multiplies its experts in groups of
   16 with llama.cpp's MMQ, which wants a group's weights in one buffer at a fixed stride, so every expert a chunk routes
@@ -1935,7 +1943,7 @@ the pairs in which the switched arm won). They are here so you can try them on y
   136 bytes past a 640-wide down matrix; they are zeroed before each group. That is about 2.3 MiB over 9,300 slots (one
   slot fewer out of 6,998 on one RTX 3090). `STRATA_MMQ_DIRECT=2` keeps that layout but copies as before (an A/B
   reference); 0 or unset is the default path, byte for byte. `STRATA_MMQ_DIRECT_LOG=1` adds each stage's count of experts
-  read in place to the log after every prompt. Under HIP, on a build without `STRATA_MMQ_TAB`, or when CMake turned
+  read in place to the log after every prompt. Under HIP other than gfx906, on a CUDA build without `STRATA_MMQ_TAB`, or when CMake turned
   that option off (it does so, with a message, when the llama.cpp tree's `mmq.cuh` differs from the one the copy
   mirrors), the variable is ignored.
   **Why the build option is off:** the engine loads every kernel at start (`CUDA_MODULE_LOADING=EAGER`), and the nine

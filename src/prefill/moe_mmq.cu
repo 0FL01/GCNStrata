@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 
 namespace strata::prefill::mmq {
 #if defined(STRATA_KQ_DSO)
@@ -177,6 +178,10 @@ __global__ void set_bounds_kernel(int32_t* d, int32_t rows) {
 
 unsigned blocks(int64_t n) { return (unsigned) ((n + 255) / 256); }
 
+#if defined(STRATA_HIP_GFX906) && defined(__HIPCC__)
+#define STRATA_GFX906_Q4_TAB 1
+#endif
+
 #if defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
 // STRATA_MMQ_DIRECT: a group's guards (y < g.n, byte stores) and its two zero tails (y == g.n: gate/up, y == g.n + 1:
 // down; uint4 stores when `tail16`, which the host checked: both pointers and the size 16-byte aligned).  Only in a
@@ -197,6 +202,11 @@ __global__ void prep_group_kernel(GuardTab g, int64_t guard, uint8_t* tail_gu, u
     }
 }
 
+#endif
+
+#if defined(STRATA_GFX906_Q4_TAB)
+#include "moe_mmq_gfx906_q4.cuh"
+#elif defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
 // the pointer-table MMQ per type: the native packs' nine types (CMake's _strata_mmq_tab_types, all of them checked
 // bit for bit by prefill_mmq_tab_test).  false: no instance - the optional Q5_0 and K-quant experts keep the gather
 bool run_tab(ggml_backend_cuda_context* ctx, const mmq_args* a, const mmq_x_tab* tab, cudaStream_t s) {
@@ -496,6 +506,15 @@ void Context::run(const Product& p, void* stream) {
                          (long long) p.w_rows);
             std::exit(1);
         }
+#elif defined(STRATA_GFX906_Q4_TAB)
+        if (p.last_tile) {
+            const DownTabs tabs{*p.tab, *p.last_tile};
+            if (t == GGML_TYPE_Q4_0) run_q4_tab<GGML_TYPE_Q4_0>(a, tabs, s);
+            else if (t == GGML_TYPE_Q4_1) run_q4_tab<GGML_TYPE_Q4_1>(a, tabs, s);
+            else GGML_ABORT("unexpected gfx906 direct down type");
+        } else if (t == GGML_TYPE_Q4_0 && p.w_cols == 2560) {
+            run_q4_tab<GGML_TYPE_Q4_0>(a, *p.tab, s);
+        } else GGML_ABORT("unexpected gfx906 direct GU shape");
 #else
         run_tab(&ctx, &a, nullptr, s);
 #endif
@@ -549,7 +568,7 @@ void Context::run(const Product& p, void* stream) {
 
 // ---- STRATA_MMQ_DIRECT ----
 bool tab_built() {
-#if defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)
+#if (defined(STRATA_MMQ_TAB) && !defined(__HIPCC__)) || defined(STRATA_GFX906_Q4_TAB)
     return true;
 #else
     return false;
@@ -620,7 +639,7 @@ int direct_mode() {
         if (m != 1 && m != 2) return 0;
         if (!tab_built()) {
             std::fprintf(stderr, "strata: STRATA_MMQ_DIRECT=%d is ignored: this build has no pointer-table MMQ "
-                                 "(CUDA with STRATA_MMQ_TAB only)\n", m);
+                                 "(requires gfx906 Q4 or CUDA with STRATA_MMQ_TAB)\n", m);
             return 0;
         }
         return m;
@@ -628,7 +647,49 @@ int direct_mode() {
     return mode;
 }
 
-size_t direct_slot_guard() { return direct_mode() != 0 ? kSlotGuard : 0; }
+size_t direct_slot_guard() {
+#if defined(STRATA_GFX906_Q4_TAB)
+    return 0; // the only padding this path reads is in pre-existing group scratch
+#else
+    return direct_mode() != 0 ? kSlotGuard : 0;
+#endif
+}
+
+#if defined(STRATA_GFX906_Q4_TAB)
+// compact ends at tail. Its final matrix needs at most 80 zero bytes; shadows start AFTER this
+// range, with another 80 zeros after each copy. A compact prefix of length zero needs no tail.
+constexpr unsigned kShadowPad16 = 5;
+__global__ void q4_down_shadow_kernel(WeightTab sources, uint4* tail, unsigned rows16, bool compact) {
+    const unsigned j = blockIdx.y, v = blockIdx.x * blockDim.x + threadIdx.x;
+    uint4* out = tail + kShadowPad16 + j * (rows16 + kShadowPad16);
+    if (v < rows16) out[v] = ((const uint4*)sources.p[j])[v];
+    else if (v < rows16 + kShadowPad16) out[v] = make_uint4(0, 0, 0, 0);
+    if (compact && j == 0 && v < kShadowPad16) tail[v] = make_uint4(0, 0, 0, 0);
+}
+
+void q4_down_shadows(const WeightTab& down, unsigned mask, int n, int ns, void* compact, size_t matrix,
+                     WeightTab& last, void* stream) {
+    // Plan restricts this to 2560 x 640 in Q4_0/Q4_1, with I=64. Each direct expert frees one
+    // entire matrix slot, far more than rows + 2*pad; n<=16. Both scratch and matrix are 16-aligned.
+    constexpr size_t pad = kShadowPad16 * sizeof(uint4);
+    const size_t rows = matrix / (2560 / 64);
+    GGML_ASSERT(ns >= 0 && ns < n && n <= kGatherGroupMax && rows + 2*pad <= matrix && rows % 16 == 0);
+    uint8_t* tail = (uint8_t*)compact + ns * matrix;
+    WeightTab sources{};
+    int copied = 0;
+    for (int q = 0; q < n; ++q) {
+        const uint8_t* src = (const uint8_t*)down.p[q] + (matrix - rows);
+        if (mask & (1u << q)) {
+            sources.p[copied] = src;
+            last.p[q] = tail + pad + copied++ * (rows + pad);
+        } else last.p[q] = src;
+    }
+    GGML_ASSERT(ns + copied == n);
+    q4_down_shadow_kernel<<<dim3(blocks(rows / 16 + kShadowPad16), copied), 256, 0, (cudaStream_t)stream>>>(
+        sources, (uint4*)tail, (unsigned)(rows / 16), ns > 0);
+    ck(cudaGetLastError(), "q4_down_shadows");
+}
+#endif
 
 void prep_group(const GuardTab& g, size_t guard_bytes, void* tail_gu, void* tail_d, size_t tail_bytes, void* stream) {
 #if !defined(STRATA_MMQ_TAB) || defined(__HIPCC__)
@@ -644,7 +705,7 @@ void prep_group(const GuardTab& g, size_t guard_bytes, void* tail_gu, void* tail
     GuardTab gt = g;
     gt.n = guard > 0 ? n : 0;
     const bool tail16 = ((uintptr_t) tail_gu | (uintptr_t) tail_d | tail_bytes) % 16 == 0;
-    const size_t span = std::max(guard, tail);
+    const size_t span = std::max(guard, tail16 ? tail / 16 : tail);
     prep_group_kernel<<<dim3(blocks((int64_t) span), (unsigned) (gt.n + 2)), 256, 0, (cudaStream_t) stream>>>(
         gt, (int64_t) guard, (uint8_t*) tail_gu, (uint8_t*) tail_d, (int64_t) tail, tail16);
     ck(cudaGetLastError(), "prep_group");
