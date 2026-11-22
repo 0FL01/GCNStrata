@@ -4490,8 +4490,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     return !v || std::atoi(v) != 0;
                                 }();
                                 if (q4_tiles && !direct && mmq_gt == 2 && (mmq_dt == 2 || mmq_dt == 3) &&
-                                    T >= 512 && T <= 4096)
-                                    gu.tile_hint = nr <= 24 * ngx ? 16 : nr <= 52 * ngx ? 24 : nr <= 112 * ngx ? 32 : 48;
+                                    ((T >= 512 && T <= 4096) || T == 8192))
+                                    gu.tile_hint = T == 8192 ? 32 : nr <= 24 * ngx ? 16 : nr <= 52 * ngx ? 24 : nr <= 112 * ngx ? 32 : 48;
 #endif
                                 gu.y_scale = mmq::fp4_activations(mmq_gt) ? m.Xscale : nullptr;
                                 if (direct) gu.tab = &tgu;
