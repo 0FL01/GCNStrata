@@ -117,10 +117,49 @@ __device__ __forceinline__ int reduce12_head_of_lane(int lane) {
     return ((lane >> 4) & 1) * 8 + ((lane >> 3) & 1) * 4 + ((lane >> 2) & 1) * 2 + ((lane >> 1) & 1);
 }
 
+#if defined(STRATA_HIP_GFX906)
+// The gfx906 swizzle instruction is a constant-index exchange within each 32-lane
+// half-wave. DPP is within 16 (xor 8 == rotate 8) / 4 lanes. Unlike the HIP
+// generic xor shuffle these do not construct a dynamic index, clamp and permute it.
+// The lanes that participate in a dot product are always a complete logical warp.
+template <int X> __device__ __forceinline__ float qk2_xor(float a) {
+    const int v = __float_as_int(a);
+    if constexpr (X == 16 || X == 4)
+        return __int_as_float(__builtin_amdgcn_ds_swizzle(v, (X << 10) | 31));
+    if constexpr (X == 8) return __int_as_float(__builtin_amdgcn_mov_dpp(v, 0x128, 15, 15, false));
+    if constexpr (X == 2) return __int_as_float(__builtin_amdgcn_mov_dpp(v, 0x4e, 15, 15, false));
+    if constexpr (X == 1) return __int_as_float(__builtin_amdgcn_mov_dpp(v, 0xb1, 15, 15, false));
+}
+// Reduce-scatter as in reduce12_gfx906; just exchange with the constant xor partners.
+__device__ __forceinline__ float qk2_reduce12(const float (&part)[16], int lane) {
+    float r8[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const bool hi = (lane & 16) != 0;
+        r8[i] = (hi ? part[i + 8] : part[i]) + qk2_xor<16>(hi ? part[i] : part[i + 8]);
+    }
+    float r4[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const bool hi = (lane & 8) != 0;
+        r4[i] = (hi ? r8[i + 4] : r8[i]) + qk2_xor<8>(hi ? r8[i] : r8[i + 4]);
+    }
+    float r2[2];
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const bool hi = (lane & 4) != 0;
+        r2[i] = (hi ? r4[i + 2] : r4[i]) + qk2_xor<4>(hi ? r4[i] : r4[i + 2]);
+    }
+    const bool hi2 = (lane & 2) != 0;
+    const float r1 = (hi2 ? r2[1] : r2[0]) + qk2_xor<2>(hi2 ? r2[0] : r2[1]);
+    return r1 + qk2_xor<1>(r1);
+}
+#endif
+
 // The chunk kernel's body; `p` is the query's KV pools (the call's one set, or blockIdx.z's slot's set).
 // (the body is a device function so the batch window's rows kernel below can run it over each query's own pools without
 // the default kernel's signature, or the function-pointer types the pre-sm_75 / HIP selections build, changing)
-template <int KV_MODE, bool LANE_CELL, bool QUERY_SWIZZLE, bool REDUCE12, bool PROMPT_V = false>
+template <int KV_MODE, bool LANE_CELL, bool QUERY_SWIZZLE, bool REDUCE12, bool PROMPT_V = false, bool PROMPT_QK = false>
 __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, QsaAttnPools p,
                                                 const int32_t* __restrict__ ids, const int32_t* __restrict__ step,
                                                 int n_kv_heads, int page_size, float scale,
@@ -203,6 +242,53 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
             }
         }
     } else
+#if defined(STRATA_HIP_GFX906)
+    if constexpr (PROMPT_QK) {
+        static_assert(PROMPT_V && REDUCE12 && QUERY_SWIZZLE && KV_MODE == 1 && CHUNK == 64 && WARPS == 8);
+        const int qflip = lane & 4;
+        const int h_out = reduce12_head_of_lane(lane);
+        // Score two cells from one load of this head's two swizzled query float4s.
+        // Each individual dot and its five butterfly partners remain in the baseline order.
+        for (int i = 0; i < CHUNK; i += 2 * WARPS) {
+            const int c = i + warp;
+            const long long rows[2] = {srow[c], srow[c + WARPS]};
+            if ((rows[0] & rows[1]) < 0) {
+                if (lane < G) sp[lane][c] = sp[lane][c + WARPS] = -FLT_MAX;
+                continue;
+            }
+            // A partial pair duplicates its valid peer's load, then writes the masked
+            // score sentinel. Never dereference a missing row or assume row zero exists.
+            float kk[2][8];
+            load8<1>(p, false, rows[0] >= 0 ? rows[0] : rows[1], lane * 8, kk[0]);
+            load8<1>(p, false, rows[1] >= 0 ? rows[1] : rows[0], lane * 8, kk[1]);
+            // The loop-invariant address otherwise hoists all 96 query words before
+            // the pair loop (136 VGPRs). Identity asm keeps the reads local to a tile.
+            using V4f = float __attribute__((ext_vector_type(4)));
+            int qv = (lane * 8 + qflip) / 4;
+            float pp[2][16] = {};
+#pragma unroll
+            for (int h = 0; h < G; ++h) {
+                const auto* qr = reinterpret_cast<const V4f*>(&sq[h][0]);
+                const V4f a = qr[qv], b = qr[qv ^ 1];
+#pragma unroll
+                for (int j = 0; j < 2; ++j) {
+                    const float* k = kk[j];
+                    pp[j][h] = k[0] * a.x + k[1] * a.y + k[2] * a.z + k[3] * a.w +
+                               k[4] * b.x + k[5] * b.y + k[6] * b.z + k[7] * b.w;
+                }
+                // This identity consumes both completed dots before the next head's
+                // reads: keep exactly two query vectors live, with no extra GPU ALU.
+                asm volatile("" : "+v"(qv) : "v"(pp[0][h]), "v"(pp[1][h]));
+            }
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const float score = qk2_reduce12(pp[j], lane);
+                if ((lane & 1) == 0 && h_out < G)
+                    sp[h_out][c + j * WARPS] = rows[j] >= 0 ? score * scale : -FLT_MAX;
+            }
+        }
+    } else
+#endif
     // scores: each warp takes cells warp, warp+8, ...; each lane holds 8 of the 256 dimensions.
     for (int c = warp; c < CHUNK; c += WARPS) {
         if (c >= n_here || srow[c] < 0) {
@@ -337,14 +423,14 @@ __device__ __forceinline__ void attn_chunk_body(const float* __restrict__ q, Qsa
     for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h];
 }
 
-template <int KV_MODE, bool LANE_CELL = false, bool QUERY_SWIZZLE = false, bool REDUCE12 = false, bool PROMPT_V = false>
+template <int KV_MODE, bool LANE_CELL = false, bool QUERY_SWIZZLE = false, bool REDUCE12 = false, bool PROMPT_V = false, bool PROMPT_QK = false>
 __global__ void __launch_bounds__(THREADS) attn_chunk_kernel(const float* __restrict__ q, QsaAttnPools p,
                                                              const int32_t* __restrict__ ids,
                                                              const int32_t* __restrict__ step, int n_kv_heads,
                                                              int page_size, float scale, float* __restrict__ part_acc,
                                                              float* __restrict__ part_m, float* __restrict__ part_l,
                                                              int n_chunks, int cap = 0, long long scratch_stride = 0) {
-    attn_chunk_body<KV_MODE, LANE_CELL, QUERY_SWIZZLE, REDUCE12, PROMPT_V>(q, p, ids, step, n_kv_heads, page_size, scale,
+    attn_chunk_body<KV_MODE, LANE_CELL, QUERY_SWIZZLE, REDUCE12, PROMPT_V, PROMPT_QK>(q, p, ids, step, n_kv_heads, page_size, scale,
                                                                  part_acc, part_m, part_l, n_chunks, cap,
                                                                  scratch_stride);
 }
@@ -1040,6 +1126,15 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
                 return !e || std::strcmp(e, "1") == 0;
             }();
             if (kernel == -2 && prompt_v) {
+                static const bool prompt_qk = [] {
+                    const char* e = std::getenv("STRATA_GFX906_PROMPT_QK2");
+                    return !e || std::strcmp(e, "1") == 0;
+                }();
+                if (prompt_qk) {
+                    attn_chunk_kernel<1, false, true, true, true, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps,
+                        (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+                    return;
+                }
                 attn_chunk_kernel<1, false, true, true, true><<<grid, THREADS, 0, st>>>(q, pools, ids, steps,
                     (int) s.n_head_kv, (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
                 return;
