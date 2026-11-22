@@ -9,6 +9,7 @@
 #endif
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/kernels/gfx_arch.hpp"
 #include "strata/prefill/prefill.hpp"
 #include <atomic>
 #if defined(__cpp_lib_atomic_wait)
@@ -892,6 +893,7 @@ struct Prefill::Impl {
     uint16_t *xn16 = nullptr, *lo16 = nullptr;
     float* mixed = nullptr;
     uint16_t *mixed_bf = nullptr, *mixed_h = nullptr;
+    bool hc_up_f16 = false;   // this stage may leave the HC up GEMM in the original gated allocation as FP16
     bool f16_io = false;   // HIP, STRATA_HIP_PROMPT_F16=1: this stage's 16-bit GEMMs run FP16 in and out (set in init)
     bool xn_f16 = false;   // Turing, BF16 on FP16 tensor cores: xn16 written as the FP16 values the GEMM would convert
     uint16_t *xn16_lo = nullptr, *lo16_lo = nullptr, *mixed_bf_lo = nullptr;   // bf16x2(): the BF16 GEMMs' low parts
@@ -1430,6 +1432,15 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         set_act_f16(m.f16_io);
         static const bool f16_range = std::getenv("STRATA_F16_RANGE") != nullptr;   // what reaches FP16's range
         if (f16_range) { set_f16_range(true); gemm_set_f16_range(true); }
+#if defined(STRATA_HIP_GFX906)
+        const char* hc_f16 = std::getenv("STRATA_GFX906_HC_UP_F16");  // =0 keeps the widening pass
+        if (m.f16_io && (!hc_f16 || hc_f16[0] == '1') && !f16_range && !std::getenv("STRATA_DBG_NAN") &&
+            !gr_unfused() && !hc_upmix() && !std::getenv("STRATA_HC_UPMIX_CHECK")) {
+            cudaDeviceProp p{};
+            m.hc_up_f16 = cudaGetDeviceProperties(&p, m.device) == cudaSuccess && p.warpSize == 64 &&
+                          strata::kernels::gfx_arch_is(p.gcnArchName, "gfx906");
+        }
+#endif
         // the hyper-connection's xn16 straight as the FP16 the tensor-core GEMM reads (its two readers then skip the
         // conversion pass; the same values): STRATA_XN_F16=0 keeps the BF16 image
         static const bool xn_env = [] { const char* e = std::getenv("STRATA_XN_F16"); return e == nullptr || e[0] != '0'; }();
@@ -3116,6 +3127,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (!hcd && !hdown && !bf16_proj(m.gemm, wd, m.xn16, m.lo, T, sd, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
                 }
                 gr_silu(m.lo, m.lo16, T, m.cs, m.lo16_lo);
+                HcUpF16Rows gated16;
                 bool upmixed = false;
                 if (wu->q8_scale == nullptr && hc_upmix() && T >= std::max(pf_switch_min_t(), hc_upmix_min_t()) && !gr_unfused() && !m.lo16_lo && !m.mixed_bf_lo &&
                     wu->kind == core::WeightKind::Bf16InF32 && wu->data && wu->ne0 == LR && wu->ne1 == D) {
@@ -3155,7 +3167,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         wu->kind == core::WeightKind::Bf16InF32,
                         1,m.device,T,D,LR,m.cs,m.lo16,(const uint16_t*)wu->data,m.gated,hc_clone_counts);
 #endif
-                    if (!upmixed && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
+                    if (m.hc_up_f16 && !upmixed && !m.lo16_lo && !m.mixed_bf_lo && wu != &wu_q8 && wu->resident &&
+                        !wu->q8_scale && wu->kind == core::WeightKind::Bf16InF32 && wu->data && wu->ne0 == LR && wu->ne1 == D)
+                        gated16 = m.gemm.hc_up_f16(m.lo16, (const uint16_t*) wu->data, m.gated, T, D, LR);
+                    if (!upmixed && !gated16.data && !bf16_proj(m.gemm, wu, m.lo16, m.gated, T, su, err, 0, m.lo16_lo, 0, m.cs)) return false;
                 }
 #if defined(STRATA_HC_BF16_N4_BUILT)
                 if (!hcd) {
@@ -3167,6 +3182,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (!hcd && !bf16_proj(m.gemm, wi, m.xn16, m.inj, T, si, err, 0, m.xn16_lo, ldx != D ? ldx : 0, m.cs, xf16)) return false;
 #endif
                 if (upmixed) {
+                } else if (gated16.data) {
+                    gr_mix_r_f16(m.R, m.grs, (const float*) wn->data, gated16, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h);
                 } else if (gr_unfused()) {
                     gr_mix(m.xn, m.gated, m.mixed, m.mixed_bf, T, m.cs, m.mixed_h, m.mixed_bf_lo);
                 } else {

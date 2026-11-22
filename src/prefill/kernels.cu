@@ -1,5 +1,6 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
+#include "strata/prefill/gemm.hpp"
 #include "strata/kernels/mrope.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/router_top10.hpp"
@@ -143,9 +144,10 @@ __global__ void gr_norm_rs_kernel(const float* __restrict__ R, const float* __re
         if (xn16_lo) xn16_lo[xo + d] = bf_lo(v, h);
     }
 }
+template <typename Gate>
 __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __restrict__ rs, const float* __restrict__ w,
-                                const float* __restrict__ g, float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
-                                int64_t T, uint16_t* __restrict__ mixed_h, uint16_t* __restrict__ mixed16_lo) {
+                                const Gate* __restrict__ g, float* __restrict__ mixed, uint16_t* __restrict__ mixed16,
+                                int64_t T, uint16_t* __restrict__ mixed_h, uint16_t* __restrict__ mixed16_lo, int64_t ld) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= T * N) return;
     const int64_t t = i / N, d = i % N;
@@ -154,7 +156,10 @@ __global__ void gr_mix_r_kernel(const float* __restrict__ R, const float* __rest
     for (int c = 0; c < HC; ++c) {
         const int64_t j = t * D + c * N + d;
         const float x = R[j] * rs[t * HC + c] * w[c * N + d];   // gr_norm_kernel's value, bit for bit
-        s = fmaf(x, sigm(g[j]), s);
+        float gate;
+        if constexpr (sizeof(Gate) == sizeof(uint16_t)) gate = __half2float(g[t * ld + c * N + d]);
+        else gate = g[j];
+        s = fmaf(x, sigm(gate), s);
     }
     s /= (float) HC;
     mixed[i] = s;
@@ -2384,8 +2389,14 @@ void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint1
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
               int64_t T, void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo) {
     gr_mix_r_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, gated, mixed, mixed16, T,
-                                                                          mixed_h, mixed16_lo);
+                                                                          mixed_h, mixed16_lo, D);
     check("gr_mix_r");
+}
+void gr_mix_r_f16(const float* R, const float* rs, const float* w_norm, HcUpF16Rows gated, float* mixed,
+                  uint16_t* mixed16, int64_t T, void* stream, uint16_t* mixed_h) {
+    gr_mix_r_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm,
+        reinterpret_cast<const __half*>(gated.data), mixed, mixed16, T, mixed_h, nullptr, gated.stride);
+    check("gr_mix_r_f16");
 }
 bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const float* rs, const float* w_norm,
               float* mixed, uint16_t* mixed16, uint16_t* mixed_h, int64_t T, void* stream) {

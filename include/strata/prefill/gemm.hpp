@@ -23,6 +23,12 @@ bool gemm_f16_range_read(float max_abs[2], unsigned long long over[2], bool rese
 namespace hc_f16_exact { struct State; }
 #endif
 
+// HC up only. The first N half-words in each original FP32 gate row are live until mix on the same stream.
+struct HcUpF16Rows {
+    const uint16_t* data = nullptr;
+    int64_t stride = 0;  // in FP16 elements, not bytes or FP32 elements
+};
+
 class Gemm {
 public:
     Gemm() = default;
@@ -43,6 +49,8 @@ public:
     /// (prefill's xn16 with its f16img writers): that path skips the conversion; any other converts back.
     void bf16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy = 0,
               float beta = 0.0f, int64_t ldx = 0, bool x_f16 = false);
+    /// One dense HC up product, leaving the original FP16-out layout in gated. Empty = no launch, use bf16().
+    HcUpF16Rows hc_up_f16(const uint16_t* lo16, const uint16_t* w_up, float* gated, int64_t T, int64_t N, int64_t K);
     /// true when bf16() runs its products through FP16 tensor cores here (Turing, STRATA_BF16_TC): where X may be FP16
     bool bf16_converts_x() const;
 
@@ -114,7 +122,8 @@ private:
     void* mmq_buf_ = nullptr;
     bool mmq_failed_ = false;
     /// Y = X . W^T with FP16 out, written into Y's own rows and widened there (no buffer): prompt_f16() only.
-    void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy);
+    void f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                     bool widen = true);
 };
 
 /// Pascal, opt-in: Gemm::f16's large dense shapes as cublasSgemm on FP32 copies (gemm.cu; bitwise the FP16 call's

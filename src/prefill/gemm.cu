@@ -1313,7 +1313,22 @@ bool Gemm::native_mmq(const uint16_t* X, int type, const void* W, float* Y, int6
     return true;
 }
 #endif
-void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy) {
+HcUpF16Rows Gemm::hc_up_f16(const uint16_t* lo16, const uint16_t* w_up, float* gated, int64_t T, int64_t N, int64_t K) {
+#if defined(STRATA_HIP_GFX906) && defined(__HIPCC__)
+    // A split BF16 weight starts tile r0 at gated + r0 FLOATS, not half-words. Only a single tile is one FP16 view.
+    if (f16_io_ && T > 0 && N == 10240 && K == 320 && scratch_elems_ >= N * K) {
+        bf16_to_f16_rows<<<1024, 256, 0, (cudaStream_t) stream_>>>(w_up, (__half*) scratch_, N * K);
+        f16_inplace(lo16, scratch_, gated, T, N, K, N, false);
+        return {reinterpret_cast<const uint16_t*>(gated), 2 * N};
+    }
+#else
+    (void) lo16; (void) w_up; (void) gated; (void) T; (void) N; (void) K;
+#endif
+    return {};
+}
+
+void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                       bool widen) {
 #if defined(__HIPCC__)
     const float one = 1.0f, zero = 0.0f;
     bool done = false;
@@ -1326,6 +1341,7 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
            "cublasGemmEx f16 out");
     }
+    if (!widen) return;
     static const bool dbg_nan = std::getenv("STRATA_DBG_NAN") != nullptr;
     widen_rows_f16<<<(unsigned) T, 256, 0, (cudaStream_t) stream_>>>(Y, N, ldy, dbg_nan ? 1 : 0);
     if (dbg_nan) {   // debug only: a sync per GEMM
@@ -1338,7 +1354,7 @@ void Gemm::f16_inplace(const uint16_t* X, const uint16_t* W, float* Y, int64_t T
         }
     }
 #else
-    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy;
+    (void) X; (void) W; (void) Y; (void) T; (void) N; (void) K; (void) ldy; (void) widen;
 #endif
 }
 
