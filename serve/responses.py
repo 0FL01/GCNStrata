@@ -125,7 +125,7 @@ def _tool_output(item, param):
     return out if isinstance(out, str) else _content(out, param + ".output")
 
 
-def input_messages(req: dict) -> list[dict]:
+def input_messages(req: dict, *, keep_tool_ids: bool = False) -> list[dict]:
     """`instructions` + `input` -> the chat template's messages."""
     messages = []
     instructions = req.get("instructions")
@@ -199,7 +199,7 @@ def input_messages(req: dict) -> list[dict]:
         else:
             raise ResponsesError(f"input items of type {kind!r} are not supported", param + ".type",
                                  "unsupported_parameter")
-    _order_tool_results(messages)
+    _order_tool_results(messages, keep_tool_ids)
     # leading system/developer messages (Codex: instructions, then its developer message) become one system message
     # at the start; later ones become user messages in place, as on the chat path
     lead = 0
@@ -210,10 +210,31 @@ def input_messages(req: dict) -> list[dict]:
     return _late_system_to_user(messages)
 
 
-def _order_tool_results(messages):
-    """Use the same complete, unambiguous ID matching as Chat before dropping private IDs."""
-    from serve.frontend import _order_chat_tool_results
-    _order_chat_tool_results(messages)
+def _order_tool_results(messages, keep_tool_ids=False):
+    """The template places tool results by position: each run of tool messages is put in the order of the calls of
+    the assistant turn before it (a client may send the results in the order they finished). Keep the IDs only for
+    a template that uses them to name a tool response."""
+    i = 0
+    while i < len(messages):
+        if messages[i]["role"] != "tool":
+            i += 1
+            continue
+        j = i
+        while j < len(messages) and messages[j]["role"] == "tool":
+            j += 1
+        prev = messages[i - 1] if i else {}
+        order = [c.get("_call_id") for c in prev.get("tool_calls") or []]
+        rank = {cid: k for k, cid in enumerate(order) if cid}
+        messages[i:j] = sorted(messages[i:j], key=lambda m: rank.get(m.get("_call_id"), len(order)))
+        i = j
+    for m in messages:
+        cid = m.pop("_call_id", None)
+        if cid and keep_tool_ids:
+            m["tool_call_id"] = cid
+        for c in m.get("tool_calls") or []:
+            cid = c.pop("_call_id", None)
+            if cid and keep_tool_ids:
+                c["id"] = cid
 
 
 def request_tools(req: dict):
@@ -453,8 +474,9 @@ class Assembler:
     answer is the `response` of the last event, so both modes are the same items."""
 
     def __init__(self, req: dict, model: str, prompt_tokens: int, names: dict, encrypted: bool,
-                 json_mode: bool = False):
+                 json_mode: bool = False, *, confirm_tool_calls: bool = False):
         self.names, self.encrypted, self.json_mode = names, encrypted, json_mode
+        self.confirm_tool_calls = confirm_tool_calls
         self.prompt_tokens = prompt_tokens
         self.seq = 0
         self.item = None                             # the open output item
@@ -506,12 +528,13 @@ class Assembler:
     def index(self) -> int:
         return len(self.response["output"]) - 1
 
-    def close(self, status="completed") -> list[dict]:
+    def close(self, status=None) -> list[dict]:
         item, self.item = self.item, None
         if item is None:
             return []
         at, out = self.response["output"].index(item), []
-        item["status"] = status
+        item["status"] = status or ("incomplete" if self.confirm_tool_calls and
+                                   item["type"] in ("function_call", "custom_tool_call") else "completed")
         if item["type"] == "message":
             part = item["content"][0]
             out += [self.event("response.output_text.done", item_id=item["id"], output_index=at, content_index=0,
@@ -589,7 +612,7 @@ class Assembler:
                 item["input"] = value if isinstance(value, str) else json.dumps(ev.call.arguments, ensure_ascii=False)
                 out.append(self.event("response.custom_tool_call_input.delta", item_id=item["id"],
                                       output_index=self.index, delta=item["input"]))
-            out += self.close()
+            out += self.close("completed")
         return out
 
     def _release(self, text: str) -> list[dict]:
@@ -652,7 +675,10 @@ class Assembler:
             return out + [self.event("response.incomplete", response=self.snapshot())]
         self.response["status"] = "completed"
         self.response["completed_at"] = int(time.time())
-        return out + [self.event("response.completed", response=self.snapshot())]
+        e = self.event("response.completed", response=self.snapshot())
+        if done.get("timings"):
+            e["timings"] = done["timings"]                # top-level llama.cpp's names: the speed its clients show
+        return out + [e]
 
     def failed(self, message: str, code: str = "server_error") -> dict:
         """response.failed: an error after the stream started (the HTTP status is already sent)."""

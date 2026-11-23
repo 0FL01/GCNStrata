@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 
 namespace strata::kernels {
 
@@ -210,7 +211,7 @@ bool native_mmvq_slots_wide();
 
 struct MmvqIds {
     const void* const* table;
-    const int32_t* ids;
+    const std::int32_t* ids;
     std::size_t offset;
     const void* x;
     std::size_t x_stride;

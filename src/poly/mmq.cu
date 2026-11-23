@@ -55,7 +55,11 @@ float* fp4_scales(void* xq, int64_t rows, int64_t cols) {
 
 #if STRATA_POLY_HIP_NVFP4
 bool hip_nvfp4_fits(int64_t w_rows, int64_t w_cols, const ggml_cuda_device_info::cuda_device_info& dev) {
-    const bool arch_ok = (dev.cc == GGML_CUDA_CC_RDNA2 + 1 && dev.warp_size == 32) || (dev.warp_size == 64);
+#if defined(STRATA_HIP_GFX906)
+    const bool arch_ok = (dev.warp_size == 64);
+#else
+    const bool arch_ok = (dev.cc == GGML_CUDA_CC_RDNA2 + 1 && dev.warp_size == 32);
+#endif
     if (!arch_ok || w_rows != 2304 || (w_cols != 2304 && w_cols != 1152)) return false;
     static const bool asked = [] {
         const char* v = std::getenv("STRATA_HIP_NVFP4_MMQ");

@@ -795,7 +795,8 @@ void Inkling2::load_drafter() {
         g.payload(*t);
         return g.data(*t);
     };
-    if (g.find("dspark_fuse.weight")) {
+    const bool precomp_head = g.find("markov_w2.weight") && g.find("markov_w2.bias") && g.find("markov_ctx_mix.weight");
+    if (!precomp_head) {
         const float* fuse = (const float*) host("dspark_fuse.weight");
         for (int r = 0; r <= kDsLayers; ++r) {   // a row's weights over the four taps: softmax(dspark_fuse[r])
             float most = -INFINITY, sum = 0.f;
@@ -812,7 +813,7 @@ void Inkling2::load_drafter() {
         std::memcpy(ds_mix_[kDsLayers], m, 4 * sizeof(float));
     }
     ds_w1_ = host("markov_w1.weight");
-    if (g.find("markov_w2.weight")) {
+    if (precomp_head) {
         ds_w2_host_ = host("markov_w2.weight");
         ds_b2_host_ = (const float*) host("markov_w2.bias");
     } else {
@@ -1125,6 +1126,7 @@ void Inkling2::assign_scratch() {
     ds_w2_ = (uint16_t*) fbuf(((size_t) kDsRank * n_vocab_ + 1) / 2);
     if (!ds_host_) ds_host_ = (float*) hmalloc(b * kWidth * sizeof(float), "pinned memory");
     ds_head_ready_ = false;
+    if (scratch_ && ds_w2_host_ && ds_b2_host_ && ds_w2_ && ds_b2_) prepare_head();
 }
 
 void Inkling2::conv(float* x, float* state, const float* w, const float* dynamic, int width, int n) {
