@@ -152,9 +152,10 @@ bool run(const Case& c, float* scores, float* partial, int tiles, bool timed) {
         const char* l = std::getenv("STRATA_INKLING_LANE_PROB");
         cudaDeviceProp prop{};
         int device = 0;
-        const bool gfx1031 = cudaGetDevice(&device) == cudaSuccess && cudaGetDeviceProperties(&prop, device) == cudaSuccess &&
-                             std::string(prop.gcnArchName).rfind("gfx1031", 0) == 0;
-        return v && std::string(v) == "1" && l && std::string(l) == "1" && gfx1031;
+        const bool ok_arch = cudaGetDevice(&device) == cudaSuccess && cudaGetDeviceProperties(&prop, device) == cudaSuccess &&
+                             (std::string(prop.gcnArchName).rfind("gfx1031", 0) == 0 ||
+                              std::string(prop.gcnArchName).rfind("gfx906", 0) == 0);
+        return v && std::string(v) == "1" && l && std::string(l) == "1" && ok_arch;
     }();
     const double limit = half && !c.dec && a.k.scales ? 1e-3 : 1e-4;
     const bool ok = finite && relative <= limit;

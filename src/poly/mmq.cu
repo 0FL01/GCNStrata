@@ -55,10 +55,8 @@ float* fp4_scales(void* xq, int64_t rows, int64_t cols) {
 
 #if STRATA_POLY_HIP_NVFP4
 bool hip_nvfp4_fits(int64_t w_rows, int64_t w_cols, const ggml_cuda_device_info::cuda_device_info& dev) {
-    // gfx1031 in ggml_cuda_info() is RDNA2's base gfx1030 plus one. Limit this experiment to Inkling's
-    // fused gate/up and down shapes; RDNA2 uses wave32 DP4A tiles, with no stream-k.
-    if (dev.cc != GGML_CUDA_CC_RDNA2 + 1 || dev.warp_size != 32 || w_rows != 2304 ||
-        (w_cols != 2304 && w_cols != 1152)) return false;
+    const bool arch_ok = (dev.cc == GGML_CUDA_CC_RDNA2 + 1 && dev.warp_size == 32) || (dev.warp_size == 64);
+    if (!arch_ok || w_rows != 2304 || (w_cols != 2304 && w_cols != 1152)) return false;
     static const bool asked = [] {
         const char* v = std::getenv("STRATA_HIP_NVFP4_MMQ");
         return v && v[0] == '1' && v[1] == '\0';
@@ -206,6 +204,7 @@ void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t st
             const auto& dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
             if (!hip_nvfp4_fits(w_rows, w_cols, dev))
                 throw std::runtime_error("mmq: HIP NVFP4 W4A8 not enabled or unsupported");
+#if !defined(STRATA_HIP_GFX906)
             static const bool tail = [] {
                 const char* v = std::getenv("STRATA_HIP_NVFP4_TAIL");
                 return v && v[0] == '1' && v[1] == '\0';
@@ -218,8 +217,6 @@ void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t st
                                stderr);
                 return on;
             }();
-            // J8 tiles (8 rows at most) grow with the VOP3 form: 94 -> 175 VGPRs, 2.73 -> 2.89 ms in a 128-expert
-            // launch on RX 6700 XT; from 16 rows on they gain (J64 6.02 -> 5.58 ms)
             const bool use_lean = lean && max_rows > 8;
             if (tail && (use_lean ? nvfp4_tail_lean_try(a, s) : nvfp4_tail_try(a, s))) {
                 ck("mmq NVFP4 tail product");
@@ -229,10 +226,13 @@ void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t st
                 return;
             }
             if (use_lean) nvfp4_w4a8_lean(ctx, a, s);
-            else nvfp4_w4a8(ctx, a, s);   // Q8_1 activation scales live in xq, not in a.y_scale
+            else nvfp4_w4a8(ctx, a, s);
+#else
+            nvfp4_w4a8(ctx, a, s);
+#endif
             ck("mmq product");
             static const int logged = std::fputs(
-                "strata-poly: STRATA_HIP_NVFP4_MMQ=1: using NVFP4 W4A8 MMQ on gfx1031\n", stderr);
+                "strata-poly: STRATA_HIP_NVFP4_MMQ=1: using NVFP4 W4A8 MMQ\n", stderr);
             (void) logged;
             return;
         }

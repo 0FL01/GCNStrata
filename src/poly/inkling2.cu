@@ -623,9 +623,10 @@ void Inkling2::load_drafter_shape(const Shards& g) {
     };
     const MetaValue* arch = g.get("general.architecture");
     need(arch && arch->s == "dflash", "its architecture is not 'dflash'");
-    need(g.find("dspark_hidden_out.weight") && g.find("markov_w1.weight") && g.find("joint_proj.weight") &&
-             g.find("dspark_fuse.weight"),
-         "no Inkling2 DSpark head (dspark_hidden_out, markov_w1, joint_proj, dspark_fuse)");
+    const bool precomp_head = g.find("markov_w2.weight") && g.find("markov_w2.bias") && g.find("markov_ctx_mix.weight");
+    const bool legacy_head = g.find("dspark_hidden_out.weight") && g.find("dspark_fuse.weight");
+    need((precomp_head || legacy_head) && g.find("markov_w1.weight") && g.find("joint_proj.weight"),
+         "no Inkling2 DSpark head (markov_w1, joint_proj, and markov_w2 or dspark_hidden_out)");
     const auto must = [&](const char* key) -> const MetaValue& {
         const MetaValue* v = meta_in(g, key);
         need(v != nullptr, std::string("no dflash.") + key);
@@ -641,10 +642,11 @@ void Inkling2::load_drafter_shape(const Shards& g) {
     is("attention.value_length", kHead);
     is("rope.dimension_count", kHead);
     is("block_size", kDsBlock);
-    is("attention.sliding_window", kWindow);
-    is("vocab_size_unpadded", (uint64_t) n_vocab_);
-    need(must("sample_from_anchor").u == 0 && must("attention.causal").u == 0,
-         "it samples from the anchor or is causal");
+    const uint64_t sw = must("attention.sliding_window").u;
+    need(sw == (uint64_t) kWindow || sw == (uint64_t) (kWindow + 1), "dflash.attention.sliding_window");
+    if (const MetaValue* vu = meta_in(g, "vocab_size_unpadded")) need(vu->u == (uint64_t) n_vocab_, "dflash.vocab_size_unpadded");
+    need(must("sample_from_anchor").u == 0, "it samples from the anchor");
+    if (const MetaValue* ca = meta_in(g, "attention.causal")) need(ca->u == 0, "it is causal");
     const MetaValue& taps = must("target_layers");
     need(taps.items.size() == 4 && taps.items[0].u == (uint64_t) kTap[0] && taps.items[1].u == (uint64_t) kTap[1] &&
              taps.items[2].u == (uint64_t) kTap[2] && taps.items[3].u == (uint64_t) kVisits,
@@ -658,16 +660,30 @@ void Inkling2::load_drafter_shape(const Shards& g) {
     need(std::isfinite(ds_eps_) && ds_eps_ > 0.f && std::isfinite(ds_cap_) && ds_cap_ > 0.f && ds_theta_ > 0.f,
          "its epsilon, logit cap or rope base");
     const TensorInfo* w1 = g.find("markov_w1.weight");
-    need(w1->type == GGML_TYPE_F16 && w1->shape.size() == 2 && w1->shape[0] == (uint64_t) kDsRank &&
-             w1->shape[1] >= (uint64_t) n_vocab_,
-         "markov_w1 is not F16 [256, vocabulary]");
-    const TensorInfo* fuse = g.find("dspark_fuse.weight");
-    need(fuse->type == kTypeF32 && fuse->elements() == 4 * (kDsLayers + 1), "dspark_fuse is not F32 [4, 4]");
-    const TensorInfo* hidden = g.find("dspark_hidden_out.weight");
-    const TensorInfo* hidden_b = g.find("dspark_hidden_out.bias");
-    need(hidden->type == GGML_TYPE_F16 && hidden->elements() == (uint64_t) kDsRank * kWidth && hidden_b &&
-             hidden_b->type == kTypeF32 && hidden_b->elements() == (uint64_t) kWidth,
-         "dspark_hidden_out is not F16 [256, 2304] with an F32 bias");
+    need((w1->type == GGML_TYPE_F16 || w1->type == GGML_TYPE_BF16) && w1->shape.size() == 2 &&
+             w1->shape[0] == (uint64_t) kDsRank && w1->shape[1] >= (uint64_t) n_vocab_,
+         "markov_w1 is not F16/BF16 [256, vocabulary]");
+    ds_w1_bf16_ = (w1->type == GGML_TYPE_BF16);
+    const TensorInfo* mask = g.find("mask_embd.weight");
+    need(mask && mask->shape.size() >= 1 && mask->shape[0] == (uint64_t) kWidth, "mask_embd.weight");
+    ds_mask_rows_ = (mask->shape.size() >= 2 && mask->shape[1] == (uint64_t) (kDsBlock - 1)) ? (kDsBlock - 1) : 1;
+    if (precomp_head) {
+        const TensorInfo* w2 = g.find("markov_w2.weight");
+        const TensorInfo* b2 = g.find("markov_w2.bias");
+        need((w2->type == GGML_TYPE_F16 || w2->type == GGML_TYPE_BF16) && w2->shape.size() == 2 &&
+                 w2->shape[0] == (uint64_t) kDsRank && w2->shape[1] >= (uint64_t) n_vocab_,
+             "markov_w2 is not F16/BF16 [256, vocabulary]");
+        need(b2->type == kTypeF32 && b2->elements() >= (uint64_t) n_vocab_, "markov_w2.bias is not F32 [vocabulary]");
+        ds_w2_bf16_ = (w2->type == GGML_TYPE_BF16);
+    } else {
+        const TensorInfo* fuse = g.find("dspark_fuse.weight");
+        need(fuse->type == kTypeF32 && fuse->elements() == 4 * (kDsLayers + 1), "dspark_fuse is not F32 [4, 4]");
+        const TensorInfo* hidden = g.find("dspark_hidden_out.weight");
+        const TensorInfo* hidden_b = g.find("dspark_hidden_out.bias");
+        need(hidden->type == GGML_TYPE_F16 && hidden->elements() == (uint64_t) kDsRank * kWidth && hidden_b &&
+                 hidden_b->type == kTypeF32 && hidden_b->elements() == (uint64_t) kWidth,
+             "dspark_hidden_out is not F16 [256, 2304] with an F32 bias");
+    }
 }
 
 void Inkling2::begin_pass() {
@@ -754,7 +770,7 @@ void Inkling2::load_drafter() {
         const auto name = [&](const char* n) { return "blk." + std::to_string(l) + "." + n; };
         L.attn_norm = up(name("attn_norm.weight"), kWidth, 1, kF32);
         L.ffn_norm = up(name("ffn_norm.weight"), kWidth, 1, kF32);
-        L.ctx_norm = up(name("dflare_norm.weight"), kWidth, 1, kF32);
+        L.ctx_norm = up(g.find(name("ctx_norm.weight")) ? name("ctx_norm.weight") : name("dflare_norm.weight"), kWidth, 1, kF32);
         L.q = up(name("attn_q.weight"), kWidth, kQuery, kAnyMat);
         L.k = up(name("attn_k.weight"), kWidth, kKey, kAnyMat);
         L.v = up(name("attn_v.weight"), kWidth, kKey, kAnyMat);
@@ -769,29 +785,43 @@ void Inkling2::load_drafter() {
         L.down = up(name("ffn_down.weight"), kDsFfn, kWidth, kAnyMat);
     }
     ds_out_norm_ = up("output_norm.weight", kWidth, 1, kF32);
-    ds_mask_ = up("mask_embd.weight", kWidth, 1, kF32);
-    ds_rnn_norm_ = up("dspark_norm.weight", kWidth, 1, kF32);
+    ds_mask_ = up("mask_embd.weight", kWidth, ds_mask_rows_, kF32);
+    ds_rnn_norm_ = up(g.find("markov_ctx_norm.weight") ? "markov_ctx_norm.weight" : "dspark_norm.weight", kWidth, 1, kF32);
     ds_joint_ = up("joint_proj.weight", 2 * kDsRank + 2 * kWidth, 3 * kDsRank, kF32);
     ds_joint_b_ = up("joint_proj.bias", 3 * kDsRank, 1, kF32);
 
-    const auto host = [&](const char* name) {
+    const auto host = [&](const std::string& name) {
         const TensorInfo* t = g.find(name);
         g.payload(*t);
         return g.data(*t);
     };
-    const float* fuse = (const float*) host("dspark_fuse.weight");
-    for (int r = 0; r <= kDsLayers; ++r) {   // a row's weights over the four taps: softmax(dspark_fuse[r])
-        float most = -INFINITY, sum = 0.f;
-        for (int j = 0; j < 4; ++j) most = std::max(most, fuse[r * 4 + j]);
-        for (int j = 0; j < 4; ++j) sum += ds_mix_[r][j] = std::exp(fuse[r * 4 + j] - most);
-        for (int j = 0; j < 4; ++j) ds_mix_[r][j] /= sum;
+    if (g.find("dspark_fuse.weight")) {
+        const float* fuse = (const float*) host("dspark_fuse.weight");
+        for (int r = 0; r <= kDsLayers; ++r) {   // a row's weights over the four taps: softmax(dspark_fuse[r])
+            float most = -INFINITY, sum = 0.f;
+            for (int j = 0; j < 4; ++j) most = std::max(most, fuse[r * 4 + j]);
+            for (int j = 0; j < 4; ++j) sum += ds_mix_[r][j] = std::exp(fuse[r * 4 + j] - most);
+            for (int j = 0; j < 4; ++j) ds_mix_[r][j] /= sum;
+        }
+    } else {
+        for (int l = 0; l < kDsLayers; ++l) {
+            const float* m = (const float*) host("blk." + std::to_string(l) + ".ctx_mix.weight");
+            std::memcpy(ds_mix_[l], m, 4 * sizeof(float));
+        }
+        const float* m = (const float*) host("markov_ctx_mix.weight");
+        std::memcpy(ds_mix_[kDsLayers], m, 4 * sizeof(float));
     }
     ds_w1_ = host("markov_w1.weight");
-    const uint16_t* hidden = (const uint16_t*) host("dspark_hidden_out.weight");
-    ds_hidden_.resize((size_t) kWidth * kDsRank);
-    for (size_t i = 0; i < ds_hidden_.size(); ++i) ds_hidden_[i] = ggml_fp16_to_fp32(hidden[i]);
-    const float* bias = (const float*) host("dspark_hidden_out.bias");
-    ds_hidden_b_.assign(bias, bias + kWidth);
+    if (g.find("markov_w2.weight")) {
+        ds_w2_host_ = host("markov_w2.weight");
+        ds_b2_host_ = (const float*) host("markov_w2.bias");
+    } else {
+        const uint16_t* hidden = (const uint16_t*) host("dspark_hidden_out.weight");
+        ds_hidden_.resize((size_t) kWidth * kDsRank);
+        for (size_t i = 0; i < ds_hidden_.size(); ++i) ds_hidden_[i] = ggml_fp16_to_fp32(hidden[i]);
+        const float* bias = (const float*) host("dspark_hidden_out.bias");
+        ds_hidden_b_.assign(bias, bias + kWidth);
+    }
 }
 
 size_t Inkling2::recurrent_floats() const { return (size_t) kVisits * kConvFloats; }
@@ -1546,6 +1576,30 @@ void Inkling2::drafter_kept(int n) {
 // and not from a 2304-wide correction (ninfer-3090 does the same).  Once, at the first guess: the head's rows a few
 // columns of hidden_out at a time, through wlogits_.
 void Inkling2::prepare_head() {
+    if (ds_w2_host_) {
+        std::vector<uint16_t> w2_t((size_t) kDsRank * (size_t) n_vocab_);
+        const auto* src = (const uint16_t*) ds_w2_host_;
+        for (int v = 0; v < n_vocab_; ++v) {
+            const uint16_t* row = src + (size_t) v * kDsRank;
+            for (int r = 0; r < kDsRank; ++r) {
+                float f = 0.f;
+                if (ds_w2_bf16_) {
+                    const uint32_t bits = (uint32_t) row[r] << 16;
+                    std::memcpy(&f, &bits, 4);
+                } else {
+                    f = ggml_fp16_to_fp32(row[r]);
+                }
+                w2_t[(size_t) r * (size_t) n_vocab_ + (size_t) v] = ggml_fp32_to_fp16(f);
+            }
+        }
+        ck(cudaMemcpyAsync(ds_w2_, w2_t.data(), w2_t.size() * sizeof(uint16_t), cudaMemcpyHostToDevice, cs(st_)),
+           "DSpark markov_w2");
+        ck(cudaMemcpyAsync(ds_b2_, ds_b2_host_, (size_t) n_vocab_ * sizeof(float), cudaMemcpyHostToDevice, cs(st_)),
+           "DSpark markov_w2.bias");
+        ck(cudaStreamSynchronize(cs(st_)), "DSpark head");
+        ds_head_ready_ = true;
+        return;
+    }
     const int rows = std::min(kDsBlock, opt_.window);
     for (int j0 = 0; j0 < kDsRank; j0 += rows) {
         const int m = std::min(rows, kDsRank - j0);
@@ -1573,7 +1627,12 @@ void Inkling2::ds_block(int32_t token) {
     input(token, a, ds_host_);
     ck(cudaMemcpyAsync(ds_out_, ds_host_, kWidth * sizeof(float), cudaMemcpyHostToDevice, cs(st_)), "DSpark");
     rms_norm(ds_out_, fp(token_norm_), ds_x_, kWidth, 1, rms_eps_, st_);
-    dspark::fill_rows(fp(ds_mask_), ds_x_ + kWidth, kWidth, kDsBlock - 1, cs(st_));
+    if (ds_mask_rows_ == kDsBlock - 1)
+        ck(cudaMemcpyAsync(ds_x_ + kWidth, fp(ds_mask_), (size_t) (kDsBlock - 1) * kWidth * sizeof(float),
+                           cudaMemcpyDeviceToDevice, cs(st_)),
+           "DSpark mask_embd");
+    else
+        dspark::fill_rows(fp(ds_mask_), ds_x_ + kWidth, kWidth, kDsBlock - 1, cs(st_));
     for (int l = 0; l < kDsLayers; ++l) {
         const DsLayer& L = ds_[(size_t) l];
         rms_norm(ds_x_, fp(L.attn_norm), ds_xa_, kWidth, kDsBlock, ds_eps_, st_);
@@ -1618,7 +1677,14 @@ void Inkling2::draft_step(int32_t token, int i) {
     if (i == 0) ds_block(token);
     float* row = ds_host_ + kWidth;   // past the anchor's embedding, which may still be on its way
     const uint16_t* w1 = (const uint16_t*) ds_w1_ + (size_t) token * kDsRank;
-    for (int j = 0; j < kDsRank; ++j) row[j] = ggml_fp16_to_fp32(w1[j]);
+    if (ds_w1_bf16_) {
+        for (int j = 0; j < kDsRank; ++j) {
+            const uint32_t bits = (uint32_t) w1[j] << 16;
+            std::memcpy(&row[j], &bits, 4);
+        }
+    } else {
+        for (int j = 0; j < kDsRank; ++j) row[j] = ggml_fp16_to_fp32(w1[j]);
+    }
     ck(cudaMemcpyAsync(ds_w1row_, row, kDsRank * sizeof(float), cudaMemcpyHostToDevice, cs(st_)), "DSpark");
     dspark::joint(ds_state_, ds_w1row_, ds_cur_ + (size_t) (i + 1) * kWidth, hn_, ds_jx_, cs(st_));
     lin(ds_joint_, ds_jx_, ds_jo_, 1);

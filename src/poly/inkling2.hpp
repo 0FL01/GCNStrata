@@ -121,7 +121,11 @@ private:
     std::array<Cache, kDsLayers> ds_cache_;
     Dev ds_out_norm_, ds_mask_, ds_rnn_norm_, ds_joint_, ds_joint_b_;
     float ds_mix_[kDsLayers + 1][4] = {};   // softmax of dspark_fuse's rows: the layers' and the recurrent head's
-    const uint8_t* ds_w1_ = nullptr;        // markov_w1: F16 rows of kDsRank, in the mapped file
+    const uint8_t* ds_w1_ = nullptr;        // markov_w1: F16 or BF16 rows of kDsRank, in the mapped file
+    const uint8_t* ds_w2_host_ = nullptr;   // precomputed markov_w2 [n_vocab_][kDsRank] (BF16/F16) when in GGUF
+    const float* ds_b2_host_ = nullptr;     // precomputed markov_w2.bias [n_vocab_] when in GGUF
+    bool ds_w1_bf16_ = false, ds_w2_bf16_ = false;
+    int ds_mask_rows_ = 1;                  // 1 (shared mask_embd) or 7 (per-position mask_embd)
     std::vector<float> ds_hidden_, ds_hidden_b_;   // dspark_hidden_out [kWidth][kDsRank] and its bias, for prepare_head()
     float ds_eps_ = 0, ds_cap_ = 0, ds_theta_ = 0;
     bool ds_head_ready_ = false;

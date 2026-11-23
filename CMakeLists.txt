@@ -2155,6 +2155,8 @@ if(STRATA_NATIVE_EXPERTS AND STRATA_HIP_GFX906)
              iq4_xs mxfp4)
     list(APPEND _strata_poly_mmq_instances ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
   endforeach()
+  list(APPEND _strata_poly_mmq_instances src/poly/mmq_nvfp4.cu)
+  set_property(SOURCE src/poly/mmq.cu APPEND PROPERTY COMPILE_DEFINITIONS STRATA_POLY_HIP_NVFP4=1)
   add_library(strata_poly_mmq STATIC src/poly/mmq.cu src/poly/fattn.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu
               ${_strata_poly_mmq_instances})
   target_include_directories(strata_poly_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
