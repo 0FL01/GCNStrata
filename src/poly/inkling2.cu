@@ -23,6 +23,11 @@ namespace strata::poly {
 namespace {
 
 constexpr int kThreads = 128;
+#ifdef STRATA_HIP_GFX906
+constexpr int kMixThreads = 576;  // 9 wave64s x float4 = 2304 floats/row; avoids 108-VGPR/thread spill
+#else
+constexpr int kMixThreads = kThreads;
+#endif
 constexpr int kRowWidth = 2304;   // Inkling2::kWidth, for the kernels that keep a whole row in registers
 constexpr int kKvWidth = 1024;    // Inkling2::kKey
 constexpr int kValueTile = 128;
@@ -55,12 +60,68 @@ template <bool Maximum = false> __device__ float block_reduce(float x, float* wa
 
 struct MixInputs { const float* x[5]; };
 
+#ifdef STRATA_HIP_GFX906
+__device__ __forceinline__ float wave64_sum_mix(float x) {
+#pragma unroll
+    for (int d = 32; d > 0; d >>= 1) x += __shfl_down(x, d, 64);
+    return x;
+}
+#endif
+
 // A depth query attends all finished blocks and the current partial block. RMS-normalized states are values too.
 // Each input's two sums take the same per-thread order and the same reduction tree as one block_reduce() each, but
 // a thread loads its 18 values of every input at once and all ten sums go up the tree together: a single block (one
 // token) waits for memory once, not 36 times. The products are fused as the compiler fuses them in the per-element
 // loops (explicitly: with five inputs in registers it would not).
 __device__ __forceinline__ void mix_row(const MixInputs& in, int count, const float* query, float* out, size_t row) {
+#ifdef STRATA_HIP_GFX906
+    constexpr int kMost = 5, kW = kMixThreads / 64;
+    static_assert(kMixThreads * 4 == kRowWidth && kMixThreads % 64 == 0, "576 threads = 9 wave64s x float4");
+    const int tid = threadIdx.x;
+    const int lane = tid & 63, wave = tid >> 6;
+    __shared__ float waves[2 * kMost][kW];
+
+    const float4 q = reinterpret_cast<const float4*>(query)[tid];
+    float4 xv[kMost];
+    for (int j = 0; j < count; ++j) {
+        const float4 x = reinterpret_cast<const float4*>(in.x[j] + row)[tid];
+        xv[j] = x;
+        float ss = __fmaf_rn(x.x, x.x, __fmaf_rn(x.y, x.y, __fmaf_rn(x.z, x.z, x.w * x.w)));
+        float dot = __fmaf_rn(x.x, q.x, __fmaf_rn(x.y, q.y, __fmaf_rn(x.z, q.z, x.w * q.w)));
+        ss = wave64_sum_mix(ss);
+        dot = wave64_sum_mix(dot);
+        if (lane == 0) {
+            waves[2 * j][wave] = ss;
+            waves[2 * j + 1][wave] = dot;
+        }
+    }
+    __syncthreads();
+    if (wave == 0 && lane < 2 * count) {
+        float s = 0.f;
+#pragma unroll
+        for (int w = 0; w < kW; ++w) s += waves[lane][w];
+        waves[lane][0] = s;
+    }
+    __syncthreads();
+    float scale[kMost], w[kMost], top = -INFINITY;
+    for (int j = 0; j < count; ++j) {
+        scale[j] = rsqrtf(waves[2 * j][0] / kRowWidth + 1.e-6f);
+        w[j] = waves[2 * j + 1][0] * scale[j] * rsqrtf((float) kRowWidth);
+        top = fmaxf(top, w[j]);
+    }
+    float sum = 0.f;
+    for (int j = 0; j < count; ++j) sum += (w[j] = expf(w[j] - top));
+    const float inv_sum = 1.f / sum;
+    float4 res = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int j = 0; j < count; ++j) {
+        const float c = w[j] * scale[j] * inv_sum;
+        res.x = __fmaf_rn(c, xv[j].x, res.x);
+        res.y = __fmaf_rn(c, xv[j].y, res.y);
+        res.z = __fmaf_rn(c, xv[j].z, res.z);
+        res.w = __fmaf_rn(c, xv[j].w, res.w);
+    }
+    reinterpret_cast<float4*>(out + row)[tid] = res;
+#else
     constexpr int kMost = 5, kWaves = kThreads / 32, kPer = kRowWidth / kThreads;
     static_assert(kRowWidth % kThreads == 0, "a row is whole loads of the block");
     __shared__ float waves[2 * kMost][kWaves];
@@ -118,6 +179,7 @@ __device__ __forceinline__ void mix_row(const MixInputs& in, int count, const fl
             if (j < count) val = __fmaf_rn(w[j] * scale[j], x[j][k], val);
         out[row + threadIdx.x + k * kThreads] = val / sum;
     }
+#endif
 }
 
 __global__ void mix_kernel(MixInputs in, int count, const float* query, float* out) {
@@ -370,6 +432,69 @@ __global__ void store2_q8_kernel(const float* k, const float* v, int8_t* kc, __h
 // mix_kernel mixes the banks, and the RMS norms of the stream and the message side by side in pair.
 __device__ __forceinline__ void control_in_row(const float* bank0, const float* bank1, const float* query,
                                                const float* in, float* msg, float* pair, size_t row) {
+#ifdef STRATA_HIP_GFX906
+    constexpr int kW = kMixThreads / 64;
+    const int tid = threadIdx.x, lane = tid & 63, wave = tid >> 6;
+    __shared__ float waves[6][kW];
+
+    const float4 q = reinterpret_cast<const float4*>(query)[tid];
+    const float4 b0 = reinterpret_cast<const float4*>(bank0 + row)[tid];
+    const float4 b1 = reinterpret_cast<const float4*>(bank1 + row)[tid];
+    const float4 x = reinterpret_cast<const float4*>(in + row)[tid];
+
+    float s[6];
+    s[0] = __fmaf_rn(b0.x, b0.x, __fmaf_rn(b0.y, b0.y, __fmaf_rn(b0.z, b0.z, b0.w * b0.w)));
+    s[1] = __fmaf_rn(b0.x, q.x, __fmaf_rn(b0.y, q.y, __fmaf_rn(b0.z, q.z, b0.w * q.w)));
+    s[2] = __fmaf_rn(b1.x, b1.x, __fmaf_rn(b1.y, b1.y, __fmaf_rn(b1.z, b1.z, b1.w * b1.w)));
+    s[3] = __fmaf_rn(b1.x, q.x, __fmaf_rn(b1.y, q.y, __fmaf_rn(b1.z, q.z, b1.w * q.w)));
+    s[4] = __fmaf_rn(x.x, x.x, __fmaf_rn(x.y, x.y, __fmaf_rn(x.z, x.z, x.w * x.w)));
+#pragma unroll
+    for (int j = 0; j < 5; ++j) {
+        const float y = wave64_sum_mix(s[j]);
+        if (lane == 0) waves[j][wave] = y;
+    }
+    __syncthreads();
+    if (wave == 0 && lane < 5) {
+        float acc = 0.f;
+#pragma unroll
+        for (int w = 0; w < kW; ++w) acc += waves[lane][w];
+        waves[lane][0] = acc;
+    }
+    __syncthreads();
+    const float s0 = rsqrtf(waves[0][0] / kRowWidth + 1.e-6f);
+    const float s1 = rsqrtf(waves[2][0] / kRowWidth + 1.e-6f);
+    float w0 = waves[1][0] * s0 * rsqrtf((float) kRowWidth);
+    float w1 = waves[3][0] * s1 * rsqrtf((float) kRowWidth);
+    const float top = fmaxf(w0, w1);
+    w0 = expf(w0 - top);
+    w1 = expf(w1 - top);
+    const float inv_sum = 1.f / (w0 + w1);
+    const float c0 = w0 * s0 * inv_sum, c1 = w1 * s1 * inv_sum;
+
+    float4 m;
+    m.x = __fmaf_rn(c1, b1.x, c0 * b0.x);
+    m.y = __fmaf_rn(c1, b1.y, c0 * b0.y);
+    m.z = __fmaf_rn(c1, b1.z, c0 * b0.z);
+    m.w = __fmaf_rn(c1, b1.w, c0 * b0.w);
+    reinterpret_cast<float4*>(msg + row)[tid] = m;
+
+    float ms = __fmaf_rn(m.x, m.x, __fmaf_rn(m.y, m.y, __fmaf_rn(m.z, m.z, m.w * m.w)));
+    ms = wave64_sum_mix(ms);
+    if (lane == 0) waves[5][wave] = ms;
+    __syncthreads();
+    if (wave == 0 && lane == 0) {
+        float acc = 0.f;
+#pragma unroll
+        for (int w = 0; w < kW; ++w) acc += waves[5][w];
+        waves[5][0] = acc;
+    }
+    __syncthreads();
+    const float sx = rsqrtf(waves[4][0] / float(kRowWidth) + 1.e-6f);
+    const float sm = rsqrtf(waves[5][0] / float(kRowWidth) + 1.e-6f);
+    float4* out4 = reinterpret_cast<float4*>(pair + 2 * row);
+    out4[tid] = make_float4(x.x * sx, x.y * sx, x.z * sx, x.w * sx);
+    out4[kRowWidth / 4 + tid] = make_float4(m.x * sm, m.y * sm, m.z * sm, m.w * sm);
+#else
     constexpr int kPer = kRowWidth / kThreads, kWaves = kThreads / 32;
     __shared__ float waves[6][kWaves];
     float b0[kPer], b1[kPer], x[kPer], q[kPer];
@@ -431,6 +556,7 @@ __device__ __forceinline__ void control_in_row(const float* bank0, const float* 
         out[i] = x[k] * sx;
         out[kRowWidth + i] = m[k] * sm;
     }
+#endif
 }
 
 __global__ void control_in_kernel(const float* bank0, const float* bank1, const float* query, const float* in,
@@ -1193,7 +1319,7 @@ void Inkling2::depth_mix(const float* query, float* dst, int first, int n) {
     MixInputs m{};
     for (int i = 0; i < depth_n_; ++i) m.x[i] = depth_[i] + at;
     m.x[depth_n_] = r_ + at;
-    mix_kernel<<<n, kThreads, 0, cs(st_)>>>(m, depth_n_ + 1, query, dst);
+    mix_kernel<<<n, kMixThreads, 0, cs(st_)>>>(m, depth_n_ + 1, query, dst);
 }
 
 void Inkling2::control(const Block& b, int il, int stream, float* in, int n) {
@@ -1201,9 +1327,9 @@ void Inkling2::control(const Block& b, int il, int stream, float* in, int n) {
     const float* query = b.msg_query.p
                              ? fp(b.msg_query) + (size_t) stream * kWidth
                              : fp(stream == 0 || stream == 3 ? loop_query_ : loop_kv_query_) + row * kWidth;
-    if (fused(n)) control_in_kernel<<<n, kThreads, 0, cs(st_)>>>(bank0_, bank1_, query, in, msg_, pair_);
+    if (fused(n)) control_in_kernel<<<n, kMixThreads, 0, cs(st_)>>>(bank0_, bank1_, query, in, msg_, pair_);
     else {
-        mix_kernel<<<n, kThreads, 0, cs(st_)>>>(MixInputs{{bank0_, bank1_}}, 2, query, msg_);
+        mix_kernel<<<n, kMixThreads, 0, cs(st_)>>>(MixInputs{{bank0_, bank1_}}, 2, query, msg_);
         rms_norm(in, nullptr, pair_, kWidth, n, 1.e-6f, st_, 2 * kWidth);
         rms_norm(msg_, nullptr, pair_ + kWidth, kWidth, n, 1.e-6f, st_, 2 * kWidth);
     }
@@ -1242,7 +1368,7 @@ bool Inkling2::heads(const Block& b, int il, bool swa, bool loop, int n, const D
         ms.query[i] = fp(b.aquery) + (swa ? 0 : i * kWidth);
         ms.out[i] = s3cur_ + i * w;
     }
-    mix3_kernel<<<dim3(n, 3), kThreads, 0, cs(st_)>>>(m, depth_n_ + 1, ms);
+    mix3_kernel<<<dim3(n, 3), kMixThreads, 0, cs(st_)>>>(m, depth_n_ + 1, ms);
     if (loop) {
         Control3 c{};
         F32Segments down;
@@ -1260,7 +1386,7 @@ bool Inkling2::heads(const Block& b, int il, bool swa, bool loop, int n, const D
             down.x[i] = c.pair[i];
             down.y[i] = s3rank_ + (size_t) i * n * kRank;
         }
-        control_in3_kernel<<<dim3(n, 3), kThreads, 0, cs(st_)>>>(bank0_, bank1_, c);
+        control_in3_kernel<<<dim3(n, 3), kMixThreads, 0, cs(st_)>>>(bank0_, bank1_, c);
         // lin(c.down, pair_, rank_, n) of each stream: gemv_f32_waves() with a row of outputs to its input
         gemv_f32_waves_segments(down, 3, 2 * kWidth, kRank, kRank, n, st_);
         control_out3_kernel<<<dim3(kWidth / 32, n, 3), 256, 0, cs(st_)>>>(c, kRank);
