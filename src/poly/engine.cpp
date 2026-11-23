@@ -3621,6 +3621,12 @@ void Engine::relock() {
 }
 
 void Engine::trim() {
+    if (opt_.tp > 1) {
+        hfree(h_res_);
+        h_res_ = nullptr;
+        h_res_rows_ = 0;
+        return;
+    }
     relock();   // first: under Linux the pages dropped below must not be locked
     struct Held {
         float recent;

@@ -909,6 +909,11 @@ void Inkling2::peer_wait() {
 
 void Inkling2::on_loaded() {
     if (tp_size_ == 2 && all_cached()) {
+        for (size_t il = 0; il < layers_.size(); ++il) {
+            layers_[il].exp_gate = nullptr;
+            layers_[il].exp_up = nullptr;
+            layers_[il].exp_down = nullptr;
+        }
         for (auto& v : tp2_exp_gu_) { v.clear(); v.shrink_to_fit(); }
         for (auto& v : tp2_exp_down_) { v.clear(); v.shrink_to_fit(); }
     }
@@ -1367,7 +1372,8 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
 
 size_t Inkling2::extra_bytes() const {
     return (kVisits - kVisits / kBlock) * (size_t) std::min(opt_.max_context, kWindow - 1) * kv_bytes() +
-           (draft_ ? 2 * (size_t) std::min(opt_.max_context, kWindow) * ds_row_bytes() : 0);
+           (draft_ ? 2 * (size_t) std::min(opt_.max_context, kWindow) * ds_row_bytes() : 0) +
+           (peer_ ? peer_->card_state_bytes() : 0);
 }
 
 void Inkling2::ring_state(int visit, int64_t pos, const uint8_t* src, uint8_t* dst) {
@@ -1420,6 +1426,16 @@ void Inkling2::save_card_state(uint8_t* dst) {
         return;
     }
     Engine::save_card_state(dst);
+    if (peer_) {
+        const size_t r0_extra = (kVisits - kVisits / kBlock) * (size_t) std::min(opt_.max_context, kWindow - 1) * kv_bytes() +
+                                (draft_ ? 2 * (size_t) std::min(opt_.max_context, kWindow) * ds_row_bytes() : 0);
+        int prev = 0; (void) cudaGetDevice(&prev);
+        ck(cudaSetDevice(peer_->device_), "save peer state");
+        ck(cudaStreamSynchronize(cs(peer_->st_)), "save peer state");
+        peer_->pos_ = pos_;
+        peer_->save_card_state(dst + state_n_ * sizeof(float) + r0_extra);
+        (void) cudaSetDevice(prev);
+    }
 }
 
 bool Inkling2::try_pack_state(uint8_t* dst) {
@@ -1519,6 +1535,12 @@ void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
                 ds_ring(l, pos, src, nullptr);
                 src += (size_t) std::min(opt_.max_context, kWindow) * ds_row_bytes();
             }
+    if (peer_) {
+        int prev = 0; (void) cudaGetDevice(&prev);
+        ck(cudaSetDevice(peer_->device_), "load peer state");
+        peer_->load_state(src, pos);
+        (void) cudaSetDevice(prev);
+    }
 }
 
 void Inkling2::assign_scratch() {
