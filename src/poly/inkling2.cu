@@ -838,6 +838,10 @@ void Inkling2::start_peer_thread() {
                     peer_->cover(pos_ + n);
                     tp2_->broadcast_from_0(1, peer_->r_, n * kWidth, peer_->st_);
                     peer_->run_visits_local(n);
+                } else if (cmd == PeerCmd::kLogits) {
+                    tp2_->broadcast_from_0(1, peer_->xn_, n * kWidth, peer_->st_);
+                    peer_->lin(peer_->output_, peer_->xn_, peer_->tp2_logits_half_, n);
+                    tp2_->gather_from_1(1, nullptr, peer_->tp2_logits_half_, n * peer_->tp2_vocab_n_, peer_->st_);
                 } else if (cmd == PeerCmd::kKeepSnap) {
                     ck(cudaMemcpyAsync(peer_->state_, peer_->snap_ + snap_idx * peer_->rec_n_,
                                        peer_->rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(peer_->st_)),
@@ -916,9 +920,54 @@ void Inkling2::on_reset() {
     peer_wait();
 }
 
+__global__ void interleave_logits_kernel(const float* __restrict__ h0, const float* __restrict__ h1,
+                                         float* __restrict__ out, int n0, int n1, int rows) {
+    const int n_vocab = n0 + n1;
+    const size_t idx = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const size_t total = (size_t) rows * n_vocab;
+    if (idx >= total) return;
+    const int r = (int) (idx / n_vocab);
+    const int c = (int) (idx % n_vocab);
+    out[idx] = c < n0 ? h0[(size_t) r * n0 + c] : h1[(size_t) r * n1 + (c - n0)];
+}
+
 void Inkling2::on_keep_snap(size_t snap_idx) {
     if (!peer_) return;
     peer_dispatch(PeerCmd::kKeepSnap, 0, snap_idx);
+    peer_wait();
+}
+
+Dev Inkling2::load_output_matrix(const TensorInfo* t, int64_t file_vocab) {
+    if (tp_size_ != 2) return Engine::load_output_matrix(t, file_vocab);
+    const int half0 = n_vocab_ / 2;
+    tp2_vocab_lo_ = tp_rank_ == 0 ? 0 : half0;
+    tp2_vocab_n_ = tp_rank_ == 0 ? half0 : (n_vocab_ - half0);
+    return upload_row_range(t, "output.weight", n_embd_, file_vocab, tp2_vocab_lo_, tp2_vocab_n_, kAnyMat);
+}
+
+void Inkling2::project_logits(const float* h, float* out, int rows) {
+    if (!peer_ || rows > std::max(kDsBlock, opt_.window)) {
+        Engine::project_logits(h, out, rows);
+        return;
+    }
+    peer_dispatch(PeerCmd::kLogits, rows);
+    try {
+        tp2_->broadcast_from_0(0, const_cast<float*>(h), rows * kWidth, st_);
+        if (rows == 1) {
+            lin(output_, h, out, 1);
+            tp2_->gather_from_1(0, out + tp2_vocab_n_, nullptr, n_vocab_ - tp2_vocab_n_, st_);
+        } else {
+            lin(output_, h, tp2_logits_half_, rows);
+            tp2_->gather_from_1(0, tp2_logits_peer_, nullptr, rows * (n_vocab_ - tp2_vocab_n_), st_);
+            const size_t total = (size_t) rows * n_vocab_;
+            interleave_logits_kernel<<<(unsigned) ((total + 255) / 256), 256, 0, cs(st_)>>>(
+                tp2_logits_half_, tp2_logits_peer_, out, tp2_vocab_n_, n_vocab_ - tp2_vocab_n_, rows);
+        }
+    } catch (...) {
+        tp2_->abort_barrier();
+        peer_wait();
+        throw;
+    }
     peer_wait();
 }
 
@@ -1031,14 +1080,6 @@ void Inkling2::load_moe_tp2(int il) {
         const uint8_t* gu_src = home(*gu).data(*gu);
         auto& gu_dst = tp2_exp_gu_[(size_t) il];
         gu_dst.resize((size_t) n_expert_ * L.gu_stride);
-        for (int e = 0; e < n_expert_; ++e) {
-            const uint8_t* es = gu_src + (size_t) e * full_gu_stride;
-            uint8_t* ed = gu_dst.data() + (size_t) e * L.gu_stride;
-            std::memcpy(ed, es + (size_t) tp_rank_ * quarter_gu, quarter_gu);
-            std::memcpy(ed + quarter_gu, es + half_gu_exp + (size_t) tp_rank_ * quarter_gu, quarter_gu);
-        }
-        L.exp_gate = gu_dst.data();
-        L.exp_up = gu_dst.data() + L.gu_bytes;
 
         const uint8_t* d_src = home(*td).data(*td);
         auto& d_dst = tp2_exp_down_[(size_t) il];
@@ -1046,13 +1087,31 @@ void Inkling2::load_moe_tp2(int il) {
         const size_t full_row = full_d_bytes / (size_t) n_embd_;
         const size_t half_row = full_row / 2;
         if (full_row % 2 != 0) throw std::runtime_error(blk(il, "TP2 ffn_down_exps odd row bytes"));
-        for (int e = 0; e < n_expert_; ++e) {
-            const uint8_t* es = d_src + (size_t) e * full_d_bytes;
-            uint8_t* ed = d_dst.data() + (size_t) e * L.d_bytes;
-            for (int r = 0; r < n_embd_; ++r)
-                std::memcpy(ed + (size_t) r * half_row, es + (size_t) r * full_row + (size_t) tp_rank_ * half_row,
-                            half_row);
+
+        const int n_thr = std::min(8, std::max(1, n_expert_));
+        std::vector<std::thread> pool;
+        pool.reserve((size_t) n_thr);
+        for (int t = 0; t < n_thr; ++t) {
+            pool.emplace_back([&, t] {
+                const int e0 = t * n_expert_ / n_thr;
+                const int e1 = (t + 1) * n_expert_ / n_thr;
+                for (int e = e0; e < e1; ++e) {
+                    const uint8_t* es = gu_src + (size_t) e * full_gu_stride;
+                    uint8_t* ed = gu_dst.data() + (size_t) e * L.gu_stride;
+                    std::memcpy(ed, es + (size_t) tp_rank_ * quarter_gu, quarter_gu);
+                    std::memcpy(ed + quarter_gu, es + half_gu_exp + (size_t) tp_rank_ * quarter_gu, quarter_gu);
+
+                    const uint8_t* ds = d_src + (size_t) e * full_d_bytes;
+                    uint8_t* dd = d_dst.data() + (size_t) e * L.d_bytes;
+                    for (int r = 0; r < n_embd_; ++r)
+                        std::memcpy(dd + (size_t) r * half_row,
+                                    ds + (size_t) r * full_row + (size_t) tp_rank_ * half_row, half_row);
+                }
+            });
         }
+        for (auto& th : pool) th.join();
+        L.exp_gate = gu_dst.data();
+        L.exp_up = gu_dst.data() + L.gu_bytes;
         L.exp_down = d_dst.data();
     }
 
@@ -1505,6 +1564,11 @@ void Inkling2::assign_scratch() {
     rank_ = fbuf(n * kRank);
     gain_ = fbuf(width);
     forget_ = fbuf(width);
+    if (tp_size_ == 2) {
+        const size_t max_r = (size_t) std::max(kDsBlock, opt_.window);
+        tp2_logits_half_ = fbuf(max_r * (size_t) tp2_vocab_n_);
+        if (tp_rank_ == 0) tp2_logits_peer_ = fbuf(max_r * (size_t) (n_vocab_ - tp2_vocab_n_));
+    }
     if (!draft_) return;
     ds_taps_ = fbuf(3 * width);
     const size_t b = kDsBlock;
@@ -2098,7 +2162,7 @@ void Inkling2::ds_block(int32_t token) {
 void Inkling2::ds_base(int to) {
     if (to <= ds_based_) return;
     const int first = ds_based_, n = (first ? ds_rows_ : std::max(to, std::min(ds_rows_, 3))) - first;
-    lin(output_, ds_cur_ + (size_t) (first + 1) * kWidth, ds_base_ + (size_t) first * n_vocab_, n);
+    project_logits(ds_cur_ + (size_t) (first + 1) * kWidth, ds_base_ + (size_t) first * n_vocab_, n);
     ds_based_ = first + n;
 }
 

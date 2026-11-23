@@ -76,11 +76,83 @@ __global__ void p2p_ar_pingpong_f32(float* __restrict__ data,
     __syncthreads();
     if (s_aborted) return;
 
-    // Sum local + peer into data
+    // Sum local (from L1/L2-cached data) + peer (from uncached peer P2P buffer) into data
     for (int i = threadIdx.x; i < n4; i += blockDim.x) {
-        const float4 a = sb4[i];
+        const float4 a = d4[i];
         const float4 b = pb4[i];
         d4[i] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
+    }
+}
+
+// Symmetric FP16 ping-pong P2P all-reduce for T = 2..8 (halves PCIe bytes, identical fp16(a)+fp16(b) on both ranks).
+__global__ void p2p_ar_pingpong_f16(float* __restrict__ data,
+                                    __half2* __restrict__ self_b0, __half2* __restrict__ self_b1,
+                                    const __half2* __restrict__ peer_b0, const __half2* __restrict__ peer_b1,
+                                    volatile uint32_t* __restrict__ self_flag,
+                                    volatile uint32_t* __restrict__ peer_flag,
+                                    uint32_t* __restrict__ gen_slot,
+                                    volatile uint32_t* __restrict__ abort_dev,
+                                    int n) {
+    __shared__ uint32_t s_slot;
+    __shared__ uint32_t s_aborted;
+    if (threadIdx.x == 0) {
+        uint32_t g = *gen_slot + 1u;
+        if (g == 0u) g = 1u;
+        *gen_slot = g;
+        s_slot = g & 1u;
+        s_aborted = 0u;
+    }
+    __syncthreads();
+    const uint32_t slot = s_slot;
+    __half2* __restrict__ sb = slot ? self_b1 : self_b0;
+    const __half2* __restrict__ pb = slot ? peer_b1 : peer_b0;
+
+    const int n4 = n >> 2;
+    float4* __restrict__ d4 = reinterpret_cast<float4*>(data);
+    uint2* __restrict__ sb2 = reinterpret_cast<uint2*>(sb);
+    const uint2* __restrict__ pb2 = reinterpret_cast<const uint2*>(pb);
+
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = d4[i];
+        const __half2 lo = __floats2half2_rn(v.x, v.y);
+        const __half2 hi = __floats2half2_rn(v.z, v.w);
+        uint2 packed;
+        packed.x = *reinterpret_cast<const unsigned int*>(&lo);
+        packed.y = *reinterpret_cast<const unsigned int*>(&hi);
+        sb2[i] = packed;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        const uint32_t g = *gen_slot;
+        __threadfence_system();
+        peer_flag[slot] = g;
+        __threadfence_system();
+        while (self_flag[slot] != g) {
+            if (*abort_dev != 0u) {
+                s_aborted = 1u;
+                break;
+            }
+#ifdef STRATA_USE_HIP
+            __builtin_amdgcn_s_sleep(1);
+#endif
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    if (s_aborted) return;
+
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 v = d4[i];
+        const __half2 alo = __floats2half2_rn(v.x, v.y);
+        const __half2 ahi = __floats2half2_rn(v.z, v.w);
+        const uint2 bp = pb2[i];
+        const __half2 blo = *reinterpret_cast<const __half2*>(&bp.x);
+        const __half2 bhi = *reinterpret_cast<const __half2*>(&bp.y);
+        d4[i] = make_float4(__low2float(alo) + __low2float(blo),
+                            __high2float(alo) + __high2float(blo),
+                            __low2float(ahi) + __low2float(bhi),
+                            __high2float(ahi) + __high2float(bhi));
     }
 }
 
@@ -217,9 +289,21 @@ void Tp2Comm::all_reduce(int rank, float* data, int n, void* stream) {
         throw std::runtime_error("Tp2Comm::all_reduce: communicator aborted");
     const int peer = 1 - rank;
     if (n <= kSmallMax && (n & 3) == 0) {
-        p2p_ar_pingpong_f32<<<1, 256, 0, cs(stream)>>>(
-            data, p2p_buf_[rank][0], p2p_buf_[rank][1], p2p_buf_[peer][0], p2p_buf_[peer][1],
-            p2p_flag_[rank], p2p_flag_[peer], p2p_gen_[rank], abort_dev_, n);
+        static const bool use_f16 = [] {
+            const char* v = std::getenv("STRATA_TP2_P2P_F16");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        if (use_f16 && n > 2304) {
+            p2p_ar_pingpong_f16<<<1, 256, 0, cs(stream)>>>(
+                data,
+                reinterpret_cast<__half2*>(p2p_buf_[rank][0]), reinterpret_cast<__half2*>(p2p_buf_[rank][1]),
+                reinterpret_cast<const __half2*>(p2p_buf_[peer][0]), reinterpret_cast<const __half2*>(p2p_buf_[peer][1]),
+                p2p_flag_[rank], p2p_flag_[peer], p2p_gen_[rank], abort_dev_, n);
+        } else {
+            p2p_ar_pingpong_f32<<<1, 256, 0, cs(stream)>>>(
+                data, p2p_buf_[rank][0], p2p_buf_[rank][1], p2p_buf_[peer][0], p2p_buf_[peer][1],
+                p2p_flag_[rank], p2p_flag_[peer], p2p_gen_[rank], abort_dev_, n);
+        }
         return;
     }
     if (n > max_floats_)
@@ -253,6 +337,23 @@ void Tp2Comm::broadcast_from_0(int rank, float* data, int n, void* stream) {
         ck(cudaMemcpyPeerAsync(data, dev_[1], bcast_src_, dev_[0], (size_t) n * sizeof(float), cs(stream)),
            "tp2 bcast peer copy");
         ck(cudaEventRecord(static_cast<cudaEvent_t>(ev_bcast_done_), cs(stream)), "tp2 bcast done record");
+        host_barrier(1);
+    }
+}
+
+void Tp2Comm::gather_from_1(int rank, float* dst_on_0, const float* src_on_1, int n, void* stream) {
+    if (bar_aborted_.load(std::memory_order_acquire))
+        throw std::runtime_error("Tp2Comm::gather_from_1: communicator aborted");
+    if (rank == 0) {
+        bcast_src_ = dst_on_0;
+        host_barrier(0);   // dst_on_0 published
+        host_barrier(0);   // wait until rank 1 has recorded ev_bcast_done_
+        ck(cudaStreamWaitEvent(cs(stream), static_cast<cudaEvent_t>(ev_bcast_done_), 0), "tp2 gather wait");
+    } else {
+        host_barrier(1);
+        ck(cudaMemcpyPeerAsync(bcast_src_, dev_[0], src_on_1, dev_[1], (size_t) n * sizeof(float), cs(stream)),
+           "tp2 gather peer copy");
+        ck(cudaEventRecord(static_cast<cudaEvent_t>(ev_bcast_done_), cs(stream)), "tp2 gather done record");
         host_barrier(1);
     }
 }

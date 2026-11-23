@@ -467,6 +467,8 @@ protected:
     virtual void on_loaded() {}
     virtual void on_reset() {}
     virtual void on_keep_snap(size_t snap_idx) { (void) snap_idx; }
+    virtual Dev load_output_matrix(const TensorInfo* t, int64_t file_vocab);
+    virtual void project_logits(const float* h, float* out, int rows);
     /// The model's output for `rows` tokens from row `first` of the call, normed: what the output matrix takes.
     virtual void output_rows(int first, int rows, float* h) = 0;
     /// A token's experts and their weights from its scores at layer il's router.  `token` is the token the row is
@@ -559,6 +561,8 @@ protected:
     /// slice_cols=true halves n_in (contiguous columns). n_in and n_out are the full GGUF dimensions.
     Dev upload_slice(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
                      int tp_rank, bool slice_cols);
+    Dev upload_row_range(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out,
+                         int64_t row_start, int64_t row_count, Want want);
     float global_scale(const TensorInfo& t) const;
     const TensorInfo* tensor(int il, const char* name) const;
     const Shards& home(const TensorInfo& t) const;

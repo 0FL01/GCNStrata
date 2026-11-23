@@ -28,6 +28,9 @@ public:
     /// Broadcast `data[0..n)` from rank 0 to rank 1 using peer copy + event handoff.
     void broadcast_from_0(int rank, float* data, int n, void* stream);
 
+    /// Copy `n` floats from `src_on_1` (on GPU 1) to `dst_on_0` (on GPU 0) with event handoff.
+    void gather_from_1(int rank, float* dst_on_0, const float* src_on_1, int n, void* stream);
+
     /// Simple reusable 2-thread host spin barrier between rank 0 and rank 1.
     void host_barrier(int rank);
     void abort_barrier();

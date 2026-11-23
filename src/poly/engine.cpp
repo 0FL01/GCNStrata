@@ -1931,6 +1931,59 @@ Dev Engine::upload_slice(const TensorInfo* t, const std::string& name, int64_t n
     return d;
 }
 
+Dev Engine::upload_row_range(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out,
+                             int64_t row_start, int64_t row_count, Want want) {
+    if (!t) throw std::runtime_error("the GGUF has no tensor " + name);
+    const uint64_t rest = t->elements() / std::max<uint64_t>(t->shape[0], 1);
+    if ((int64_t) t->shape[0] != n_in || (int64_t) rest != n_out)
+        throw std::runtime_error(t->name + " is " + shape_of(*t) + ", expected [" + std::to_string(n_in) + ", " +
+                                 std::to_string(n_out) + "]");
+    if (row_start < 0 || row_count <= 0 || row_start + row_count > n_out)
+        throw std::runtime_error("upload_row_range: out of range for " + t->name);
+    const size_t full_bytes = home(*t).payload(*t);
+    const size_t row_bytes = full_bytes / (size_t) n_out;
+    const size_t slice_bytes = row_bytes * (size_t) row_count;
+    const size_t slice_count = (size_t) n_in * (size_t) row_count;
+    const bool as_is = (t->type == kTypeF32 || (want != kF32 && t->type == kTypeBF16) ||
+                        (want == kAnyMat && kernels::native_mmvq_supported((int) t->type)));
+    const uint32_t type = as_is ? t->type : want == kF32 ? kTypeF32 : kTypeBF16;
+    const size_t out_bytes = as_is ? slice_bytes : slice_count * (type == kTypeF32 ? sizeof(float) : sizeof(uint16_t));
+    if (type == kTypeBF16) bf16_max_ = std::max(bf16_max_, slice_count);
+    Dev d{dense_ ? dense_ + dense_at_ : nullptr, type, (int) n_in, (int) row_count};
+    d.scale = global_scale(*t);
+    dense_at_ += pad(out_bytes) + kTail;
+    if (!dense_) return d;
+    if (dense_at_ > dense_bytes_) throw std::logic_error("the dense arena is too small for " + t->name);
+    const uint8_t* ptr = (const uint8_t*) home(*t).data(*t) + (size_t) row_start * row_bytes;
+    if (as_is) {
+        h2d(d.p, ptr, slice_bytes);
+        return d;
+    }
+    std::vector<float> f(slice_count);
+    const ggml_type_traits* traits = ggml_get_type_traits((ggml_type) t->type);
+    if (t->type == kTypeF32) std::memcpy(f.data(), ptr, slice_bytes);
+    else if (traits && traits->to_float) traits->to_float(ptr, f.data(), (int64_t) slice_count);
+    else throw std::runtime_error(t->name + " is " + shape_of(*t) + ", a type this engine cannot slice");
+    if (type == kTypeF32) {
+        h2d(d.p, f.data(), out_bytes);
+        return d;
+    }
+    std::vector<ggml_bf16_t> h(slice_count);
+    ggml_fp32_to_bf16_row(f.data(), h.data(), (int64_t) slice_count);
+    h2d(d.p, h.data(), out_bytes);
+    return d;
+}
+
+Dev Engine::load_output_matrix(const TensorInfo* t, int64_t file_vocab) {
+    Dev d = upload(t, "output.weight", n_embd_, file_vocab, kAnyMat);
+    d.n_out = n_vocab_;
+    return d;
+}
+
+void Engine::project_logits(const float* h, float* out, int rows) {
+    lin(output_, h, out, rows);
+}
+
 int64_t Engine::vram_free_mib() const {
     OnCard here(device_, split_);
     size_t free_b = 0, total_b = 0;
@@ -2877,9 +2930,7 @@ void Engine::load(const Options& o) {
             out_norm_ = upload(norm, "output_norm.weight", n_embd_, 1, kF32);
             // a file without an output matrix ties the output to the token table
             const TensorInfo* head = gg_->find("output.weight");
-            output_ = upload(head ? head : gg_->find("token_embd.weight"), "output.weight", n_embd_, file_vocab,
-                             kAnyMat);
-            output_.n_out = n_vocab_;  // padded rows are not tokens and never enter logits or sampling
+            output_ = load_output_matrix(head ? head : gg_->find("token_embd.weight"), file_vocab);
         }
         if (draft_) load_drafter();
         if (pass == 0) {
@@ -5434,7 +5485,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         next_->step(seqs, tokens, n);
     } else {
         output_rows(0, R, xn_);
-        lin(output_, xn_, wlogits_, R);
+        project_logits(xn_, wlogits_, R);
         finish_logits(wlogits_, R);
         ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) R * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost,
                            cs(st_)),
@@ -5655,14 +5706,14 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
     }
     // The model's output: the last token's for the logits, and every token's for the draft block.
     if (want_logits || draft_) {
-        const bool replay = opt_.graphs && n == 1 && want_logits && !opt_.dump;
+        const bool replay = opt_.graphs && n == 1 && want_logits && !opt_.dump && opt_.tp == 1;
         const int m = draft_ ? n : 1;
         float* h = draft_ ? hn_ + n_embd_ : xn_;
         const auto tail = [&] {
             output_rows(n - m, m, h);
             dbg("out_norm", n_layer_, h, n_embd_);
             if (!want_logits) return;
-            lin(output_, h + (size_t) (m - 1) * n_embd_, logits_, 1);
+            project_logits(h + (size_t) (m - 1) * n_embd_, logits_, 1);
             finish_logits(logits_, 1);
             ck(cudaMemcpyAsync(h_logits_, logits_, (size_t) n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost,
                                cs(st_)),
@@ -5953,7 +6004,7 @@ void Engine::window(const int32_t* tokens, int t) {
     }
     float* h = draft_ ? hn_ + n_embd_ : xn_;
     output_rows(0, t, h);
-    lin(output_, h, wlogits_, t);
+    project_logits(h, wlogits_, t);
     finish_logits(wlogits_, t);
     ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) t * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)),
        "logits");

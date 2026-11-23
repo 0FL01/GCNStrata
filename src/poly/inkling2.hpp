@@ -32,6 +32,8 @@ protected:
     void on_loaded() override;
     void on_reset() override;
     void on_keep_snap(size_t snap_idx) override;
+    Dev load_output_matrix(const TensorInfo* t, int64_t file_vocab) override;
+    void project_logits(const float* h, float* out, int rows) override;
     void alloc_caches() override;
     void assign_scratch() override;
     // the drafter's FFN down projection takes rows of 9216 (kDsFfn), its block 8 of them
@@ -65,7 +67,9 @@ private:
     int conv_floats_ = kConvFloats;
     std::shared_ptr<Tp2Comm> tp2_;
     std::unique_ptr<Inkling2> peer_;
-    enum class PeerCmd { kIdle, kRunVisits, kKeepSnap, kReset, kStop };
+    enum class PeerCmd { kIdle, kRunVisits, kLogits, kKeepSnap, kReset, kStop };
+    int tp2_vocab_lo_ = 0, tp2_vocab_n_ = 0;
+    float *tp2_logits_half_ = nullptr, *tp2_logits_peer_ = nullptr;
     std::thread peer_thread_;
     std::mutex peer_mu_;
     std::condition_variable peer_cv_;
