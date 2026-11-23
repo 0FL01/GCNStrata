@@ -29,6 +29,7 @@ struct Attend {
     int n = 0;
     int window = 0;
     int ring = 0;
+    int kv_heads = 8;   // 8 for single GPU (24 Q heads), 4 for TP2 (12 Q heads)
     float* out = nullptr;
 };
 

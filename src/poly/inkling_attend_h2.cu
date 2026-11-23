@@ -26,11 +26,12 @@ __device__ __forceinline__ uint32_t bcast_u(uint32_t v, int owner) {
     return __float_as_uint(lean_broadcast8(__uint_as_float(v), owner));
 }
 
-template <bool Q8>
+template <bool Q8, int KvHeads>
 __global__ void __launch_bounds__(kFlashThreads)
 flash_h2_kernel(const float* __restrict__ q, const float* __restrict__ rel, const float* __restrict__ table,
                 const float* __restrict__ sink, const float* __restrict__ gate, KvView k, KvView v, int64_t pos,
                 int n, int window, int ring, float* __restrict__ out) {
+    constexpr int kQHeads = KvHeads * kGroup;
     __shared__ uint2 ksh[kKeys][kHead / 4];              // 4 halves a float4 group
     __shared__ _Float16 vsh[kKeys / 2][kHead / 4][4][2];  // [pair c % 8][float4 group][dim][c / 8]
     __shared__ float ts[kSlice * kRelative];
@@ -39,7 +40,7 @@ flash_h2_kernel(const float* __restrict__ q, const float* __restrict__ rel, cons
     const bool live = t0 + tl < n;
     const int64_t p = pos + t, lo = oldest(p + 1, window);
     const int64_t kmin = oldest(pos + t0 + 1, window), kmax = pos + last;
-    const size_t qh0 = (size_t) t * kHeads + g * kGroup;
+    const size_t qh0 = (size_t) t * kQHeads + g * kGroup;
 
     uint32_t qh[kGroup][2 * kVec];
     float o[kGroup][4 * kVec], rr[kGroup][kRelPart], m[kGroup], l[kGroup], lc[kGroup];
@@ -62,7 +63,7 @@ flash_h2_kernel(const float* __restrict__ q, const float* __restrict__ rel, cons
     }
 
     Raw<Q8> raw;
-    fetch<Q8>(raw, k, v, kmin / kKeys * kKeys, kmin, kmax, ring, g, tid);
+    fetch<Q8, KvHeads>(raw, k, v, kmin / kKeys * kKeys, kmin, kmax, ring, g, tid);
     const auto tile = [&]<bool Near, bool Mask>(int64_t kb) __attribute__((always_inline)) {
         __syncthreads();
 #pragma unroll
@@ -75,7 +76,7 @@ flash_h2_kernel(const float* __restrict__ q, const float* __restrict__ rel, cons
             vsh[c % 8][w][2][c / 8] = (_Float16) vx.z;
             vsh[c % 8][w][3][c / 8] = (_Float16) vx.w;
         }
-        if (kb + kKeys <= kmax) fetch<Q8>(raw, k, v, kb + kKeys, kmin, kmax, ring, g, tid);
+        if (kb + kKeys <= kmax) fetch<Q8, KvHeads>(raw, k, v, kb + kKeys, kmin, kmax, ring, g, tid);
         if constexpr (Near) {
             const int64_t dlo = pos + t0 - (kb + kKeys - 1);
             for (int i = tid; i < kSlice * kRelative; i += kFlashThreads) {
@@ -198,9 +199,13 @@ flash_h2_kernel(const float* __restrict__ q, const float* __restrict__ rel, cons
 void attend_flash_h2(const Attend& a, cudaStream_t st) {
     if (a.n <= 0) return;
     if (!a.k.scales) throw std::runtime_error("Inkling half flash attention: needs the Q8_0 cache");
-    const dim3 grid((a.n + kTokens - 1) / kTokens, kKv);
-    flash_h2_kernel<true><<<grid, kFlashThreads, 0, st>>>(a.q, a.rel, a.table, a.sink, a.gate, a.k, a.v, a.pos, a.n,
-                                                      a.window, a.ring, a.out);
+    const auto run = [&]<int Kv>() {
+        const dim3 grid((a.n + kTokens - 1) / kTokens, Kv);
+        flash_h2_kernel<true, Kv><<<grid, kFlashThreads, 0, st>>>(a.q, a.rel, a.table, a.sink, a.gate, a.k, a.v, a.pos,
+                                                                  a.n, a.window, a.ring, a.out);
+    };
+    if (a.kv_heads == 4) run.template operator()<4>();
+    else run.template operator()<8>();
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) throw std::runtime_error(std::string("Inkling half flash attention: ") + cudaGetErrorString(e));
 }

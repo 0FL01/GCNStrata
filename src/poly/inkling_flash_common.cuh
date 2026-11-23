@@ -35,14 +35,15 @@ template <> struct Raw<false> {
     uint2 k[kLoads], v[kLoads];
 };
 
-template <bool Q8> __device__ void fetch(Raw<Q8>& raw, KvView k, KvView v, int64_t kb, int64_t kmin, int64_t kmax,
-                                         int ring, int g, int tid) {
+template <bool Q8, int KvHeads = kKv>
+__device__ void fetch(Raw<Q8>& raw, KvView k, KvView v, int64_t kb, int64_t kmin, int64_t kmax,
+                      int ring, int g, int tid) {
 #pragma unroll
     for (int i = 0; i < kLoads; ++i) {
         const int at_i = tid + i * kFlashThreads, c = at_i / (kHead / 4), w = at_i % (kHead / 4);
         const int64_t key = kb + c;
         const bool in = key >= kmin && key <= kmax;
-        const size_t at = in ? ((size_t) (ring ? key % ring : key) * kKv + g) * kHead + 4 * w : 0;
+        const size_t at = in ? ((size_t) (ring ? key % ring : key) * KvHeads + g) * kHead + 4 * w : 0;
         if constexpr (Q8) {
             raw.k[i] = in ? *reinterpret_cast<const char4*>(k.data + at) : make_char4(0, 0, 0, 0);
             raw.v[i] = in ? *reinterpret_cast<const char4*>(v.data + at) : make_char4(0, 0, 0, 0);

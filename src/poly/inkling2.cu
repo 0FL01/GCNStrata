@@ -375,7 +375,7 @@ struct KvStore {
     int64_t at;   // the row's place in the cache
 };
 __global__ void heads_kv_kernel(Conv k, Conv v, HeadNorms h, KvStore c, float eps, int64_t pos, float alpha,
-                                size_t stride) {
+                                size_t stride, int kv_width) {
     __shared__ float waves[kThreads / 32];
     int head = blockIdx.x, j = 0;
     while (j < 3 && head >= h.s[j].heads) head -= h.s[j++].heads;
@@ -383,7 +383,7 @@ __global__ void heads_kv_kernel(Conv k, Conv v, HeadNorms h, KvStore c, float ep
     const int i = head * kThreads + threadIdx.x;
     if (j == 1 || j == 2) {
         const Conv& cv = j == 2 ? v : k;
-        conv_channel(cv.x, cv.state, cv.w, cv.dynamic, kKvWidth, 1, i, cv.snap, stride);
+        conv_channel(cv.x, cv.state, cv.w, cv.dynamic, kv_width, 1, i, cv.snap, stride);
     }
     const HeadNorm& s = h.s[j];
     head_norm(s.x, s.w, s.width, s.heads, s.clip, eps, pos, s.floor, alpha, head, 0, waves);
@@ -394,32 +394,32 @@ __global__ void heads_kv_kernel(Conv k, Conv v, HeadNorms h, KvStore c, float ep
     for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o, 32));
     const float d = amax / 127.0f;
     const float id = d > 0.f ? 1.0f / d : 0.0f;
-    constexpr int nb = kKvWidth / 32;
+    const int nb = kv_width / 32;
     if (threadIdx.x % 32 == 0) (j == 2 ? c.vs : c.ks)[(size_t) c.at * nb + i / 32] = __float2half(d);
     float q = rintf(x * id);
     q = fminf(fmaxf(q, -127.0f), 127.0f);
-    (j == 2 ? c.vc : c.kc)[(size_t) c.at * kKvWidth + i] = (int8_t) q;
+    (j == 2 ? c.vc : c.kc)[(size_t) c.at * kv_width + i] = (int8_t) q;
 }
 
 // K and V into their Q8_0 caches in one launch, as store_q8_kernel writes them, a row at (pos + row) % ring (or
 // pos + row in a full layer's cache).
 __global__ void store2_q8_kernel(const float* k, const float* v, int8_t* kc, __half* ks, int8_t* vc, __half* vs,
-                                 int64_t pos, int ring, int rows) {
-    constexpr int nb = kKvWidth / 32;
+                                 int64_t pos, int ring, int rows, int kv_width) {
+    const int nb = kv_width / 32;
     int gb = blockIdx.x * blockDim.x + threadIdx.x;
     if (gb >= 2 * nb * rows) return;
     const bool second = gb >= nb * rows;
     if (second) gb -= nb * rows;
     const int row = gb / nb, blk = gb % nb;
     const int64_t at = ring ? (pos + row) % ring : pos + row;
-    const float* xr = (second ? v : k) + (size_t) row * kKvWidth + blk * 32;
+    const float* xr = (second ? v : k) + (size_t) row * kv_width + blk * 32;
     float amax = 0.f;
 #pragma unroll
     for (int j = 0; j < 32; ++j) amax = fmaxf(amax, fabsf(xr[j]));
     const float d = amax / 127.0f;
     const float id = d > 0.f ? 1.0f / d : 0.0f;
     (second ? vs : ks)[(size_t) at * nb + blk] = __float2half(d);
-    int8_t* cr = (second ? vc : kc) + (size_t) at * kKvWidth + blk * 32;
+    int8_t* cr = (second ? vc : kc) + (size_t) at * kv_width + blk * 32;
 #pragma unroll
     for (int j = 0; j < 32; ++j) {
         float q = rintf(xr[j] * id);
@@ -738,6 +738,188 @@ void Inkling2::load_geometry() {
         std::fprintf(stderr, "strata-poly: DSpark drafter %s: up to %d guesses a window\n", opt_.draft_model.c_str(),
                      ds_rows_);
     }
+    if (tp_size_ == 2) {
+        if (tp_rank_ == 1 && window > 1) opt_.window = std::min(window, kDsBlock);
+        n_heads_ = kHeads / 2;
+        n_kv_ = kKv / 2;
+        n_query_ = n_heads_ * kHead;
+        n_key_ = n_kv_ * kHead;
+        conv_floats_ = (kTaps - 1) * (2 * n_key_ + 2 * kWidth);
+        n_ff_exp_ /= 2;
+        moe_tail_ = false;   // all_reduce #2 needs the summed local MoE output in fo_ before conv_add
+    }
+}
+
+Inkling2::~Inkling2() { stop_peer_thread(); }
+
+std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
+    struct DevGuard {
+        int prev = 0;
+        bool ok = false;
+        DevGuard() { ok = (cudaGetDevice(&prev) == cudaSuccess); }
+        ~DevGuard() { if (ok) { (void) cudaSetDevice(prev); } }
+    } guard;
+    const int max_floats = std::max(o.prompt_batch, 8) * kWidth;
+    auto comm = Tp2Comm::create(0, 1, max_floats);
+
+    auto r0 = std::make_unique<Inkling2>();
+    r0->device_ = 0;
+    r0->split_ = true;
+    r0->tp_size_ = 2;
+    r0->tp_rank_ = 0;
+    r0->tp2_ = comm;
+
+    auto r1 = std::make_unique<Inkling2>();
+    r1->device_ = 1;
+    r1->split_ = true;
+    r1->tp_size_ = 2;
+    r1->tp_rank_ = 1;
+    r1->tp2_ = comm;
+
+    Options o0 = o;
+    o0.tp = 2;
+    Options o1 = o;
+    o1.tp = 2;
+    o1.draft = false;
+    o1.draft_model.clear();
+    if (o.draft && !o.draft_model.empty()) o1.window = o.window > 0 ? std::min(o.window, kDsBlock) : kDsBlock;
+
+    ck(cudaSetDevice(0), "tp2 setDevice 0");
+    r0->load(o0);
+    ck(cudaSetDevice(1), "tp2 setDevice 1");
+    r1->load(o1);
+    ck(cudaSetDevice(0), "tp2 setDevice 0");
+    r0->peer_ = std::move(r1);
+    r0->start_peer_thread();
+    return r0;
+}
+
+void Inkling2::start_peer_thread() {
+    if (!peer_) return;
+    bool started = false;
+    std::exception_ptr start_err;
+    peer_thread_ = std::thread([this, &started, &start_err] {
+        try {
+            ck(cudaSetDevice(peer_->device_), "tp2 peer setDevice");
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lk(peer_mu_);
+                start_err = std::current_exception();
+                started = true;
+            }
+            peer_cv_.notify_one();
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(peer_mu_);
+            started = true;
+        }
+        peer_cv_.notify_one();
+        while (true) {
+            PeerCmd cmd = PeerCmd::kIdle;
+            int n = 0;
+            size_t snap_idx = 0;
+            {
+                std::unique_lock<std::mutex> lk(peer_mu_);
+                peer_cv_.wait(lk, [&] { return peer_cmd_ != PeerCmd::kIdle; });
+                cmd = peer_cmd_;
+                n = peer_arg_n_;
+                snap_idx = peer_arg_snap_;
+                peer_cmd_ = PeerCmd::kIdle;
+            }
+            if (cmd == PeerCmd::kStop) break;
+            std::exception_ptr err;
+            try {
+                if (cmd == PeerCmd::kRunVisits) {
+                    peer_->pos_ = pos_;
+                    peer_->windowed_ = windowed_;
+                    peer_->snap_bits_ = snap_bits_;
+                    peer_->snap_at_ = windowed_ && snap_bits_ ? peer_->snap_ + (snap_at_ - snap_) : nullptr;
+                    peer_->cover(pos_ + n);
+                    tp2_->broadcast_from_0(1, peer_->r_, n * kWidth, peer_->st_);
+                    peer_->run_visits_local(n);
+                } else if (cmd == PeerCmd::kKeepSnap) {
+                    ck(cudaMemcpyAsync(peer_->state_, peer_->snap_ + snap_idx * peer_->rec_n_,
+                                       peer_->rec_n_ * sizeof(float), cudaMemcpyDeviceToDevice, cs(peer_->st_)),
+                       "tp2 peer keep");
+                } else if (cmd == PeerCmd::kReset) {
+                    peer_->reset();
+                }
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "strata-poly: TP2 peer exception: %s\n", e.what());
+                tp2_->abort_barrier();
+                err = std::current_exception();
+            } catch (...) {
+                tp2_->abort_barrier();
+                err = std::current_exception();
+            }
+            {
+                std::lock_guard<std::mutex> lk(peer_mu_);
+                peer_err_ = err;
+                peer_done_ = true;
+            }
+            peer_cv_.notify_one();
+        }
+    });
+    std::unique_lock<std::mutex> lk(peer_mu_);
+    peer_cv_.wait(lk, [&] { return started; });
+    if (start_err) {
+        lk.unlock();
+        if (peer_thread_.joinable()) peer_thread_.join();
+        std::rethrow_exception(start_err);
+    }
+}
+
+void Inkling2::stop_peer_thread() {
+    if (!peer_thread_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lk(peer_mu_);
+        peer_cmd_ = PeerCmd::kStop;
+    }
+    peer_cv_.notify_one();
+    peer_thread_.join();
+}
+
+void Inkling2::peer_dispatch(PeerCmd cmd, int n, size_t snap_idx) {
+    {
+        std::lock_guard<std::mutex> lk(peer_mu_);
+        peer_done_ = false;
+        peer_err_ = nullptr;
+        peer_arg_n_ = n;
+        peer_arg_snap_ = snap_idx;
+        peer_cmd_ = cmd;
+    }
+    peer_cv_.notify_one();
+}
+
+void Inkling2::peer_wait() {
+    std::exception_ptr err;
+    {
+        std::unique_lock<std::mutex> lk(peer_mu_);
+        peer_cv_.wait(lk, [&] { return peer_done_; });
+        err = peer_err_;
+        peer_err_ = nullptr;
+    }
+    if (err) std::rethrow_exception(err);
+}
+
+void Inkling2::on_loaded() {
+    if (tp_size_ == 2 && all_cached()) {
+        for (auto& v : tp2_exp_gu_) { v.clear(); v.shrink_to_fit(); }
+        for (auto& v : tp2_exp_down_) { v.clear(); v.shrink_to_fit(); }
+    }
+}
+
+void Inkling2::on_reset() {
+    if (!peer_) return;
+    peer_dispatch(PeerCmd::kReset);
+    peer_wait();
+}
+
+void Inkling2::on_keep_snap(size_t snap_idx) {
+    if (!peer_) return;
+    peer_dispatch(PeerCmd::kKeepSnap, 0, snap_idx);
+    peer_wait();
 }
 
 // The drafter's shape must be the one graph_inkling2 runs for this model (llama.cpp's dspark.cpp): three layers of
@@ -822,24 +1004,107 @@ void Inkling2::begin_pass() {
     }
 }
 
+void Inkling2::load_moe_tp2(int il) {
+    Layer& L = layers_[(size_t) il];
+    L.moe = true;
+    L.gate_inp = upload(tensor(il, "ffn_gate_inp.weight"), blk(il, "ffn_gate_inp.weight"), n_embd_, n_expert_, kAnyMat);
+    const int full_ff = n_ff_exp_ * 2;
+    const TensorInfo* td = tensor(il, "ffn_down_exps.weight");
+    const TensorInfo* gu = tensor(il, "ffn_gate_up_exps.weight");
+    if (!td || !gu) throw std::runtime_error(blk(il, "TP2 requires ffn_gate_up_exps and ffn_down_exps"));
+    const size_t full_d_bytes = home(*td).payload(*td) / (size_t) n_expert_;
+    const size_t full_gu_stride = home(*gu).payload(*gu) / (size_t) n_expert_;
+    const size_t half_gu_exp = full_gu_stride / 2;   // all gate rows (or all up rows) of one expert
+    const size_t quarter_gu = half_gu_exp / 2;       // half of gate (or half of up) for this rank
+
+    L.d_type = td->type;
+    L.d_bytes = full_d_bytes / 2;
+    L.gu_type = gu->type;
+    L.gu_bytes = quarter_gu;
+    L.gu_stride = 2 * quarter_gu;
+    L.u_type = L.gu_type;
+    L.u_bytes = L.gu_bytes;
+    L.u_stride = L.gu_stride;
+    L.gu_step = L.gu2();
+
+    if (dense_) {
+        const uint8_t* gu_src = home(*gu).data(*gu);
+        auto& gu_dst = tp2_exp_gu_[(size_t) il];
+        gu_dst.resize((size_t) n_expert_ * L.gu_stride);
+        for (int e = 0; e < n_expert_; ++e) {
+            const uint8_t* es = gu_src + (size_t) e * full_gu_stride;
+            uint8_t* ed = gu_dst.data() + (size_t) e * L.gu_stride;
+            std::memcpy(ed, es + (size_t) tp_rank_ * quarter_gu, quarter_gu);
+            std::memcpy(ed + quarter_gu, es + half_gu_exp + (size_t) tp_rank_ * quarter_gu, quarter_gu);
+        }
+        L.exp_gate = gu_dst.data();
+        L.exp_up = gu_dst.data() + L.gu_bytes;
+
+        const uint8_t* d_src = home(*td).data(*td);
+        auto& d_dst = tp2_exp_down_[(size_t) il];
+        d_dst.resize((size_t) n_expert_ * L.d_bytes);
+        const size_t full_row = full_d_bytes / (size_t) n_embd_;
+        const size_t half_row = full_row / 2;
+        if (full_row % 2 != 0) throw std::runtime_error(blk(il, "TP2 ffn_down_exps odd row bytes"));
+        for (int e = 0; e < n_expert_; ++e) {
+            const uint8_t* es = d_src + (size_t) e * full_d_bytes;
+            uint8_t* ed = d_dst.data() + (size_t) e * L.d_bytes;
+            for (int r = 0; r < n_embd_; ++r)
+                std::memcpy(ed + (size_t) r * half_row, es + (size_t) r * full_row + (size_t) tp_rank_ * half_row,
+                            half_row);
+        }
+        L.exp_down = d_dst.data();
+    }
+
+    const auto one = [&](const char* n, uint32_t type, Dev& d, std::vector<float>& h) {
+        const TensorInfo* t = tensor(il, n);
+        h.clear();
+        if (type != GGML_TYPE_NVFP4 || !t) return;
+        if (t->type != kTypeF32) throw std::runtime_error(t->name + " is not F32");
+        d = upload(t, blk(il, n), n_expert_, 1, kF32);
+        h.resize((size_t) n_expert_);
+        std::memcpy(h.data(), home(*t).data(*t), h.size() * sizeof(float));
+    };
+    if (L.gu_type == GGML_TYPE_NVFP4 && tensor(il, "ffn_gate_up_exps.scale")) {
+        one("ffn_gate_up_exps.scale", L.gu_type, L.s_gate, L.h_s_gate);
+        L.s_up = L.s_gate;
+        L.h_s_up = L.h_s_gate;
+    } else {
+        one("ffn_gate_exps.scale", L.gu_type, L.s_gate, L.h_s_gate);
+        one("ffn_up_exps.scale", L.u_type, L.s_up, L.h_s_up);
+    }
+    one("ffn_down_exps.scale", L.d_type, L.s_down, L.h_s_down);
+    (void) full_ff;
+    L.slot.assign((size_t) n_expert_, nullptr);
+    ++n_moe_;
+}
+
 void Inkling2::load_layer(int il) {
     Block& b = blocks_[il];
     Layer& L = layers_[il];
     const auto part = [&](const char* name, int cols, int rows = 1, Want want = kF32) {
         return upload(tensor(il, name), blk(il, name), cols, rows, want);
     };
-    b.q = part("attn_q.weight", kWidth, kQuery, kAnyMat);
-    b.k = part("attn_k.weight", kWidth, kKey, kAnyMat);
-    b.v = part("attn_v.weight", kWidth, kKey, kAnyMat);
-    b.o = part("attn_output.weight", kQuery, kWidth, kAnyMat);
-    b.gate = part("attn_gate.weight", kWidth, kQuery, kAnyMat);
-    b.rel = part("attn_rel.weight", kWidth, kRelative * kHeads, kAnyMat);
-    b.sink = part("attn_sink_proj.weight", kWidth, kHeads);
-    b.qclip = part("attn_q_clip.weight", kHead, kHeads);
-    b.rclip = part("attn_rel_clip.weight", kRelative, kHeads);
+    const auto row_sh = [&](const char* name, int cols, int rows, Want want = kF32) {
+        return tp_size_ == 2 ? upload_slice(tensor(il, name), blk(il, name), cols, rows, want, tp_rank_, false)
+                             : part(name, cols, rows, want);
+    };
+    const auto col_sh = [&](const char* name, int cols, int rows, Want want = kF32) {
+        return tp_size_ == 2 ? upload_slice(tensor(il, name), blk(il, name), cols, rows, want, tp_rank_, true)
+                             : part(name, cols, rows, want);
+    };
+    b.q = row_sh("attn_q.weight", kWidth, kQuery, kAnyMat);
+    b.k = row_sh("attn_k.weight", kWidth, kKey, kAnyMat);
+    b.v = row_sh("attn_v.weight", kWidth, kKey, kAnyMat);
+    b.o = col_sh("attn_output.weight", kQuery, kWidth, kAnyMat);
+    b.gate = row_sh("attn_gate.weight", kWidth, kQuery, kAnyMat);
+    b.rel = row_sh("attn_rel.weight", kWidth, kRelative * kHeads, kAnyMat);
+    b.sink = row_sh("attn_sink_proj.weight", kWidth, kHeads);
+    b.qclip = row_sh("attn_q_clip.weight", kHead, kHeads);
+    b.rclip = row_sh("attn_rel_clip.weight", kRelative, kHeads);
     b.table = part("attn_rel_bias.weight", kRelative, kWindow);
-    b.kconv = part("attn_k_conv.weight", kTaps, kKey);
-    b.vconv = part("attn_v_conv.weight", kTaps, kKey);
+    b.kconv = row_sh("attn_k_conv.weight", kTaps, kKey);
+    b.vconv = row_sh("attn_v_conv.weight", kTaps, kKey);
     b.aconv = part("attn_post_conv.weight", kTaps, kWidth);
     b.fconv = part("ffn_post_conv.weight", kTaps, kWidth);
     if (local(il)) L.attn_norm = part("attn_norm.weight", kWidth);
@@ -847,15 +1112,16 @@ void Inkling2::load_layer(int il) {
         L.attn_norm = part("attn_q_inp_norm.weight", kWidth);
         b.knorm = part("attn_k_inp_norm.weight", kWidth);
         b.vnorm = part("attn_v_inp_norm.weight", kWidth);
-        b.kproj = part("attn_k_conv_proj.weight", kWidth, kTaps * kKv);
-        b.vproj = part("attn_v_conv_proj.weight", kWidth, kTaps * kKv);
+        b.kproj = row_sh("attn_k_conv_proj.weight", kWidth, kTaps * kKv);
+        b.vproj = row_sh("attn_v_conv_proj.weight", kWidth, kTaps * kKv);
     }
     if (il > 0) b.aquery = part("attn_res_query.weight", kWidth, local(il) ? 1 : 3);
     b.fquery = part("ffn_res_query.weight", kWidth);
     L.ffn_norm = part("ffn_norm.weight", kWidth);
     if (!tensor(il, "ffn_gate_up_exps.weight"))
         throw std::runtime_error(blk(il, "ffn_gate_up_exps.weight is required for Inkling-2-Mini"));
-    load_moe(il, false);
+    if (tp_size_ == 2) load_moe_tp2(il);
+    else load_moe(il, false);
     if ((L.gu_type == GGML_TYPE_NVFP4 && L.h_s_gate.empty()) ||
         (L.d_type == GGML_TYPE_NVFP4 && L.h_s_down.empty()))
         throw std::runtime_error(blk(il, "NVFP4 experts require their scales"));
@@ -951,17 +1217,19 @@ void Inkling2::load_drafter() {
     }
 }
 
-size_t Inkling2::recurrent_floats() const { return (size_t) kVisits * kConvFloats; }
+size_t Inkling2::recurrent_floats() const { return (size_t) kVisits * conv_floats_; }
 size_t Inkling2::kv_bytes() const {
-    return 2 * (q8() ? kKey + (kKey / 32) * sizeof(uint16_t) : kKey * sizeof(uint16_t));
+    return 2 * (q8() ? n_key_ + (n_key_ / 32) * sizeof(uint16_t) : n_key_ * sizeof(uint16_t));
 }
-size_t Inkling2::card_row_bytes() const { return kVisits / kBlock * kv_bytes() + (draft_ ? ds_row_bytes() : 0); }
+size_t Inkling2::card_row_bytes() const {
+    return kVisits / kBlock * kv_bytes() * (peer_ ? 2 : 1) + (draft_ ? ds_row_bytes() : 0);
+}
 
 void Inkling2::alloc_caches() {
     ring_ = std::min(opt_.max_context, kWindow + rows_ - 1);
     auto* rings = (uint8_t*) seq_alloc((size_t) (kVisits - kVisits / kBlock) * ring_ * kv_bytes(), "Inkling SWA KV");
-    const size_t wide = kKey * (q8() ? 1 : sizeof(uint16_t));
-    const size_t scale = q8() ? kKey / 32 * sizeof(uint16_t) : 0;
+    const size_t wide = n_key_ * (q8() ? 1 : sizeof(uint16_t));
+    const size_t scale = q8() ? n_key_ / 32 * sizeof(uint16_t) : 0;
     for (int i = 0; i < kVisits; ++i) {
         for (int j = 0; j < 4; ++j) {
             const size_t stride = j % 2 ? scale : wide;
@@ -1003,6 +1271,12 @@ void Inkling2::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
             ck(cudaMemcpy(dst, p.data + first * p.stride, bytes, cudaMemcpyDeviceToHost), "save DSpark rows");
             dst += bytes;
         }
+    if (peer_) {
+        int prev = 0; cudaGetDevice(&prev);
+        ck(cudaSetDevice(peer_->device_), "save peer rows");
+        peer_->save_card_rows(first, n, dst);
+        cudaSetDevice(prev);
+    }
 }
 
 void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) {
@@ -1024,6 +1298,12 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
                           cudaMemcpyHostToDevice), "load DSpark rows");
             src += (size_t) count * p.stride;
         }
+    if (peer_) {
+        int prev = 0; cudaGetDevice(&prev);
+        ck(cudaSetDevice(peer_->device_), "load peer rows");
+        peer_->load_card_rows(src, from, count, first, n);
+        cudaSetDevice(prev);
+    }
 }
 
 size_t Inkling2::extra_bytes() const {
@@ -1158,8 +1438,8 @@ void Inkling2::save_layer(int il, int64_t pos, uint8_t* dst) {
             }
     }
     for (int i = 0; i < kVisits; ++i) if (physical(i) == il) {
-        const size_t at = (size_t) i * kConvFloats;
-        ck(cudaMemcpy(dst + at * sizeof(float), state_ + at, kConvFloats * sizeof(float), cudaMemcpyDeviceToHost),
+        const size_t at = (size_t) i * conv_floats_;
+        ck(cudaMemcpy(dst + at * sizeof(float), state_ + at, conv_floats_ * sizeof(float), cudaMemcpyDeviceToHost),
            "save Inkling convolution");
         if (local(i)) {
             const size_t offset = (i - i / kBlock) * (size_t) std::min(opt_.max_context, kWindow - 1) * kv_bytes();
@@ -1184,14 +1464,14 @@ void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
 
 void Inkling2::assign_scratch() {
     const size_t n = rows_, width = n * kWidth;
-    q_ = fbuf(n * kQuery);
-    k_ = fbuf(n * kKey);
-    v_ = fbuf(n * kKey);
-    att_ = fbuf(n * kQuery);
-    gate_ = fbuf(n * kQuery);
-    rel_ = fbuf(n * kHeads * kRelative);
-    sink_ = fbuf(n * kHeads);
-    taps_ = fbuf(n * kKv * kTaps);
+    q_ = fbuf(n * n_query_);
+    k_ = fbuf(n * n_key_);
+    v_ = fbuf(n * n_key_);
+    att_ = fbuf(n * n_query_);
+    gate_ = fbuf(n * n_query_);
+    rel_ = fbuf(n * n_heads_ * kRelative);
+    sink_ = fbuf(n * n_heads_);
+    taps_ = fbuf(n * n_kv_ * kTaps);
     halo_ = fbuf((size_t) div_up(rows_, kConvSpan) * 3 * kWidth);
     // A tile takes kValueTile scores and one kHead-wide partial value vector per query head. Keep room
     // for a single query at the configured limit, but share that room across queries on shorter prefixes.
@@ -1202,8 +1482,8 @@ void Inkling2::assign_scratch() {
     partial_ = fbuf(inkling::plain_partial_floats(attend_tiles_));
     if (decode_) {
         chunks_ = fbuf(inkling::decode_floats());
-        taps2_ = fbuf(n * kKv * kTaps);
-        attq_ = fbuf((size_t) kStageRows * (kQuery / 32) * 36 / sizeof(float));   // Q8_1: 36 bytes a block of 32
+        taps2_ = fbuf(n * n_kv_ * kTaps);
+        attq_ = fbuf((size_t) kStageRows * (n_query_ / 32) * 36 / sizeof(float));   // Q8_1: 36 bytes a block of 32
         kq8_ = fbuf((size_t) (kWidth / 32) * 36 / sizeof(float));
         vq8_ = fbuf((size_t) (kWidth / 32) * 36 / sizeof(float));
         // heads(): the three streams of up to kStageRows - 1 decode rows
@@ -1272,10 +1552,10 @@ void Inkling2::store(const float* x, Cache& c, int side, int n) {
     int64_t pos = swa ? pos_ % ring_ : pos_;
     for (int at = 0; at < n;) {
         const int m = swa ? std::min(n - at, ring_ - (int) pos) : n;
-        if (q8()) store_q8(x, (int8_t*) values.data, (uint16_t*) scales.data, kKey, pos, m, st_);
-        else store_f16(x, (uint16_t*) values.data, kKey, pos, m, st_);
+        if (q8()) store_q8(x, (int8_t*) values.data, (uint16_t*) scales.data, n_key_, pos, m, st_);
+        else store_f16(x, (uint16_t*) values.data, n_key_, pos, m, st_);
         at += m;
-        x += (size_t) m * kKey;
+        x += (size_t) m * n_key_;
         pos = 0;
     }
 }
@@ -1284,11 +1564,11 @@ void Inkling2::attention(const Block& b, int n) {
     Cache& c = caches_[visit_];
     const bool swa = local(visit_);
     if (fused(n) && q8()) {
-        const int blocks = 2 * (kKey / 32) * n;
+        const int blocks = 2 * (n_key_ / 32) * n;
         if (!kv_stored_)
             store2_q8_kernel<<<div_up(blocks, 256), 256, 0, cs(st_)>>>(
                 k_, v_, (int8_t*) c.planes[0].data, (__half*) c.planes[1].data, (int8_t*) c.planes[2].data,
-                (__half*) c.planes[3].data, pos_, swa ? ring_ : 0, n);
+                (__half*) c.planes[3].data, pos_, swa ? ring_ : 0, n, n_key_);
         kv_stored_ = false;
     } else {
         store(k_, c, 0, n);
@@ -1306,6 +1586,7 @@ void Inkling2::attention(const Block& b, int n) {
     a.n = n;
     a.window = swa ? kWindow : 0;
     a.ring = swa ? ring_ : 0;
+    a.kv_heads = n_kv_;
     a.out = att_;
     // Prompt batches only: a token's answer and short calls keep the plain kernels and their sums.
     if (flash_ && n >= kStageRows) inkling::attend_flash(a, cs(st_));
@@ -1426,12 +1707,34 @@ void Inkling2::run_visits(int n) {
         first = (int) std::min<int64_t>(n, im.at + im.n - pos_);
     }
     if (first < n) norm_text(first, n - first);
-    fo_clean_ = false;   // fo_ is what the last call left
     // half a warp an NVFP4 expert row for this call's few tokens only (iq_set_slot_lanes() is the process's)
     kernels::iq_set_slot_lanes(fused(n));
     struct Lanes {
         ~Lanes() { kernels::iq_set_slot_lanes(false); }
     } lanes;
+    if (peer_) {
+        peer_dispatch(PeerCmd::kRunVisits, n);
+        try {
+            tp2_->broadcast_from_0(0, r_, n * kWidth, st_);
+            run_visits_local(n);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata-poly: TP2 rank0 exception: %s\n", e.what());
+            tp2_->abort_barrier();
+            peer_wait();
+            throw;
+        } catch (...) {
+            tp2_->abort_barrier();
+            peer_wait();
+            throw;
+        }
+        peer_wait();
+    } else {
+        run_visits_local(n);
+    }
+}
+
+void Inkling2::run_visits_local(int n) {
+    fo_clean_ = false;   // fo_ is what the last call left
     depth_n_ = 0;
     for (visit_ = 0; visit_ < kVisits; ++visit_) {
         if (visit_ == kStart) axpy(r_, 1.f, prelude_, n * kWidth, false, st_);
@@ -1509,10 +1812,10 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     }
     lin(b.sink, xq, sink_, n);
 
-    float* hist = state_ + (size_t) visit_ * kConvFloats;
+    float* hist = state_ + (size_t) visit_ * conv_floats_;
     const auto kv_conv = [&](float* x, float* state, const Dev& w, const Dev& dyn, const float* input) {
         if (!swa) lin(dyn, input, taps_, n);
-        conv(x, state, fp(w), swa ? nullptr : taps_, kKey, n);
+        conv(x, state, fp(w), swa ? nullptr : taps_, n_key_, n);
     };
     const int floor = swa ? 0 : floor_;
     if (fused(n)) {
@@ -1521,43 +1824,44 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
             lin(b.vproj, xv, taps2_, n);
         }
         const Conv ck{k_, hist, fp(b.kconv), swa ? nullptr : taps_, snap_of(hist)};
-        const Conv cv{v_, hist + 3 * kKey, fp(b.vconv), swa ? nullptr : taps2_, snap_of(hist + 3 * kKey)};
-        HeadNorms h{{{q_, fp(b.qclip), kHead, kHeads, qk_clip_, floor}, {k_, nullptr, kHead, kKv, qk_clip_, 0},
-                     {v_, nullptr, kHead, kKv, 0.f, 0}, {rel_, fp(b.rclip), kRelative, kHeads, r_clip_, floor}}};
+        const Conv cv{v_, hist + 3 * n_key_, fp(b.vconv), swa ? nullptr : taps2_, snap_of(hist + 3 * n_key_)};
+        HeadNorms h{{{q_, fp(b.qclip), kHead, n_heads_, qk_clip_, floor}, {k_, nullptr, kHead, n_kv_, qk_clip_, 0},
+                     {v_, nullptr, kHead, n_kv_, 0.f, 0}, {rel_, fp(b.rclip), kRelative, n_heads_, r_clip_, floor}}};
         if (n == 1 && q8()) {   // attention() finds K and V stored
             Cache& c = caches_[visit_];
             const KvStore to{(int8_t*) c.planes[0].data, (int8_t*) c.planes[2].data, (__half*) c.planes[1].data,
                              (__half*) c.planes[3].data, swa ? pos_ % ring_ : pos_};
-            heads_kv_kernel<<<2 * kHeads + 2 * kKv, kThreads, 0, cs(st_)>>>(ck, cv, h, to, rms_eps_, pos_, alpha_,
-                                                                           rec_n_);
+            heads_kv_kernel<<<2 * n_heads_ + 2 * n_kv_, kThreads, 0, cs(st_)>>>(ck, cv, h, to, rms_eps_, pos_, alpha_,
+                                                                                rec_n_, n_key_);
             kv_stored_ = true;
         } else {
-            conv2_kernel<<<div_up(2 * kKey, kThreads), kThreads, 0, cs(st_)>>>(ck, cv, kKey, n, rec_n_);
-            head_norms_kernel<<<dim3(2 * kHeads + 2 * kKv, n), kThreads, 0, cs(st_)>>>(h, rms_eps_, pos_, alpha_);
+            conv2_kernel<<<div_up(2 * n_key_, kThreads), kThreads, 0, cs(st_)>>>(ck, cv, n_key_, n, rec_n_);
+            head_norms_kernel<<<dim3(2 * n_heads_ + 2 * n_kv_, n), kThreads, 0, cs(st_)>>>(h, rms_eps_, pos_, alpha_);
         }
     } else {
         kv_conv(k_, hist, b.kconv, b.kproj, xk);
-        kv_conv(v_, hist + 3 * kKey, b.vconv, b.vproj, xv);
+        kv_conv(v_, hist + 3 * n_key_, b.vconv, b.vproj, xv);
     }
     const auto heads = [&](float* x, const float* w, int width, int count, float clip, int log_floor) {
         head_norm_kernel<<<dim3(count, n), kThreads, 0, cs(st_)>>>(x, w, width, count, clip, rms_eps_, pos_, log_floor,
                                                                   alpha_);
     };
     if (!fused(n)) {
-        heads(q_, fp(b.qclip), kHead, kHeads, qk_clip_, floor);
-        heads(k_, nullptr, kHead, kKv, qk_clip_, 0);
-        heads(v_, nullptr, kHead, kKv, 0.f, 0);
-        heads(rel_, fp(b.rclip), kRelative, kHeads, r_clip_, floor);
+        heads(q_, fp(b.qclip), kHead, n_heads_, qk_clip_, floor);
+        heads(k_, nullptr, kHead, n_kv_, qk_clip_, 0);
+        heads(v_, nullptr, kHead, n_kv_, 0.f, 0);
+        heads(rel_, fp(b.rclip), kRelative, n_heads_, r_clip_, floor);
     }
-    dbg("Qcur", visit_, q_, kQuery);
-    dbg("Kcur", visit_, k_, kKey);
+    dbg("Qcur", visit_, q_, n_query_);
+    dbg("Kcur", visit_, k_, n_key_);
     attention(b, n);
     lin(b.o, att_, ao_, n, fused(n) ? attq_ : nullptr);   // attend_decode() quantized it
+    if (tp2_) tp2_->all_reduce(tp_rank_, ao_, n * kWidth, st_);
     if (fused(n))
         conv_add_kernel<<<div_up(kWidth, kThreads), kThreads, 0, cs(st_)>>>(
-            ao_, nullptr, hist + 6 * kKey, fp(b.aconv), r_, il % kBlock == 0 ? depth_[depth_n_++] : nullptr, kWidth, n,
-            false, TailSum{}, snap_of(hist + 6 * kKey), rec_n_);
-    else conv(ao_, hist + 6 * kKey, fp(b.aconv), nullptr, kWidth, n);
+            ao_, nullptr, hist + 6 * n_key_, fp(b.aconv), r_, il % kBlock == 0 ? depth_[depth_n_++] : nullptr, kWidth,
+            n, false, TailSum{}, snap_of(hist + 6 * n_key_), rec_n_);
+    else conv(ao_, hist + 6 * n_key_, fp(b.aconv), nullptr, kWidth, n);
     if (fused(n)) {   // conv_add_kernel() did the rest
     } else if (il % kBlock == 0) {
         axpy(r_, 1.f, depth_[depth_n_++], n * kWidth, false, st_);
@@ -1629,7 +1933,8 @@ void Inkling2::moe_add(int n) {
 }
 
 void Inkling2::layer_tail(Layer&, int il, int n) {
-    float* hist = state_ + (size_t) visit_ * kConvFloats + 6 * kKey + 3 * kWidth;
+    if (tp2_) tp2_->all_reduce(tp_rank_, fo_, n * kWidth, st_);
+    float* hist = state_ + (size_t) visit_ * conv_floats_ + 6 * n_key_ + 3 * kWidth;
     if (fused(n)) {
         // with the record's experts summed here (STRATA_INKLING_TAIL_MOE), moe() launched nothing for them
         conv_add_kernel<<<div_up(kWidth, kThreads), kThreads, 0, cs(st_)>>>(

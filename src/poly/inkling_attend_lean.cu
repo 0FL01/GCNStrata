@@ -11,11 +11,12 @@
 namespace strata::poly::inkling {
 namespace {
 
-template <bool Q8>
+template <bool Q8, int KvHeads>
 __global__ void __launch_bounds__(kFlashThreads)
 flash_lean_kernel(const float* __restrict__ q, const float* __restrict__ rel, const float* __restrict__ table,
                   const float* __restrict__ sink, const float* __restrict__ gate, KvView k, KvView v, int64_t pos,
                   int n, int window, int ring, float* __restrict__ out) {
+    constexpr int kQHeads = KvHeads * kGroup;
     __shared__ float4 ks[kKeys][kHead / 4];
     __shared__ float4 vs[kKeys][kHead / 4];
     __shared__ float ts[kSlice * kRelative];
@@ -24,7 +25,7 @@ flash_lean_kernel(const float* __restrict__ q, const float* __restrict__ rel, co
     const bool live = t0 + tl < n;
     const int64_t p = pos + t, lo = oldest(p + 1, window);
     const int64_t kmin = oldest(pos + t0 + 1, window), kmax = pos + last;
-    const size_t qh0 = (size_t) t * kHeads + g * kGroup;
+    const size_t qh0 = (size_t) t * kQHeads + g * kGroup;
 
     float qr[kGroup][4 * kVec], o[kGroup][4 * kVec], rr[kGroup][kRelPart], m[kGroup], l[kGroup], lc[kGroup];
 #pragma unroll
@@ -43,7 +44,7 @@ flash_lean_kernel(const float* __restrict__ q, const float* __restrict__ rel, co
     }
 
     Raw<Q8> raw;
-    fetch<Q8>(raw, k, v, kmin / kKeys * kKeys, kmin, kmax, ring, g, tid);
+    fetch<Q8, KvHeads>(raw, k, v, kmin / kKeys * kKeys, kmin, kmax, ring, g, tid);
     // One block of keys, as flash_kernel<Q8, true> takes it; Near stages the table slice and adds the relative terms,
     // Mask masks the keys a token must not see. Both are true but for the far blocks.
     const auto tile = [&]<bool Near, bool Mask>(int64_t kb) __attribute__((always_inline)) {
@@ -54,7 +55,7 @@ flash_lean_kernel(const float* __restrict__ q, const float* __restrict__ rel, co
             ks[c][w] = unpack<Q8>(raw, i, false);
             vs[c][w] = unpack<Q8>(raw, i, true);
         }
-        if (kb + kKeys <= kmax) fetch<Q8>(raw, k, v, kb + kKeys, kmin, kmax, ring, g, tid);   // under this block's work
+        if (kb + kKeys <= kmax) fetch<Q8, KvHeads>(raw, k, v, kb + kKeys, kmin, kmax, ring, g, tid);   // under this block's work
         if constexpr (Near) {
             // ts[j]: the table row of distance pos + t0 - (kb + kKeys - 1) + j, zero past the bias's extent
             const int64_t dlo = pos + t0 - (kb + kKeys - 1);
@@ -172,13 +173,17 @@ flash_lean_kernel(const float* __restrict__ q, const float* __restrict__ rel, co
 
 void attend_flash_lean(const Attend& a, cudaStream_t st) {
     if (a.n <= 0) return;
-    const dim3 grid(div_up(a.n, kTokens), kKv);
-    if (a.k.scales)
-        flash_lean_kernel<true><<<grid, kFlashThreads, 0, st>>>(a.q, a.rel, a.table, a.sink, a.gate, a.k, a.v, a.pos, a.n,
-                                                            a.window, a.ring, a.out);
-    else
-        flash_lean_kernel<false><<<grid, kFlashThreads, 0, st>>>(a.q, a.rel, a.table, a.sink, a.gate, a.k, a.v, a.pos,
-                                                             a.n, a.window, a.ring, a.out);
+    const auto run = [&]<int Kv>() {
+        const dim3 grid(div_up(a.n, kTokens), Kv);
+        if (a.k.scales)
+            flash_lean_kernel<true, Kv><<<grid, kFlashThreads, 0, st>>>(a.q, a.rel, a.table, a.sink, a.gate, a.k, a.v,
+                                                                        a.pos, a.n, a.window, a.ring, a.out);
+        else
+            flash_lean_kernel<false, Kv><<<grid, kFlashThreads, 0, st>>>(a.q, a.rel, a.table, a.sink, a.gate, a.k, a.v,
+                                                                         a.pos, a.n, a.window, a.ring, a.out);
+    };
+    if (a.kv_heads == 4) run.template operator()<4>();
+    else run.template operator()<8>();
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) throw std::runtime_error(std::string("Inkling lean flash attention: ") + cudaGetErrorString(e));
 }

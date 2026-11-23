@@ -1426,6 +1426,7 @@ int main(int argc, char** argv) {
         else if (a == "--skip-weight") o.skip_weight = (float) std::atof(val());
         else if (a == "--cache-bias") o.cache_bias = (float) std::atof(val());
         else if (a == "--layer-split") o.layer_split = val();
+        else if (a == "--tp") o.tp = std::atoi(val());
         else if (a == "--batch" || a == "--slots") o.batch = std::atoi(val());
         else if (a == "--batch-mtp") o.batch_mtp = true;
         else if (a == "--check-batch") check = std::atoi(val());

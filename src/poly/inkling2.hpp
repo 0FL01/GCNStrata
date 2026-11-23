@@ -2,14 +2,23 @@
 #pragma once
 
 #include "engine.hpp"
+#include "tp2_comm.hpp"
 
 #include <array>
+#include <condition_variable>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 namespace strata::poly {
 
 class Inkling2 final : public Engine {
 public:
+    static std::unique_ptr<Engine> open_tp2(const Options& o);
+    ~Inkling2() override;
+
     bool sees() const override { return true; }
     size_t card_row_bytes() const override;
     void save_card_rows(int64_t first, int64_t n, uint8_t* dst) override;
@@ -20,6 +29,9 @@ protected:
     void begin_pass() override;
     void load_layer(int il) override;
     void run_visits(int n) override;
+    void on_loaded() override;
+    void on_reset() override;
+    void on_keep_snap(size_t snap_idx) override;
     void alloc_caches() override;
     void assign_scratch() override;
     // the drafter's FFN down projection takes rows of 9216 (kDsFfn), its block 8 of them
@@ -48,6 +60,29 @@ private:
     static constexpr int kTaps = 4, kWindow = 1024, kBlock = 6, kRank = 64;
     static constexpr int kCore = 12, kStart = 6, kCoda = 42;
     static constexpr int kConvFloats = (kTaps - 1) * (2 * kKey + 2 * kWidth);
+    int tp_size_ = 1, tp_rank_ = 0;
+    int n_heads_ = kHeads, n_kv_ = kKv, n_query_ = kQuery, n_key_ = kKey;
+    int conv_floats_ = kConvFloats;
+    std::shared_ptr<Tp2Comm> tp2_;
+    std::unique_ptr<Inkling2> peer_;
+    enum class PeerCmd { kIdle, kRunVisits, kKeepSnap, kReset, kStop };
+    std::thread peer_thread_;
+    std::mutex peer_mu_;
+    std::condition_variable peer_cv_;
+    PeerCmd peer_cmd_ = PeerCmd::kIdle;
+    int peer_arg_n_ = 0;
+    size_t peer_arg_snap_ = 0;
+    bool peer_done_ = true;
+    std::exception_ptr peer_err_;
+    std::array<std::vector<uint8_t>, kPhysical> tp2_exp_gu_, tp2_exp_down_;
+
+    void start_peer_thread();
+    void stop_peer_thread();
+    void peer_dispatch(PeerCmd cmd, int n = 0, size_t snap_idx = 0);
+    void peer_wait();
+    void run_visits_local(int n);
+    void load_moe_tp2(int il);
+
     static constexpr bool local(int visit) { return visit % kBlock != kBlock - 1; }
     static constexpr int physical(int visit) {
         return visit < kStart ? visit : visit < kCoda ? kStart + (visit - kStart) % kCore : visit - 2 * kCore;

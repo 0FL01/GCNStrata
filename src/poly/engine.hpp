@@ -123,6 +123,7 @@ struct Options {
     std::string layer_split;      ///< the layers across the CUDA devices this process sees, in their order: "auto"
                                   ///< (by each card's free VRAM) or the first layer of each later card ("20,30");
                                   ///< empty, or one device: the current card alone
+    int tp = 1;                   ///< tensor parallel degree (1 = single GPU, 2 = 2-GPU TP2 for Inkling-2-Mini)
     int batch = 0;                ///< sequences beside the first, each with a state and caches of its own (bind(),
                                   ///< step()); 0: one sequence
     bool batch_mtp = false;       ///< step() takes a guess beside each sequence's token (steps_guesses())
@@ -463,6 +464,9 @@ protected:
     virtual void layer_tail(Layer& L, int il, int n) = 0;
     /// The looped model visits a physical layer more than once, and keeps token state between those visits.
     virtual void run_visits(int n) { (void) n; }
+    virtual void on_loaded() {}
+    virtual void on_reset() {}
+    virtual void on_keep_snap(size_t snap_idx) { (void) snap_idx; }
     /// The model's output for `rows` tokens from row `first` of the call, normed: what the output matrix takes.
     virtual void output_rows(int first, int rows, float* h) = 0;
     /// A token's experts and their weights from its scores at layer il's router.  `token` is the token the row is
@@ -551,6 +555,10 @@ protected:
                float (*fix)(float) = nullptr);
     Dev upload_as(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
                   float (*fix)(float));
+    /// Upload half of a 2D tensor for TP2 (tp_rank in {0, 1}): slice_cols=false halves n_out (rows),
+    /// slice_cols=true halves n_in (contiguous columns). n_in and n_out are the full GGUF dimensions.
+    Dev upload_slice(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
+                     int tp_rank, bool slice_cols);
     float global_scale(const TensorInfo& t) const;
     const TensorInfo* tensor(int il, const char* name) const;
     const Shards& home(const TensorInfo& t) const;

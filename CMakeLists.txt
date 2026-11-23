@@ -2169,7 +2169,7 @@ if(STRATA_NATIVE_EXPERTS AND STRATA_HIP_GFX906)
                             src/poly/kolibri1.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
                             src/poly/spill.cpp src/core/conversation_memory.cpp
                             src/poly/inkling2.cu src/poly/inkling_attend.cu src/poly/inkling_attend_lean.cu
-                            src/poly/inkling_attend_h2.cu src/poly/inkling_dspark.cu)
+                            src/poly/inkling_attend_h2.cu src/poly/inkling_dspark.cu src/poly/tp2_comm.cu)
   target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_compile_definitions(strata-poly PRIVATE STRATA_USE_HIP=1)
   target_link_libraries(strata-poly PRIVATE strata_poly_mmq strata_kernels strata_spec ggml-cpu ggml-base

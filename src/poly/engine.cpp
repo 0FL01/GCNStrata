@@ -1688,6 +1688,10 @@ std::unique_ptr<Engine> Engine::open(const Options& o) {
         throw std::runtime_error("--cache-bias is supported for qwen35moe models; this is a '" + name + "' model");
     if (inkling) {
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
+        int tp = o.tp;
+        if (const char* v = std::getenv("STRATA_TP"); v && *v && tp <= 1) tp = std::atoi(v);
+        if (tp == 2) return Inkling2::open_tp2(o);
+        if (tp != 1) throw std::runtime_error("Inkling-2-Mini supports --tp 1 or --tp 2 (got " + std::to_string(tp) + ")");
         auto engine = std::make_unique<Inkling2>();
         engine->load(o);
         return engine;
@@ -1867,6 +1871,63 @@ Dev Engine::upload_as(const TensorInfo* t, const std::string& name, int64_t n_in
     std::vector<ggml_bf16_t> h(count);
     ggml_fp32_to_bf16_row(f.data(), h.data(), (int64_t) count);
     h2d(d.p, h.data(), out);
+    return d;
+}
+
+Dev Engine::upload_slice(const TensorInfo* t, const std::string& name, int64_t n_in, int64_t n_out, Want want,
+                         int tp_rank, bool slice_cols) {
+    if (!t) throw std::runtime_error("the GGUF has no tensor " + name);
+    const uint64_t rest = t->elements() / std::max<uint64_t>(t->shape[0], 1);
+    if ((int64_t) t->shape[0] != n_in || (int64_t) rest != n_out)
+        throw std::runtime_error(t->name + " is " + shape_of(*t) + ", expected [" + std::to_string(n_in) + ", " +
+                                 std::to_string(n_out) + "]");
+    const int64_t s_in = slice_cols ? n_in / 2 : n_in;
+    const int64_t s_out = slice_cols ? n_out : n_out / 2;
+    const size_t full_bytes = home(*t).payload(*t);
+    const size_t row_bytes = full_bytes / (size_t) n_out;
+    const size_t half_bytes = full_bytes / 2;
+    const size_t half_count = (size_t) s_in * (size_t) s_out;
+    const bool as_is = (t->type == kTypeF32 || (want != kF32 && t->type == kTypeBF16) ||
+                        (want == kAnyMat && kernels::native_mmvq_supported((int) t->type)));
+    const uint32_t type = as_is ? t->type : want == kF32 ? kTypeF32 : kTypeBF16;
+    const size_t out_bytes = as_is ? half_bytes : half_count * (type == kTypeF32 ? sizeof(float) : sizeof(uint16_t));
+    if (type == kTypeBF16) bf16_max_ = std::max(bf16_max_, half_count);
+    Dev d{dense_ ? dense_ + dense_at_ : nullptr, type, (int) s_in, (int) s_out};
+    d.scale = global_scale(*t);
+    dense_at_ += pad(out_bytes) + kTail;
+    if (!dense_) return d;
+    if (dense_at_ > dense_bytes_) throw std::logic_error("the dense arena is too small for " + t->name);
+
+    const uint8_t* src = (const uint8_t*) home(*t).data(*t);
+    std::vector<uint8_t> raw;
+    const uint8_t* ptr = nullptr;
+    if (!slice_cols) {
+        ptr = src + (size_t) tp_rank * half_bytes;
+    } else {
+        const size_t half_row = row_bytes / 2;
+        if (row_bytes % 2 != 0) throw std::runtime_error("upload_slice: odd row_bytes for " + t->name);
+        raw.resize(half_bytes);
+        for (int64_t r = 0; r < n_out; ++r)
+            std::memcpy(raw.data() + (size_t) r * half_row, src + (size_t) r * row_bytes + (size_t) tp_rank * half_row,
+                        half_row);
+        ptr = raw.data();
+    }
+    if (as_is) {
+        h2d(d.p, ptr, half_bytes);
+        return d;
+    }
+    std::vector<float> f(half_count);
+    const ggml_type_traits* traits = ggml_get_type_traits((ggml_type) t->type);
+    if (t->type == kTypeF32) std::memcpy(f.data(), ptr, half_bytes);
+    else if (traits && traits->to_float) traits->to_float(ptr, f.data(), (int64_t) half_count);
+    else throw std::runtime_error(t->name + " is " + shape_of(*t) + ", a type this engine cannot slice");
+    if (type == kTypeF32) {
+        h2d(d.p, f.data(), out_bytes);
+        return d;
+    }
+    std::vector<ggml_bf16_t> h(half_count);
+    ggml_fp32_to_bf16_row(f.data(), h.data(), (int64_t) half_count);
+    h2d(d.p, h.data(), out_bytes);
     return d;
 }
 
@@ -2851,6 +2912,7 @@ void Engine::load(const Options& o) {
     // those are done, so that everything after it - a read of what the cache holds, the first request's cover()
     // mapping the attention caches - finds what it expects.
     ck(cudaStreamSynchronize(cs(st_)), "the load");
+    on_loaded();
     // The card has the dense weights now, and the CPU does not read them again.
     for (const auto& [p, n] : uploaded_) drop_pages(p, n);
     uploaded_ = {};
@@ -3303,6 +3365,7 @@ void Engine::reset() {
     ck(cudaMemsetAsync(state_, 0, state_n_ * sizeof(float), cs(st_)), "reset");
     pos_ = 0;
     ahead_pos_ = -1;
+    on_reset();
     if (next_) next_->reset();
 }
 
@@ -5934,9 +5997,11 @@ void Engine::keep(int n) {
         // did, and the state with them.
         const unsigned left = snap_tokens(win_) & ((1u << n) - 1u);   // the right tokens that left their state
         const int from = (int) std::bit_width(left);                  // the tokens the state at hand is after
-        ck(cudaMemcpyAsync(state_, snap_ + size_t(std::popcount(left) - 1) * rec_n_, rec_n_ * sizeof(float),
+        const size_t snap_idx = (size_t) (std::popcount(left) - 1);
+        ck(cudaMemcpyAsync(state_, snap_ + snap_idx * rec_n_, rec_n_ * sizeof(float),
                            cudaMemcpyDeviceToDevice, cs(st_)),
            "keep");
+        on_keep_snap(snap_idx);
         if (from < n) {
             pos_ += from;
             try {
