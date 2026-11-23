@@ -42,6 +42,8 @@ uint64_t lock_gpu_shared_mappings();
 /// `why` says so) when the query is not possible - always elsewhere than Windows.
 bool gpu_shared_memory_budget(const void* luid, uint64_t& budget, uint64_t& usage, std::string& why);
 
+inline bool gpu_local_memory_budget(const void*, uint64_t&, uint64_t&, std::string&) { return false; }
+
 /// The machine's physical RAM in bytes (0 when unknown).
 uint64_t total_physical_memory();
 

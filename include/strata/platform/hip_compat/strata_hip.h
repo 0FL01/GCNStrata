@@ -112,7 +112,9 @@ inline hipError_t strata_device_get_attribute(int* v, hipDeviceAttribute_t a, in
 #define cudaMemcpyAsync hipMemcpyAsync
 #define cudaMemcpyPeerAsync hipMemcpyPeerAsync
 #define cudaMemcpyPeer hipMemcpyPeer
+#define cudaMemcpy2D hipMemcpy2D
 #define cudaMemcpy2DAsync hipMemcpy2DAsync
+#define cudaGraphInstantiateWithFlags hipGraphInstantiateWithFlags
 #define cudaMemset hipMemset
 #define cudaMemsetAsync hipMemsetAsync
 // Mapped host memory is how the GPU and the CPU talk inside a running graph (the doorbells, the CPU experts'

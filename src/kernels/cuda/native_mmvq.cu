@@ -3058,7 +3058,7 @@ bool native_mmvq_supported(int ggml_type) noexcept {
     return ggml_type == 2 || ggml_type == 3 || ggml_type == 6 || ggml_type == 7 || ggml_type == 8 || ggml_type == 11 ||
            ggml_type == 12 || ggml_type == 13 || ggml_type == 14 || ggml_type == 20 ||
            ggml_type == 23 || ggml_type == 42 || ggml_type == 16 || ggml_type == 17 || ggml_type == 18 ||
-           ggml_type == 21 || ggml_type == 22 || ggml_type == 29;
+           ggml_type == 21 || ggml_type == 22 || ggml_type == 29 || ggml_type == 39 || ggml_type == 40;
 }
 
 std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
@@ -3070,6 +3070,8 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out) {
     case 7: block_elems = 32; block_bytes = 24; break;
     case 8: block_elems = 32; block_bytes = 34; break;
     case 20: block_elems = 32; block_bytes = 18; break;
+    case 39: block_elems = 32; block_bytes = 17; break;
+    case 40: block_elems = 64; block_bytes = 36; break;
     case 11: block_elems = 256; block_bytes = 110; break;
     case 12: block_elems = 256; block_bytes = 144; break;
     case 13: block_elems = 256; block_bytes = 176; break;
@@ -3094,7 +3096,7 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
     switch (ggml_type) {
     case 2: native_q4_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 6: native_q5_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
-    case 3: case 7: iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
+    case 3: case 7: case 39: case 40: iq_mmvq(ggml_type, weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 8: native_q8_0_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 20: native_iq4_nl_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
     case 11: native_q3_k_mmvq(weights, x_q8_1, y, n_in, n_out, ncols, stream); break;
@@ -3396,5 +3398,137 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
 }
 void native_mmvq_il_tune(int) {}
 #endif  // !__HIPCC__
+
+// Baseline strata-poly entry points (return false -> caller uses standard native_mmvq; optimized wave64 kernels
+// are added iteratively in P4/P5 with per-kernel measurements).
+namespace {
+struct NormQ8RowsK {
+    NormQ8Row r[4];
+};
+template<int SUM>
+__launch_bounds__(1024, 1)
+__global__ void native_add_rms_norm_q8_1_kernel(float* __restrict__ x, const float* __restrict__ add,
+                                                const float* __restrict__ w, float* __restrict__ y,
+                                                Q81Block* __restrict__ yq, int n, float eps) {
+    __shared__ float part[SUM / WARP];
+    float* xr = x + std::size_t(blockIdx.x) * n;
+    const float* ar = add ? add + std::size_t(blockIdx.x) * n : nullptr;
+    float* yr = y + std::size_t(blockIdx.x) * n;
+    Q81Block* qr = yq + std::size_t(blockIdx.x) * (n / Q8K);
+    if (threadIdx.x < SUM) {
+        float ss = 0.0f;
+        for (int i = threadIdx.x; i < n; i += SUM) {
+            float v = xr[i];
+            if (ar) xr[i] = v = __fadd_rn(v, ar[i]);
+            ss = __fmaf_rn(v, v, ss);
+        }
+        ss = warp_sum(ss);
+        if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = ss;
+    }
+    __syncthreads();
+    float sum = 0.0f;
+    for (int k = 0; k < SUM / WARP; ++k) sum = __fadd_rn(sum, part[k]);
+    const float scale = __fdiv_rn(1.0f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, float(n)), eps)));
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        const float xi = __fmul_rn(__fmul_rn(xr[i], scale), w[i]);
+        yr[i] = xi;
+        const float amax = warp_max(fabsf(xi));
+        const float bsum = warp_sum(xi);
+        const float d = q8_1_finite(amax / 127.0f);
+        const int8_t q = q8_1_quant(xi, d, amax);
+        qr[i / Q8K].qs[i % Q8K] = q;
+        if (i % Q8K == 0) qr[i / Q8K].ds = q8_1_ds(d, bsum);
+    }
+}
+template<int SUM>
+__launch_bounds__(1024, 1)
+__global__ void native_rms_norm_q8_1_rows_kernel(NormQ8RowsK rows, int n, float eps) {
+#pragma clang fp contract(off)
+    __shared__ float part[SUM / WARP];
+    const NormQ8Row& row = rows.r[blockIdx.y];
+    const float* xr = row.x + std::size_t(blockIdx.x) * n;
+    float* yr = row.y + std::size_t(blockIdx.x) * n;
+    Q81Block* qr = static_cast<Q81Block*>(row.y_q8_1) + std::size_t(blockIdx.x) * (n / Q8K);
+    if (threadIdx.x < SUM) {
+        float ss = 0.0f;
+        for (int i = threadIdx.x; i < n; i += SUM) {
+            const float v = xr[i];
+            ss = __fmaf_rn(v, v, ss);
+        }
+        ss = warp_sum(ss);
+        if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = ss;
+    }
+    __syncthreads();
+    float sum = 0.0f;
+    for (int k = 0; k < SUM / WARP; ++k) sum = __fadd_rn(sum, part[k]);
+    const float scale = 1.0f / sqrtf(sum / float(n) + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) {
+        float xi = xr[i] * scale * row.w[i];
+        yr[i] = xi;
+        const float amax = warp_max(fabsf(xi));
+        const float bsum = warp_sum(xi);
+        const float d = q8_1_finite(amax / 127.0f);
+        const int8_t q = q8_1_quant(xi, d, amax);
+        qr[i / Q8K].qs[i % Q8K] = q;
+        if (i % Q8K == 0) qr[i / Q8K].ds = q8_1_ds(d, bsum);
+    }
+}
+}  // namespace
+
+void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float* y, void* y_q8_1, int n, int rows,
+                              float eps, int threads, void* stream) {
+    validate_shape(n, 1);
+    validate_pointer(x);
+    validate_pointer(w);
+    validate_pointer(y);
+    validate_pointer(y_q8_1);
+    validate_stream(stream);
+    if (rows < 1) return;
+    const auto s = static_cast<cudaStream_t>(stream);
+    auto* q = static_cast<Q81Block*>(y_q8_1);
+    const int block = std::max(threads, std::min(1024, n));
+    switch (threads) {
+    case 128: native_add_rms_norm_q8_1_kernel<128><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
+    case 256: native_add_rms_norm_q8_1_kernel<256><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
+    case 512: native_add_rms_norm_q8_1_kernel<512><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
+    case 1024: native_add_rms_norm_q8_1_kernel<1024><<<rows, block, 0, s>>>(x, add, w, y, q, n, eps); break;
+    default: throw std::invalid_argument("native_add_rms_norm_q8_1: 128, 256, 512 or 1024 threads");
+    }
+    launch_check();
+}
+
+void native_rms_norm_q8_1_rows(const NormQ8Row* rows, int count, int n, int tokens, float eps, int threads,
+                               void* stream) {
+    validate_shape(n, 1);
+    if (count < 1 || count > 4) throw std::invalid_argument("native_rms_norm_q8_1_rows: 1 to 4 rows");
+    for (int i = 0; i < count; ++i) {
+        validate_pointer(rows[i].x);
+        validate_pointer(rows[i].w);
+        validate_pointer(rows[i].y);
+        validate_pointer(rows[i].y_q8_1);
+    }
+    validate_stream(stream);
+    if (tokens < 1) return;
+    const auto s = static_cast<cudaStream_t>(stream);
+    NormQ8RowsK rs{};
+    for (int i = 0; i < count; ++i) rs.r[i] = rows[i];
+    const int block = std::max(threads, std::min(1024, n));
+    switch (threads) {
+    case 128: native_rms_norm_q8_1_rows_kernel<128><<<dim3(tokens, count), block, 0, s>>>(rs, n, eps); break;
+    case 256: native_rms_norm_q8_1_rows_kernel<256><<<dim3(tokens, count), block, 0, s>>>(rs, n, eps); break;
+    case 512: native_rms_norm_q8_1_rows_kernel<512><<<dim3(tokens, count), block, 0, s>>>(rs, n, eps); break;
+    case 1024: native_rms_norm_q8_1_rows_kernel<1024><<<dim3(tokens, count), block, 0, s>>>(rs, n, eps); break;
+    default: throw std::invalid_argument("native_rms_norm_q8_1_rows: 128, 256, 512 or 1024 threads");
+    }
+    launch_check();
+}
+bool native_mmvq_slots_wide() { return false; }
+bool native_mmvq_slots(int, const MmvqSlots&, int, int, int, void*) { return false; }
+bool native_mmvq_ids_supported(int) { return false; }
+bool native_mmvq_ids(int, const MmvqIds&, int, int, int, void*) { return false; }
+bool native_mmvq_segments(int, const MmvqSegments&, int, void*) { return false; }
+bool native_q6_k_mmvq_warps(const void*, const void*, float*, int, int, void*) { return false; }
+bool native_q6_k_mmvq_warps_cols(const void*, const void*, float*, int, int, int, void*) { return false; }
+bool native_q8_0_mmvq_warps_cols(const void*, const void*, float*, int, int, int, void*) { return false; }
 
 } // namespace strata::kernels

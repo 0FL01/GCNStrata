@@ -186,6 +186,56 @@ void native_mmvq_il(int ggml_type, const void* weights, const void* x_q8_1, cons
 // The table's rows a warp (0, 1, 2, 4; 0 = native_mmvq's kernels) for a card of compute capability `cc` (major * 10 + minor).
 // Per-architecture tables plus STRATA_MMVQ_IL_ROWS; see native_mmvq.cu and docs/MMVQ_IL_TABLE.md.
 int native_mmvq_il_rows_for(int cc, int ggml_type, int ncols, int n_out);
+void native_add_rms_norm_q8_1(float* x, const float* add, const float* w, float* y, void* y_q8_1, int n, int rows,
+                              float eps, int threads, void* stream);
+
+/// Up to four rms_norm() + native_quantize_q8_1() pairs in one launch.
+struct NormQ8Row {
+    const float* x;
+    const float* w;
+    float* y;
+    void* y_q8_1;
+};
+void native_rms_norm_q8_1_rows(const NormQ8Row* rows, int count, int n, int tokens, float eps, int threads,
+                               void* stream);
+
+constexpr int kMmvqSlotsMax = 32;
+struct MmvqSlots {
+    const void* w[kMmvqSlotsMax];
+    const void* x[kMmvqSlotsMax];
+    float* y[kMmvqSlotsMax];
+};
+bool native_mmvq_slots(int ggml_type, const MmvqSlots& slots, int count, int n_in, int n_out, void* stream);
+bool native_mmvq_slots_wide();
+
+struct MmvqIds {
+    const void* const* table;
+    const int32_t* ids;
+    std::size_t offset;
+    const void* x;
+    std::size_t x_stride;
+    int x_every;
+    float* y;
+    std::size_t y_stride;
+};
+bool native_mmvq_ids_supported(int ggml_type);
+bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream);
+
+struct MmvqSegments {
+    static constexpr int kMost = 8;
+    int count = 0;
+    const void* w[kMost] = {};
+    const void* x[kMost] = {};
+    float* y[kMost] = {};
+    int rows[kMost] = {};
+};
+bool native_mmvq_segments(int ggml_type, const MmvqSegments& s, int n_in, void* stream);
+bool native_q6_k_mmvq_warps(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, void* stream);
+bool native_q6_k_mmvq_warps_cols(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                                 void* stream);
+bool native_q8_0_mmvq_warps_cols(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                                 void* stream);
+
 // Tests and benchmarks: every native_mmvq_il call takes `rows` a warp (0: the table).
 void native_mmvq_il_tune(int rows);
 

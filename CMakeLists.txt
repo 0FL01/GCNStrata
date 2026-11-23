@@ -2140,6 +2140,47 @@ if(STRATA_BUILD_TESTS)
   endif()
 endif()
 
+# ---- strata-poly (gfx906): Inkling-2-Mini + multi-arch GGUF engine ----
+if(STRATA_NATIVE_EXPERTS AND STRATA_HIP_GFX906)
+  if(NOT _strata_mmq)
+    if(STRATA_GGML_DIR)
+      set(_strata_gg ${STRATA_GGML_DIR}/ggml)
+    else()
+      set(_strata_gg ${strata_llamacpp_SOURCE_DIR}/ggml)
+    endif()
+    set(_strata_mmq ${_strata_gg}/src/ggml-cuda)
+  endif()
+  set(_strata_poly_mmq_instances "")
+  foreach(_t q4_0 q4_1 q5_0 q5_1 q8_0 q2_k q3_k q4_k q5_k q6_k iq1_s iq2_xxs iq2_xs iq2_s iq3_xxs iq3_s iq4_nl
+             iq4_xs mxfp4)
+    list(APPEND _strata_poly_mmq_instances ${_strata_mmq}/template-instances/mmq-instance-${_t}.cu)
+  endforeach()
+  add_library(strata_poly_mmq STATIC src/poly/mmq.cu src/poly/fattn.cu src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu
+              ${_strata_poly_mmq_instances})
+  target_include_directories(strata_poly_mmq PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq}
+                                                    ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_compile_definitions(strata_poly_mmq PRIVATE GGML_USE_HIP=1)
+  target_link_libraries(strata_poly_mmq PUBLIC ggml-base hip::host)
+
+  add_executable(strata-poly src/poly/main.cpp src/poly/engine.cpp src/poly/glm5next.cpp src/poly/qwen35.cpp
+                            src/poly/gemma4.cpp src/poly/deepseek4.cpp src/poly/lfm2moe.cpp src/poly/flint.cpp
+                            src/poly/kolibri1.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
+                            src/poly/spill.cpp src/core/conversation_memory.cpp
+                            src/poly/inkling2.cu src/poly/inkling_attend.cu src/poly/inkling_attend_lean.cu
+                            src/poly/inkling_attend_h2.cu src/poly/inkling_dspark.cu)
+  target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
+  target_compile_definitions(strata-poly PRIVATE STRATA_USE_HIP=1)
+  target_link_libraries(strata-poly PRIVATE strata_poly_mmq strata_kernels strata_spec ggml-cpu ggml-base
+                                           ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target}
+                                           Threads::Threads)
+
+  add_executable(poly_inkling_attend_test src/poly/inkling_attend_test.cu src/poly/inkling_attend.cu
+                 src/poly/inkling_attend_lean.cu src/poly/inkling_attend_h2.cu)
+  target_include_directories(poly_inkling_attend_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
+                                                             ${_strata_gpu_include_directories})
+  target_link_libraries(poly_inkling_attend_test PRIVATE ${_strata_gpu_runtime_target})
+endif()
+
 # ---- HIP gfx906: every CUDA source of the tree (and the ggml-cuda MMQ sources) is compiled as HIP ----
 if(STRATA_HIP_GFX906)
   file(GLOB_RECURSE _strata_cu CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.cu ${CMAKE_CURRENT_SOURCE_DIR}/bench/micro/*.cu

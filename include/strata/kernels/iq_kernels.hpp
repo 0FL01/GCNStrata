@@ -113,6 +113,7 @@ bool native_expert_expdec_takes(const NativeExpertLayout& L, bool& gu, bool& dow
 /// true selects the older kernels that decode it again per column (STRATA_OLD_IQ_MMVQ=1 at startup).  Both give
 /// bitwise the same results.  Set before graph capture; captured graphs keep the kernels they captured.
 void iq_set_old_kernels(bool old);
+void iq_set_slot_lanes(bool on);
 bool iq_old_kernels();
 
 }  // namespace strata::kernels

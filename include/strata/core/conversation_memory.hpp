@@ -64,6 +64,16 @@ std::optional<HostMemoryReading> sample_host_memory();
 
 std::optional<uint64_t> available_host_bytes();
 
+inline int64_t auto_conversation_cache_mib(std::optional<uint64_t> available, int64_t min_free_mib) {
+    if (!available) return 0;
+    const int64_t usable = (int64_t) (*available >> 20) - min_free_mib;
+    if (usable <= 0) return 0;
+    int64_t mib = usable * 2 / 5;
+    if (mib > 8192) mib = 8192;
+    mib -= mib % 256;
+    return mib >= 1024 ? mib : 0;
+}
+
 std::optional<uint64_t> conversation_mem_available(std::istream& meminfo);
 
 inline bool conversation_memory_admit(std::optional<uint64_t> available,

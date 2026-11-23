@@ -12,6 +12,7 @@
 #define cublasCreate hipblasCreate
 #define cublasDestroy hipblasDestroy
 #define cublasSetStream hipblasSetStream
+#define cublasGetStream hipblasGetStream
 #define cublasGemmEx hipblasGemmEx
 #define cublasSgemm hipblasSgemm
 #define cublasSgemmStridedBatched hipblasSgemmStridedBatched
@@ -19,6 +20,7 @@
 #define CUBLAS_OP_N HIPBLAS_OP_N
 #define CUBLAS_OP_T HIPBLAS_OP_T
 #define CUBLAS_GEMM_DEFAULT HIPBLAS_GEMM_DEFAULT
+#define CUBLAS_GEMM_DEFAULT_TENSOR_OP HIPBLAS_GEMM_DEFAULT
 #define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F
 #define CUDA_R_32F HIP_R_32F
 #define CUDA_R_16F HIP_R_16F

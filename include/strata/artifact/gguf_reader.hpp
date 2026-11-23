@@ -189,6 +189,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
         elems = 256;
         bytes = 98;
         return true;
+    case 19:   // IQ1_S
+        elems = 256;
+        bytes = 50;
+        return true;
     case 20:
         elems = 32;
         bytes = 18;
@@ -208,6 +212,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 29:   // IQ1_M
         elems = 256;
         bytes = 56;
+        return true;
+    case 26:   // I32
+        elems = 1;
+        bytes = 4;
         return true;
     case 24:   // I8: raw bytes (the FP8 PLE table of tools/ple_fp8_pack.py)
         elems = 1;
