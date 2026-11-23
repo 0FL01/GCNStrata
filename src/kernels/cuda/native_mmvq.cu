@@ -3522,13 +3522,129 @@ void native_rms_norm_q8_1_rows(const NormQ8Row* rows, int count, int n, int toke
     }
     launch_check();
 }
-bool native_mmvq_slots_wide() { return false; }
-bool native_mmvq_slots(int, const MmvqSlots&, int, int, int, void*) { return false; }
-bool native_mmvq_ids_supported(int) { return false; }
-bool native_mmvq_ids(int, const MmvqIds&, int, int, int, void*) { return false; }
-bool native_mmvq_segments(int, const MmvqSegments&, int, void*) { return false; }
+namespace {
+constexpr int kColWarps = 8, kColRows = 64;
+constexpr std::size_t kColsLds = 64 * 1024;
+
+template<int NC>
+__device__ __forceinline__ const Q81Block* stage_cols(const Q81Block* __restrict__ x, int xb, Q81Block* xs) {
+    const int* from = reinterpret_cast<const int*>(x);
+    int* to = reinterpret_cast<int*>(xs);
+    const int n = NC * xb * int(sizeof(Q81Block) / sizeof(int));
+    for (int i = int(threadIdx.y) * WARP + int(threadIdx.x); i < n; i += kColWarps * WARP) to[i] = from[i];
+    __syncthreads();
+    return xs;
+}
+
+template<int NC>
+__launch_bounds__(kColWarps * WARP, 1)
+__global__ void native_q8_0_warps_cols_kernel(const Q80Block* __restrict__ w, const Q81Block* __restrict__ x,
+                                              float* __restrict__ y, int n_in, int n_out) {
+    extern __shared__ Q81Block q8_cols_x[];
+    const int nb = n_in / 32, part = int(threadIdx.x) % 8, sub = int(threadIdx.x) / 8;
+    const Q81Block* xs = stage_cols<NC>(x, nb, q8_cols_x);
+    for (int r = int(threadIdx.y); r < kColRows; r += kColWarps) {
+        const int row = int(blockIdx.x) * kColRows + r;
+        if (row >= n_out) break;
+        const Q80Block* wr = w + std::size_t(row) * nb;
+        float s[NC] = {};
+        for (int kb = sub; kb < nb; kb += 4) {
+            const Q80Block* b = wr + kb;
+            const int v = load_int_b2(b->qs, part);
+            const float dw = __half2float(b->d);
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                const Q81Block* xc = xs + c * nb + kb;
+                const int u = reinterpret_cast<const int*>(xc->qs)[part];
+                s[c] += dw * __low2float(xc->ds) * float(STRATA_DP4A(v, u, 0));
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const float t = warp_sum(s[c]);
+            if (threadIdx.x == 0) y[std::size_t(c) * n_out + row] = t;
+        }
+    }
+}
+
+__launch_bounds__(4 * WARP, 1)
+__global__ void native_q8_0_segments_kernel(MmvqSegments s, int n_in) {
+    int row = int(blockIdx.x) * 4 + int(threadIdx.y);
+    int j = 0;
+    while (j < s.count && row >= s.rows[j]) row -= s.rows[j++];
+    if (j >= s.count) return;
+    const int nb = n_in / 32, part = int(threadIdx.x) % 8, sub = int(threadIdx.x) / 8;
+    const Q80Block* wr = static_cast<const Q80Block*>(s.w[j]) + std::size_t(row) * nb;
+    const Q81Block* x = static_cast<const Q81Block*>(s.x[j]);
+    float acc = 0.0f;
+    for (int kb = sub; kb < nb; kb += 4) {
+        const Q80Block* b = wr + kb;
+        const int v = load_int_b2(b->qs, part);
+        const int u = reinterpret_cast<const int*>(x[kb].qs)[part];
+        acc += __half2float(b->d) * __low2float(x[kb].ds) * float(STRATA_DP4A(v, u, 0));
+    }
+    acc = warp_sum(acc);
+    if (threadIdx.x == 0) s.y[j][row] = acc;
+}
+
+bool poly_slots_type_ok(int t) noexcept {
+    return t == 8 || t == 13 || t == 40 || t == 2 || t == 3 || t == 6 || t == 7 || t == 12 || t == 14 ||
+           t == 20 || t == 23 || t == 42 || t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29;
+}
+}  // namespace
+
+bool native_mmvq_slots_wide() { return true; }
+bool native_mmvq_slots(int ggml_type, const MmvqSlots& slots, int count, int n_in, int n_out, void* stream) {
+    if (!poly_slots_type_ok(ggml_type) || count < 1 || count > kMmvqSlotsMax || n_out <= 0) return false;
+    iq_mmvq_slots(ggml_type, slots, count, n_in, n_out, stream);
+    return true;
+}
+bool native_mmvq_ids_supported(int ggml_type) { return poly_slots_type_ok(ggml_type); }
+bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream) {
+    if (!poly_slots_type_ok(ggml_type) || count < 1 || count > 65535 || n_out <= 0 || ids.x_every < 1) return false;
+    iq_mmvq_ids(ggml_type, ids, count, n_in, n_out, stream);
+    return true;
+}
+bool native_mmvq_segments(int ggml_type, const MmvqSegments& s, int n_in, void* stream) {
+    if (ggml_type != 8 || s.count < 1 || s.count > MmvqSegments::kMost || n_in <= 0 || n_in % 128) return false;
+    int total_rows = 0;
+    for (int j = 0; j < s.count; ++j) {
+        if (s.rows[j] <= 0) return false;
+        total_rows += s.rows[j];
+    }
+    validate_stream(stream);
+    native_q8_0_segments_kernel<<<unsigned((total_rows + 3) / 4), dim3(WARP, 4), 0, static_cast<cudaStream_t>(stream)>>>(
+        s, n_in);
+    launch_check();
+    return true;
+}
 bool native_q6_k_mmvq_warps(const void*, const void*, float*, int, int, void*) { return false; }
 bool native_q6_k_mmvq_warps_cols(const void*, const void*, float*, int, int, int, void*) { return false; }
-bool native_q8_0_mmvq_warps_cols(const void*, const void*, float*, int, int, int, void*) { return false; }
+bool native_q8_0_mmvq_warps_cols(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                                 void* stream) {
+    const std::size_t lds = std::size_t(ncols) * (n_in / 32) * sizeof(Q81Block);
+    if (n_in <= 0 || n_in % 128 || n_out <= 0 || ncols < 1 || ncols > 8 || lds > kColsLds) return false;
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const cudaStream_t st = static_cast<cudaStream_t>(stream);
+    const unsigned blocks = unsigned((n_out + kColRows - 1) / kColRows);
+    const dim3 threads(WARP, kColWarps);
+    const auto* w = static_cast<const Q80Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    switch (ncols) {
+    case 1: native_q8_0_warps_cols_kernel<1><<<blocks, threads, lds, st>>>(w, x, y, n_in, n_out); break;
+    case 2: native_q8_0_warps_cols_kernel<2><<<blocks, threads, lds, st>>>(w, x, y, n_in, n_out); break;
+    case 3: native_q8_0_warps_cols_kernel<3><<<blocks, threads, lds, st>>>(w, x, y, n_in, n_out); break;
+    case 4: native_q8_0_warps_cols_kernel<4><<<blocks, threads, lds, st>>>(w, x, y, n_in, n_out); break;
+    case 5: native_q8_0_warps_cols_kernel<5><<<blocks, threads, lds, st>>>(w, x, y, n_in, n_out); break;
+    case 6: native_q8_0_warps_cols_kernel<6><<<blocks, threads, lds, st>>>(w, x, y, n_in, n_out); break;
+    case 7: native_q8_0_warps_cols_kernel<7><<<blocks, threads, lds, st>>>(w, x, y, n_in, n_out); break;
+    case 8: native_q8_0_warps_cols_kernel<8><<<blocks, threads, lds, st>>>(w, x, y, n_in, n_out); break;
+    }
+    launch_check();
+    return true;
+}
 
 } // namespace strata::kernels
