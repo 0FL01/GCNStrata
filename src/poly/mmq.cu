@@ -167,6 +167,15 @@ void Mmq::quantize(const float* x, const int32_t* ids, void* xq, int type, int64
     ck("mmq quantize");
 }
 
+#if defined(STRATA_HIP_GFX906)
+void Mmq::quantize_q4_scatter(const float* x, const int32_t* slot, void* xq, int64_t cols, int64_t tokens,
+                              int picks, void* stream) {
+    quantize_scatter_mmq_q8_1_cuda(x, slot, xq, GGML_TYPE_Q4_0, cols, cols, pad512(cols), tokens, tokens * picks, picks,
+                                   (cudaStream_t) stream);
+    ck("mmq quantize Q4 scatter");
+}
+#endif
+
 void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t stride, int n, const void* xq,
               const int32_t* bounds, const int32_t* ids, int64_t total_rows, int64_t max_rows, float* dst,
               int64_t ld_dst, void* stream) {

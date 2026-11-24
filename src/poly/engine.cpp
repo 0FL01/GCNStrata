@@ -4899,6 +4899,18 @@ void Engine::moe_rows(Layer& L, int il, int n) {
         bounds[n_group] = at;
     }
     const int rg = at;   // the card's rows
+#if defined(STRATA_HIP_GFX906)
+    static const bool want_scatter = [] {
+        const char* v = std::getenv("STRATA_TP2_PREFILL_Q4_SCATTER");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    // Every pick has a GPU row: the tok segment can hold the inverse map with no extra transfer.
+    const bool scatter_pack = want_scatter && opt_.tp == 2 && n >= 2047 && n <= 2048 && n_used_ == 8 &&
+                              n_embd_ == 2304 && n_ff_exp_ == 576 && L.gu_type == GGML_TYPE_Q4_0 && !L.mixed() &&
+                              n_round == 0 && n_cpu == 0 && rg == rr;
+#else
+    constexpr bool scatter_pack = false;
+#endif
     host_.clear();
     const ExpertScales es = expert_scales(L, d_ex_);
     for (int i = 0; i < rr; ++i) {
@@ -4915,7 +4927,8 @@ void Engine::moe_rows(Layer& L, int il, int n) {
             continue;
         }
         const int row = first_[e]++;
-        tok[row] = i / n_used_;
+        if (scatter_pack) tok[i] = row;
+        else tok[row] = i / n_used_;
         place[row] = i;
         h_ex_[row] = (int32_t) e;
     }
@@ -4960,6 +4973,10 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     // The card's part.  With the CPU's beside it, the rows of its experts' places are left at nothing.
     const auto card = [&] {
         if (n_cpu > 0) ck(cudaMemsetAsync(dx_, 0, (size_t) rr * n_embd_ * sizeof(float), cs(st_)), "expert rows");
+#if defined(STRATA_HIP_GFX906)
+        if (scatter_pack) Mmq::quantize_q4_scatter(xn_, d_tok, mq_, n_embd_, n, n_used_, st_);
+        else
+#endif
         if (rg > 0) Mmq::quantize(xn_, d_tok, mq_, gt, n_embd_, n_embd_, rg, st_);
         if (rg > 0 && L.mixed()) Mmq::quantize(xn_, d_tok, mqu_, ut, n_embd_, n_embd_, rg, st_);
 
