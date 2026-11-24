@@ -9,6 +9,7 @@
 #endif
 
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
 
@@ -314,8 +315,24 @@ void Tp2Comm::all_reduce(int rank, float* data, int n, void* stream) {
     f32_to_f16_kernel<<<blocks, 256, 0, cs(stream)>>>(data, reinterpret_cast<__half*>(dma_send_[rank]), n);
     ck(cudaStreamSynchronize(cs(stream)), "tp2 dma ready sync");
     host_barrier(rank);
-    ck(cudaMemcpyPeerAsync(dma_recv_[rank], dev_[rank], dma_send_[peer], dev_[peer],
-                           (size_t) n * sizeof(uint16_t), cs(stream)), "tp2 dma peer copy");
+#if defined(STRATA_HIP_GFX906)
+    static const bool use_push = [] {
+        const char* v = std::getenv("STRATA_TP2_PREFILL_PUSH");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    if (use_push && n >= 32 * 2304) {
+        // This rank's stream pushes its own send buffer. Both writes must finish before either rank sums,
+        // since our stream alone does not order the peer's write into our receive buffer.
+        ck(cudaMemcpyPeerAsync(dma_recv_[peer], dev_[peer], dma_send_[rank], dev_[rank],
+                               (size_t) n * sizeof(uint16_t), cs(stream)), "tp2 dma peer push");
+        ck(cudaStreamSynchronize(cs(stream)), "tp2 dma push sync");
+        host_barrier(rank);
+    } else
+#endif
+    {
+        ck(cudaMemcpyPeerAsync(dma_recv_[rank], dev_[rank], dma_send_[peer], dev_[peer],
+                               (size_t) n * sizeof(uint16_t), cs(stream)), "tp2 dma peer copy");
+    }
     sum_f16_pair_to_f32_kernel<<<blocks, 256, 0, cs(stream)>>>(
         data, reinterpret_cast<const __half*>(dma_send_[rank]), reinterpret_cast<const __half*>(dma_recv_[rank]), n);
     ck(cudaStreamSynchronize(cs(stream)), "tp2 dma done sync");
