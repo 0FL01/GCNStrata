@@ -22,10 +22,12 @@
 #include <climits>
 #include <cmath>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace strata::poly {
 namespace {
@@ -219,6 +221,7 @@ gemm_tile_kernel(const float* __restrict__ w, const float* __restrict__ x, float
 namespace small_gemm_2x2 {
 constexpr int SMALL_TOK = 16, SMALL_OUT = 32, SMALL_K = 64, SMALL_THREADS = 128;
 
+template <bool Vector>
 __global__ void __launch_bounds__(SMALL_THREADS)
 gemm_small_2x2_kernel(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int n_in, int n_out,
                   int rows) {
@@ -227,27 +230,44 @@ gemm_small_2x2_kernel(const float* __restrict__ w, const float* __restrict__ x, 
     const int t0 = blockIdx.x * SMALL_TOK, o0 = blockIdx.y * SMALL_OUT;
     const int tt = 2 * (threadIdx.x / 16), oo = 2 * (threadIdx.x % 16);
     // the next step's inputs and weights, read while this one is worked on
-    float xr[XS], wr[WS];
+    // Load adjacent K values together, but keep the same LDS layout and ascending-K FMA chain.
+    using Load = std::conditional_t<Vector, float4, float>;
+    constexpr int width = Vector ? 4 : 1;
+    Load xr[XS / width], wr[WS / width];
     const auto fetch = [&](int k0) {
-        for (int j = 0; j < XS; ++j) {
-            const int i = threadIdx.x + j * THREADS, t = t0 + i / SMALL_K, k = k0 + i % SMALL_K;
-            xr[j] = t < rows && k < n_in ? x[size_t(t) * n_in + k] : 0.0f;
+        for (int j = 0; j < XS / width; ++j) {
+            const int i = width * (threadIdx.x + j * THREADS), t = t0 + i / SMALL_K, k = k0 + i % SMALL_K;
+            if constexpr (Vector)
+                xr[j] = t < rows ? *reinterpret_cast<const float4*>(x + size_t(t) * n_in + k) : make_float4(0, 0, 0, 0);
+            else
+                xr[j] = t < rows && k < n_in ? x[size_t(t) * n_in + k] : 0.0f;
         }
-        for (int j = 0; j < WS; ++j) {
-            const int i = threadIdx.x + j * THREADS, o = o0 + i / SMALL_K, k = k0 + i % SMALL_K;
-            wr[j] = o < n_out && k < n_in ? w[size_t(o) * n_in + k] : 0.0f;
+        for (int j = 0; j < WS / width; ++j) {
+            const int i = width * (threadIdx.x + j * THREADS), o = o0 + i / SMALL_K, k = k0 + i % SMALL_K;
+            if constexpr (Vector)
+                wr[j] = o < n_out ? *reinterpret_cast<const float4*>(w + size_t(o) * n_in + k) : make_float4(0, 0, 0, 0);
+            else
+                wr[j] = o < n_out && k < n_in ? w[size_t(o) * n_in + k] : 0.0f;
         }
     };
     fetch(0);
     float acc00 = 0.0f, acc01 = 0.0f, acc10 = 0.0f, acc11 = 0.0f;
     for (int k0 = 0; k0 < n_in; k0 += SMALL_K) {
-        for (int j = 0; j < XS; ++j) {
-            const int i = threadIdx.x + j * THREADS;
-            sx[i / SMALL_K][i % SMALL_K] = xr[j];
+        const auto put = [](float* dst, Load value) {
+            if constexpr (Vector) {
+                dst[0] = value.x;
+                dst[1] = value.y;
+                dst[2] = value.z;
+                dst[3] = value.w;
+            } else dst[0] = value;
+        };
+        for (int j = 0; j < XS / width; ++j) {
+            const int i = width * (threadIdx.x + j * THREADS);
+            put(&sx[i / SMALL_K][i % SMALL_K], xr[j]);
         }
-        for (int j = 0; j < WS; ++j) {
-            const int i = threadIdx.x + j * THREADS;
-            sw[i / SMALL_K][i % SMALL_K] = wr[j];
+        for (int j = 0; j < WS / width; ++j) {
+            const int i = width * (threadIdx.x + j * THREADS);
+            put(&sw[i / SMALL_K][i % SMALL_K], wr[j]);
         }
         __syncthreads();
         if (k0 + SMALL_K < n_in) fetch(k0 + SMALL_K);
@@ -303,8 +323,19 @@ bool use(int n_in, int n_out, int rows) {
 }
 
 void launch(const float* w, const float* x, float* y, int n_in, int n_out, int rows, cudaStream_t stream) {
-    gemm_small_2x2_kernel<<<dim3((rows + SMALL_TOK - 1) / SMALL_TOK, (n_out + SMALL_OUT - 1) / SMALL_OUT),
-                            SMALL_THREADS, 0, stream>>>(w, x, y, n_in, n_out, rows);
+    const dim3 grid((rows + SMALL_TOK - 1) / SMALL_TOK, (n_out + SMALL_OUT - 1) / SMALL_OUT);
+#if defined(STRATA_HIP_GFX906)
+    static const bool vector = [] {
+        const char* value = std::getenv("STRATA_TP2_PREFILL_F32_VEC");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (vector && (rows == 2047 || rows == 2048) && n_in % SMALL_K == 0 &&
+        ((reinterpret_cast<std::uintptr_t>(w) | reinterpret_cast<std::uintptr_t>(x)) & 15) == 0) {
+        gemm_small_2x2_kernel<true><<<grid, SMALL_THREADS, 0, stream>>>(w, x, y, n_in, n_out, rows);
+        return;
+    }
+#endif
+    gemm_small_2x2_kernel<false><<<grid, SMALL_THREADS, 0, stream>>>(w, x, y, n_in, n_out, rows);
 }
 }  // namespace small_gemm_2x2
 #endif
