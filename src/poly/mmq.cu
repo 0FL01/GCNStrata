@@ -189,6 +189,21 @@ void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t st
     a.nsamples_y = 1;
     a.ncols_max = max_rows;
     a.ncols_opt = max_rows;
+#if defined(STRATA_HIP_GFX906)
+    // The fully resident Inkling-2-Mini TP2 prompt arm uses one dense projection per launch.
+    // Keep the real grid extent and change only the column count used to pick a tile.
+    if (t == GGML_TYPE_Q8_0 && n == 1 && !bounds && !ids && total_rows >= 2047 && total_rows <= 2048) {
+        static const bool tune = [] {
+            const char* v = std::getenv("STRATA_TP2_PREFILL_Q8_TILE");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        if (tune) {
+            if (w_cols == 2304 && w_rows == 512) a.ncols_opt = 48;
+            else if ((w_cols == 2304 && w_rows == 1536) || (w_cols == 1536 && w_rows == 2304))
+                a.ncols_opt = 64;
+        }
+    }
+#endif
 
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
