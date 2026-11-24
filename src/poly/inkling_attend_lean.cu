@@ -3,6 +3,7 @@
 // flash_kernel, and the default path keeps its code. The shared helpers are in inkling_flash_common.cuh.
 #include "inkling_attend_lean.hpp"
 #include "inkling_flash_common.cuh"
+#include "lean_lane_exchange_gfx906.cuh"
 
 #include <algorithm>
 #include <stdexcept>
@@ -10,6 +11,27 @@
 
 namespace strata::poly::inkling {
 namespace {
+
+template <bool Q8, int KvHeads, int X> __device__ __forceinline__ float lean_add(float v) {
+#if defined(__gfx906__)
+    if constexpr (Q8 && KvHeads == 4) return v + tp2_lean_xor<X>(v);
+#endif
+    return add_xor8<X>(v);
+}
+
+template <bool Q8, int KvHeads, int X> __device__ __forceinline__ float lean_max(float v) {
+#if defined(__gfx906__)
+    if constexpr (Q8 && KvHeads == 4) return fmaxf(v, tp2_lean_xor<X>(v));
+#endif
+    return max_xor8<X>(v);
+}
+
+template <bool Q8, int KvHeads> __device__ __forceinline__ float lean_prob(float v, int owner) {
+#if defined(__gfx906__)
+    if constexpr (Q8 && KvHeads == 4) return tp2_lean_broadcast(v, owner);
+#endif
+    return lean_broadcast8(v, owner);
+}
 
 template <bool Q8, int KvHeads>
 __global__ void __launch_bounds__(kFlashThreads)
@@ -91,9 +113,9 @@ flash_lean_kernel(const float* __restrict__ q, const float* __restrict__ rel, co
 #pragma unroll
                     for (int i = 0; i < kRelPart; ++i) score = fmaf(rr[r][i], tr[i], score);
                 }
-                score = add_xor8<1>(score);
-                score = add_xor8<2>(score);
-                score = add_xor8<4>(score);
+                score = lean_add<Q8, KvHeads, 1>(score);
+                score = lean_add<Q8, KvHeads, 2>(score);
+                score = lean_add<Q8, KvHeads, 4>(score);
                 const int64_t key = kb + c;
                 if (part == c % kSplit) s[r][c / kSplit] = Mask && (key < lo || key > p) ? -INFINITY : score;
             }
@@ -101,9 +123,9 @@ flash_lean_kernel(const float* __restrict__ q, const float* __restrict__ rel, co
 #pragma unroll
         for (int r = 0; r < kGroup; ++r) {
             float top = fmaxf(s[r][0], s[r][1]);
-            top = max_xor8<1>(top);
-            top = max_xor8<2>(top);
-            top = max_xor8<4>(top);
+            top = lean_max<Q8, KvHeads, 1>(top);
+            top = lean_max<Q8, KvHeads, 2>(top);
+            top = lean_max<Q8, KvHeads, 4>(top);
             const float mn = fmaxf(m[r], top), shrink = exp2f(m[r] - mn);
             m[r] = mn;
             l[r] *= shrink;
@@ -119,7 +141,7 @@ flash_lean_kernel(const float* __restrict__ q, const float* __restrict__ rel, co
             float prob[kGroup];
 #pragma unroll
             for (int r = 0; r < kGroup; ++r) {
-                prob[r] = lean_broadcast8(s[r][c / kSplit], c % kSplit);
+                prob[r] = lean_prob<Q8, KvHeads>(s[r][c / kSplit], c % kSplit);
                 sum[r] += prob[r];
             }
 #pragma unroll
