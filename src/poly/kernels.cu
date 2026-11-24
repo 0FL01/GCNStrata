@@ -270,6 +270,18 @@ gemm_small_2x2_kernel(const float* __restrict__ w, const float* __restrict__ x, 
 }
 
 bool use(int n_in, int n_out, int rows) {
+#if defined(STRATA_HIP_GFX906)
+    const bool router = n_in == 2304 && n_out == 128 && rows >= 512 && rows <= 2048;
+    const bool control = rows >= 2047 && rows <= 2048 &&
+                         ((n_in == 2304 && (n_out == 24 || n_out == 32 || n_out == 64)) ||
+                          (n_in == 4608 && n_out == 64));
+    if (!router && !control) return false;
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_TP2_PREFILL_F32_2X2");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+#else
     if (rows < 512 || !((n_in == 2304 && (n_out == 24 || n_out == 32 || n_out == 64)) ||
                         (n_in == 4608 && n_out == 64)))
         return false;
@@ -287,6 +299,7 @@ bool use(int n_in, int n_out, int rows) {
         return true;
     }();
     return enabled;
+#endif
 }
 
 void launch(const float* w, const float* x, float* y, int n_in, int n_out, int rows, cudaStream_t stream) {
