@@ -11,6 +11,10 @@
 #include <stdexcept>
 #include <string>
 
+#if defined(STRATA_HIP_GFX906)
+#include "mmq_q4_down_gfx906.cuh"
+#endif
+
 namespace strata::poly {
 
 #if STRATA_POLY_NVFP4 || STRATA_POLY_HIP_NVFP4
@@ -207,6 +211,13 @@ void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t st
 
     auto& ctx = *(ggml_backend_cuda_context*) ctx_;
     const cudaStream_t s = (cudaStream_t) stream;
+#if defined(STRATA_HIP_GFX906)
+    if ((t == GGML_TYPE_Q4_0 && try_q4_down_tail<GGML_TYPE_Q4_0>(a, s)) ||
+        (t == GGML_TYPE_Q4_1 && try_q4_down_tail<GGML_TYPE_Q4_1>(a, s))) {
+        ck("mmq Q4 down tail");
+        return;
+    }
+#endif
     switch (t) {
 #define X(T) case GGML_TYPE_##T: mul_mat_q_case<GGML_TYPE_##T>(ctx, a, s); break;
         STRATA_POLY_MMQ_TYPES(X)
