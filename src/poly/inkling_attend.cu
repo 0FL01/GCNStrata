@@ -628,7 +628,22 @@ __global__ void decode_kernel(const float* q, const float* rel, const float* tab
 // maximum, sum and values, and the four groups of a wave fold together at the end. Same output as decode_kernel
 // (decode_combine_kernel reads it), other sums.
 constexpr int kAttWaves = kKv, kAttThreads = 32 * kAttWaves, kAttUnroll = 2;
-template <int KvHeads = kKv>
+
+// Exchange inside each logical warp32, preserving the stock XOR sequence. The first two permutations
+// stay in a quad; the remaining masks affect only the low five bits of a gfx906 wave64 lane.
+template <int X, bool Dpp> __device__ __forceinline__ float decode_xor(float f) {
+#if defined(__gfx906__)
+    if constexpr (Dpp) {
+        const int bits = __builtin_bit_cast(int, f);
+        if constexpr (X == 1) return __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(bits, 0xb1, 15, 15, false));
+        if constexpr (X == 2) return __builtin_bit_cast(float, __builtin_amdgcn_mov_dpp(bits, 0x4e, 15, 15, false));
+        return __builtin_bit_cast(float, __builtin_amdgcn_ds_swizzle(bits, (X << 10) | 31));
+    }
+#endif
+    return __shfl_xor(f, X, 32);
+}
+
+template <int KvHeads = kKv, bool Dpp = false>
 __global__ void __launch_bounds__(32 * KvHeads, 2)
 decode_q8_kernel(const float* q, const float* rel, const float* table, KvView k, KvView v, int64_t pos, int window,
                  int ring, int chunk, float* part) {
@@ -705,9 +720,16 @@ decode_q8_kernel(const float* q, const float* rel, const float* table, KvView k,
                 for (int r = 0; r < kGroup; ++r) sc[r] += rr[r][0] * b0 + rr[r][1] * b1;
             }
 #pragma unroll
-            for (int r = 0; r < kGroup; ++r)
+            for (int r = 0; r < kGroup; ++r) {
+                if constexpr (Dpp) {
+                    sc[r] += decode_xor<4, true>(sc[r]);
+                    sc[r] += decode_xor<2, true>(sc[r]);
+                    sc[r] += decode_xor<1, true>(sc[r]);
+                } else {
 #pragma unroll
-                for (int o = 4; o > 0; o >>= 1) sc[r] += __shfl_xor(sc[r], o, 32);
+                    for (int o = 4; o > 0; o >>= 1) sc[r] += __shfl_xor(sc[r], o, 32);
+                }
+            }
             float val[16];
 #pragma unroll
             for (int x = 0; x < 4; ++x)
@@ -729,18 +751,18 @@ decode_q8_kernel(const float* q, const float* rel, const float* table, KvView k,
     // the wave's four groups of keys into one (lanes 8 and 16 apart hold the same dimensions)
 #pragma unroll
     for (int r = 0; r < kGroup; ++r) {
-        float top = fmaxf(m[r], __shfl_xor(m[r], 8, 32));
-        top = fmaxf(top, __shfl_xor(top, 16, 32));
+        float top = fmaxf(m[r], decode_xor<8, Dpp>(m[r]));
+        top = fmaxf(top, decode_xor<16, Dpp>(top));
         const float base = top == -INFINITY ? 0.f : top;
         const float f = expf(m[r] - base);
         float sum = l[r] * f;
-        sum += __shfl_xor(sum, 8, 32);
-        sum += __shfl_xor(sum, 16, 32);
+        sum += decode_xor<8, Dpp>(sum);
+        sum += decode_xor<16, Dpp>(sum);
 #pragma unroll
         for (int j = 0; j < 16; ++j) {
             float a = acc[r][j] * f;
-            a += __shfl_xor(a, 8, 32);
-            a += __shfl_xor(a, 16, 32);
+            a += decode_xor<8, Dpp>(a);
+            a += decode_xor<16, Dpp>(a);
             acc[r][j] = a;
         }
         m[r] = top;
@@ -844,6 +866,12 @@ size_t decode_floats() { return (size_t) kDecodeBlocks * kChunkFloats; }
 
 void attend_decode(const Attend& a, float* scratch, cudaStream_t st, void* q8) {
     if (a.n <= 0) return;
+#if defined(STRATA_HIP_GFX906)
+    static const bool dpp = [] {
+        const char* value = std::getenv("STRATA_INKLING_DECODE_DPP");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+#endif
     const auto run = [&]<int Kv>() {
         constexpr int Heads = Kv * kGroup;
         if (Kv * a.n > kDecodeBlocks) throw std::runtime_error("Inkling decode attention: too many rows");
@@ -855,8 +883,17 @@ void attend_decode(const Attend& a, float* scratch, cudaStream_t st, void* q8) {
             constexpr int kAttChunks = 128, kAttMin = 32, kStep = 4 * kAttUnroll;
             const int chunk = std::max(kAttMin, div_up(div_up(span, std::min(most, kAttChunks)), kStep) * kStep);
             chunks = div_up(span, chunk);
-            decode_q8_kernel<Kv><<<dim3(chunks, a.n), 32 * Kv, 0, st>>>(a.q, a.rel, a.table, a.k, a.v, a.pos, a.window,
-                                                                        a.ring, chunk, scratch);
+            const auto launch = [&]<bool Dpp>() {
+                decode_q8_kernel<Kv, Dpp><<<dim3(chunks, a.n), 32 * Kv, 0, st>>>(a.q, a.rel, a.table, a.k, a.v, a.pos,
+                                                                              a.window, a.ring, chunk, scratch);
+            };
+#if defined(STRATA_HIP_GFX906)
+            if constexpr (Kv == 4) {
+                if (dpp) launch.template operator()<true>();
+                else launch.template operator()<false>();
+            } else
+#endif
+                launch.template operator()<false>();
         } else {
             const int chunk = div_up(div_up(span, most), kThreads) * kThreads;
             const dim3 grid(div_up(span, chunk), Kv, a.n);
