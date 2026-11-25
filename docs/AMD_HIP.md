@@ -743,6 +743,12 @@ Its size per helper is 1088 bytes per configured context row plus about 18.9 MiB
 has its own stream dependencies and is still subject to the answer budget above. Smaller appends and
 sliding-window visits use the previous path. This prompt option is off by default.
 
+`STRATA_INKLING_FLASH_BALANCE=1` changes **only that split**, on four 60-CU devices. The helper
+computes 960 rows (60 whole query tiles × four KV groups = 240 CTAs), rather than 63/64 tiles.
+The owner takes the rest. On an MI50 the extra tiles can cost more than the extra owner work, since
+the helper must also receive the inputs and return its rows. Both paths use the same compiled Lean
+kernel, one-visit KV packet and stream dependencies. No persistent prefetch or decode policy change.
+
 `STRATA_INKLING_PREFILL_DEPTH_SHARE=1` is independent of decode. On two gfx906 cards, a 2047/2048-row prompt
 chunk can share one raw depth mix and its RMS between Q, K and V on the 20 sliding-window visits with messages.
 Each stream still runs its own message controller. Full-attention visits, other widths and verifier windows do not use it.

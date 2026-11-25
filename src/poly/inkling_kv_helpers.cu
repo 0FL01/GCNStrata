@@ -8,6 +8,9 @@
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -142,6 +145,7 @@ struct Mirror {
 
     Resources owner, helper;
     std::unique_ptr<Resources> bulk;
+    bool balance_flash = false;
     const int capacity;
     const hipStream_t model_stream;
     bool used = false, long_answer = false;
@@ -229,21 +233,36 @@ void enable_flash_rows(std::array<MirrorPtr, 2>& mirrors) {
     check(hipGetDevice(&device), "get bulk Flash setup device");
     RestoreDevice restore(device);
     std::array<std::unique_ptr<Resources>, 2> scratch;
+    const char* opt = std::getenv("STRATA_INKLING_FLASH_BALANCE");
+    bool balance = opt && !std::strcmp(opt, "1");
     for (int r : {0, 1}) {
+        if (balance) {
+            for (int dev : {mirrors[r]->owner.device, mirrors[r]->helper.device}) {
+                hipDeviceProp_t prop{};
+                check(hipGetDeviceProperties(&prop, dev), "query bulk Flash CU count");
+                balance &= prop.multiProcessorCount == 60;
+            }
+        }
         scratch[r] = std::make_unique<Resources>(mirrors[r]->helper.device);
         const size_t kv_bytes = size_t(mirrors[r]->capacity) * 2 * (kBulkCode + kBulkScale * sizeof(uint16_t));
         scratch[r]->init(kv_bytes / sizeof(Word) + kTableWords + kBulkHalf * (3 * kBulkQ + kBulkRel + kBulkHeads), false);
         check(hipSetDevice(mirrors[r]->owner.device), "select bulk Flash input device");
         check(hipEventCreateWithFlags(&mirrors[r]->owner.bulk_input, hipEventDisableTiming), "create bulk Flash input event");
     }
-    for (int r : {0, 1}) mirrors[r]->bulk = std::move(scratch[r]);
+    for (int r : {0, 1}) {
+        mirrors[r]->bulk = std::move(scratch[r]);
+        mirrors[r]->balance_flash = balance;
+    }
+    if (balance) std::fputs("strata-poly: STRATA_INKLING_FLASH_BALANCE=1: 60 bulk query tiles per helper\n", stderr);
 }
 
 bool try_flash_rows(Mirror& m, const Attend& a) {
     // Stay on the owners for small prompts and short appends: the full-prefix DMA would not pay back.
     if (!m.bulk || a.n < 2047 || a.n > 2048 || a.pos < 8192 || a.pos > m.capacity - a.n ||
         a.window || a.ring || a.kv_heads != kOwnerKvHeads || !a.k.scales || !a.v.scales) return false;
-    const int cut = (a.n / 32) * 16;  // unchanged complete 16-query CTAs, including the final ragged tile
+    // Four KV groups per tile. Use 240 helper CTAs instead of 252/256 on the measured 60-CU parts;
+    // the DMA and response belong to the helper's critical path, not the owner's tail.
+    const int cut = m.balance_flash ? 60 * 16 : (a.n / 32) * 16;
     auto& w = *m.bulk;
     RestoreDevice restore(m.owner.device);
     m.used = true;
