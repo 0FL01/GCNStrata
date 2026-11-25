@@ -67,7 +67,7 @@ private:
     int conv_floats_ = kConvFloats;
     std::shared_ptr<Tp2Comm> tp2_;
     std::unique_ptr<Inkling2> peer_;
-    enum class PeerCmd { kIdle, kRunVisits, kLogits, kKeepSnap, kReset, kStop };
+    enum class PeerCmd { kIdle, kRunVisits, kRunGpuVisits, kLogits, kKeepSnap, kReset, kStop };
     int tp2_vocab_lo_ = 0, tp2_vocab_n_ = 0;
     float *tp2_logits_half_ = nullptr, *tp2_logits_peer_ = nullptr;
     std::thread peer_thread_;
@@ -84,8 +84,26 @@ private:
     void stop_peer_thread();
     void peer_dispatch(PeerCmd cmd, int n = 0, size_t snap_idx = 0);
     void peer_wait();
-    void run_visits_local(int n);
+    void run_visits_local(int n, bool gpu_route = false);
+    void layer_head_impl(Layer& L, int il, int n, bool gpu_route);
     void load_moe_tp2(int il);
+
+#if defined(STRATA_HIP_GFX906)
+    static constexpr int kGpuRouteRows = 4;
+    struct GpuRouteReport {
+        int32_t invalid;
+        int32_t ids[kVisits * kGpuRouteRows * 8];
+    };
+    GpuRouteReport *gpu_route_dev_ = nullptr, *gpu_route_host_ = nullptr;
+    float *gpu_route_bias_ = nullptr, *gpu_route_gu_ = nullptr;
+    void* gpu_route_q8_ = nullptr;
+    bool gpu_route_failed_ = false;
+    bool gpu_route_supported() const;
+    bool gpu_decode_supported() const;
+    void init_gpu_route();
+    void gpu_route_moe(Layer& L, int il, int n);
+    void count_gpu_route(int n);
+#endif
 
     static constexpr bool local(int visit) { return visit % kBlock != kBlock - 1; }
     static constexpr int physical(int visit) {

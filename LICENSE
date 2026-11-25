@@ -2,6 +2,8 @@ MIT License
 
 Copyright (c) 2026 Niko1221 and the Strata contributors
 
+Portions of src/poly/inkling_expf_gfx906.cuh: Copyright (c) 2017-2026, Arm Limited.
+
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
 in the Software without restriction, including without limitation the rights

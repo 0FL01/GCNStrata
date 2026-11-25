@@ -19,6 +19,14 @@
 #include <cstring>
 #include <stdexcept>
 
+#if defined(STRATA_HIP_GFX906)
+#include "inkling_route_gfx906.cuh"
+#include <cfenv>
+#if defined(__x86_64__) && defined(__GLIBC__)
+#include <xmmintrin.h>
+#endif
+#endif
+
 namespace strata::poly {
 namespace {
 
@@ -32,6 +40,38 @@ constexpr int kRowWidth = 2304;   // Inkling2::kWidth, for the kernels that keep
 constexpr int kKvWidth = 1024;    // Inkling2::kKey
 constexpr int kValueTile = 128;
 int div_up(int a, int b) { return (a + b - 1) / b; }
+
+#if defined(STRATA_HIP_GFX906)
+bool gpu_route_host_fp() {
+#if defined(__x86_64__) && defined(__GLIBC__)
+    // Match the x86 glibc FMA expf, with nearest rounding and no FTZ or DAZ on the CPU.
+    return __builtin_cpu_supports("fma") && std::fegetround() == FE_TONEAREST &&
+           (_mm_getcsr() & 0xe040u) == 0;
+#else
+    return false;
+#endif
+}
+
+bool gpu_route_host_expf() {
+    if (!gpu_route_host_fp()) return false;
+    // These inputs distinguish the dispatched x86 FMA expf from the unfused one (e.g. FMA disabled by a libc
+    // tunable), so check the actual libm used by route(), not just the processor's capability.
+    const volatile float x = -0x1.f8cbb2p+5f, y = 0x1.04845ep+5f;
+    return std::exp(x) == 0x1.f45326p-92f && std::exp(y) == 0x1.f93e38p+46f;
+}
+
+__global__ void gpu_route_sum(const float* down, const float* weight, float* fo, int width) {
+    const int col = (int) blockIdx.x * (int) blockDim.x + (int) threadIdx.x;
+    if (col >= width) return;
+    const int row = (int) blockIdx.y, first = row * inkling_route::kPicks;
+    const int at = row * width + col;
+    float sum = fo[at];
+    // Same starting value, order and multiply-add expression as add_scaled().
+    for (int k = 0; k < inkling_route::kPicks; ++k)
+        sum = sum + down[(first + k) * width + col] * weight[first + k];
+    fo[at] = sum;
+}
+#endif
 
 template <bool Maximum> __device__ float wave_reduce(float x) {
     for (int d = 16; d > 0; d /= 2) {
@@ -788,6 +828,23 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
     r0->load(o0);
     ck(cudaSetDevice(1), "tp2 setDevice 1");
     r1->load(o1);
+#if defined(STRATA_HIP_GFX906)
+    const char* want = std::getenv("STRATA_INKLING_GPU_ROUTE");
+    if (want && !std::strcmp(want, "1")) {
+        const bool decode = Tp2Comm::small_push_enabled() && gpu_route_host_expf() &&
+                            r0->gpu_route_supported() && r1->gpu_route_supported() &&
+                            r0->gpu_decode_supported() && r1->gpu_decode_supported();
+        if (decode) {
+            r1->init_gpu_route();
+            ck(cudaSetDevice(0), "tp2 setDevice 0");
+            r0->init_gpu_route();
+            std::fputs("strata-poly: STRATA_INKLING_GPU_ROUTE=1: exact GPU routing for TP2 T=1..4\n", stderr);
+        } else {
+            std::fputs("strata-poly: STRATA_INKLING_GPU_ROUTE=1 unavailable (needs FP32 small push, fully resident "
+                       "Q4 TP2 decode and default x86 glibc FMA FP mode)\n", stderr);
+        }
+    }
+#endif
     ck(cudaSetDevice(0), "tp2 setDevice 0");
     r0->peer_ = std::move(r1);
     r0->start_peer_thread();
@@ -830,14 +887,14 @@ void Inkling2::start_peer_thread() {
             if (cmd == PeerCmd::kStop) break;
             std::exception_ptr err;
             try {
-                if (cmd == PeerCmd::kRunVisits) {
+                if (cmd == PeerCmd::kRunVisits || cmd == PeerCmd::kRunGpuVisits) {
                     peer_->pos_ = pos_;
                     peer_->windowed_ = windowed_;
                     peer_->snap_bits_ = snap_bits_;
                     peer_->snap_at_ = windowed_ && snap_bits_ ? peer_->snap_ + (snap_at_ - snap_) : nullptr;
                     peer_->cover(pos_ + n);
                     tp2_->broadcast_from_0(1, peer_->r_, n * kWidth, peer_->st_);
-                    peer_->run_visits_local(n);
+                    peer_->run_visits_local(n, cmd == PeerCmd::kRunGpuVisits);
                 } else if (cmd == PeerCmd::kLogits) {
                     tp2_->broadcast_from_0(1, peer_->xn_, n * kWidth, peer_->st_);
                     peer_->lin(peer_->output_, peer_->xn_, peer_->tp2_logits_half_, n);
@@ -918,6 +975,97 @@ void Inkling2::on_loaded() {
         for (auto& v : tp2_exp_down_) { v.clear(); v.shrink_to_fit(); }
     }
 }
+
+#if defined(STRATA_HIP_GFX906)
+bool Inkling2::gpu_route_supported() const {
+    using namespace inkling_route;
+    if (!all_cached() || !opt_.gpu_experts || opt_.dump || opt_.cache_bias != 0.f || expert_scale_ != 8.f ||
+        n_layer_ != kPhysical || lo_ != 0 || hi_ != n_layer_ ||
+        n_embd_ != kWidth || n_ff_exp_ != 576 || n_expert_ != kExperts || n_used_ != kPicks)
+        return false;
+    cudaDeviceProp props{};
+    ck(cudaGetDeviceProperties(&props, device_), "Inkling GPU route device properties");
+    if (!kernels::gfx_arch_is(props.gcnArchName, "gfx906")) return false;
+    for (int il = 0; il < n_layer_; ++il) {
+        const Layer& L = layers_[il];
+        const auto& bias = blocks_[il].bias;
+        if (!L.moe || L.gate_inp.type != kTypeF32 || bias.size() != kExperts ||
+            std::any_of(bias.begin(), bias.end(), [](float x) { return !std::isfinite(x); }))
+            return false;
+    }
+    return true;
+}
+
+bool Inkling2::gpu_decode_supported() const {
+    using namespace inkling_route;
+    if (!decode_ || !situ_q8_ || moe_tail_ || !(situ_.beta > 0.f) || prefetch_k_ > 0) return false;
+    const auto q4 = [](uint32_t type) { return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1; };
+    for (int il = 0; il < n_layer_; ++il) {
+        const Layer& L = layers_[il];
+        if (L.mixed() || L.gu_bytes != L.u_bytes || !q4(L.gu_type) || !q4(L.d_type) ||
+            L.gu_bytes != (size_t) n_ff_exp_ * ggml_row_size((ggml_type) L.gu_type, n_embd_) ||
+            L.d_bytes != (size_t) n_embd_ * ggml_row_size((ggml_type) L.d_type, n_ff_exp_) ||
+            !L.h_s_gate.empty() || !L.h_s_up.empty() || !L.h_s_down.empty() ||
+            L.slot.size() != kExperts || std::any_of(L.slot.begin(), L.slot.end(), [](auto p) { return !p; }))
+            return false;
+    }
+    return true;
+}
+
+void Inkling2::init_gpu_route() {
+    using namespace inkling_route;
+    std::vector<float> bias;
+    bias.reserve((size_t) kPhysical * kExperts);
+    for (const Block& b : blocks_) bias.insert(bias.end(), b.bias.begin(), b.bias.end());
+    gpu_route_bias_ = (float*) dmalloc(bias.size() * sizeof(float), "Inkling GPU route bias");
+    ck(cudaMemcpy(gpu_route_bias_, bias.data(), bias.size() * sizeof(float), cudaMemcpyHostToDevice),
+       "Inkling GPU route bias");
+    static_assert(kPicks == 8 && kGpuRouteRows * kPicks <= kSumRows);
+    const int rr = std::min(rows_, kGpuRouteRows) * kPicks;
+    if (!d_slots_)
+        d_slots_ = (void**) dmalloc((size_t) n_layer_ * kExperts * sizeof(void*), "Inkling GPU route slots");
+    if (!d_wts_) d_wts_ = (float*) dmalloc((size_t) rr * sizeof(float), "Inkling GPU route weights");
+    gpu_route_dev_ = (GpuRouteReport*) dmalloc(sizeof(GpuRouteReport), "Inkling GPU route picks");
+    gpu_route_host_ = (GpuRouteReport*) hmalloc(sizeof(GpuRouteReport), "Inkling GPU route report");
+    gpu_route_gu_ = (float*) dmalloc((size_t) rr * 2 * n_ff_exp_ * sizeof(float), "Inkling GPU route gate/up");
+    gpu_route_q8_ = dmalloc((size_t) rr * kernels::native_q8_1_bytes(n_ff_exp_), "Inkling GPU route activation Q8_1");
+    if (!card_moe(1)) throw std::logic_error("Inkling GPU route could not initialize resident slots");
+}
+
+void Inkling2::gpu_route_moe(Layer& L, int il, int n) {
+    using namespace inkling_route;
+    const int rr = n * kPicks;
+    int32_t* ids = gpu_route_dev_->ids + visit_ * rr;
+    const void* const* table = d_slots_ + (size_t) il * kExperts;
+    select(rl_, gpu_route_bias_ + il * kExperts, expert_scale_, ids, d_wts_, n, &gpu_route_dev_->invalid, st_);
+    const size_t ff = (size_t) n_ff_exp_;
+    const kernels::MmvqIds gu{table, ids, 0, xq_, kernels::native_q8_1_bytes(n_embd_), kPicks, gpu_route_gu_, 2 * ff};
+    if (!kernels::native_mmvq_ids((int) L.gu_type, gu, rr, n_embd_, 2 * n_ff_exp_, st_))
+        throw std::logic_error("Inkling GPU route gate/up MMVQ rejected a validated shape");
+    situ_rows_q8_1(gpu_route_gu_, gpu_route_q8_, n_ff_exp_, rr, situ_.beta, situ_.linear_beta, st_, expert_scales(L, ids));
+    const kernels::MmvqIds down{table, ids, L.gu2(), gpu_route_q8_, kernels::native_q8_1_bytes(n_ff_exp_),
+                               1, d_, (size_t) n_embd_};
+    if (!kernels::native_mmvq_ids((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_))
+        throw std::logic_error("Inkling GPU route down MMVQ rejected a validated shape");
+    gpu_route_sum<<<dim3(div_up(n_embd_, 256), n), 256, 0, cs(st_)>>>(d_, d_wts_, fo_, n_embd_);
+    ck(cudaGetLastError(), "Inkling GPU route sum");
+}
+
+void Inkling2::count_gpu_route(int n) {
+    // Count each visit (including repeat visits to a physical block), just as the stock route does. Keep the
+    // compact picks on the GPU throughout the call; the single validation copy supplies the usage counts too.
+    const int rr = n * inkling_route::kPicks;
+    for (int visit = 0; visit < kVisits; ++visit) {
+        const int il = physical(visit);
+        for (int p = 0; p < rr; ++p) {
+            const size_t i = (size_t) il * n_expert_ + gpu_route_host_->ids[visit * rr + p];
+            ++use_[i];
+            if (n_swap_ > 0) recent_[i] += use_weight(il);
+        }
+    }
+    stats_.gpu_experts += kVisits * rr;
+}
+#endif
 
 void Inkling2::on_reset() {
     if (!peer_) return;
@@ -1319,6 +1467,9 @@ void Inkling2::alloc_caches() {
 }
 
 void Inkling2::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
+#if defined(STRATA_HIP_GFX906)
+    if (gpu_route_failed_) throw std::runtime_error("cannot save rows from a failed Inkling GPU route");
+#endif
     if (first < 0 || n < 0 || first + n > opt_.max_context) throw std::logic_error("save_rows: outside context");
     if (!n) return;
     ck(cudaStreamSynchronize(cs(st_)), "save Inkling rows");
@@ -1413,6 +1564,9 @@ void Inkling2::ds_ring(int l, int64_t pos, const uint8_t* src, uint8_t* dst) {
 }
 
 void Inkling2::save_card_state(uint8_t* dst) {
+#if defined(STRATA_HIP_GFX906)
+    if (gpu_route_failed_) throw std::runtime_error("cannot save state from a failed Inkling GPU route");
+#endif
     static const bool pack = [] {
         const char* p = std::getenv("STRATA_INKLING_STATE_PACK");
         return p && p[0] == '1' && p[1] == '\0';
@@ -1779,6 +1933,15 @@ bool Inkling2::heads(const Block& b, int il, bool swa, bool loop, int n, const D
 }
 
 void Inkling2::run_visits(int n) {
+#if defined(STRATA_HIP_GFX906)
+    if (gpu_route_failed_) throw std::runtime_error("Inkling GPU route failed; reopen the TP2 engine");
+    if (gpu_route_dev_ && (!all_cached() || !peer_->all_cached()))
+        throw std::runtime_error("Inkling GPU route lost TP2 residency; reopen the engine");
+    const bool gpu_route = gpu_route_dev_ && n >= 1 && n <= kGpuRouteRows && n <= rows_ &&
+                           n <= peer_->rows_ && !block_pass_ && gpu_route_host_fp();
+#else
+    constexpr bool gpu_route = false;
+#endif
     // Engine::input already put the projected patches in r_. Only token embeddings take the learned norm.
     const auto norm_text = [&](int first, int count) {
         const size_t at = (size_t) first * kWidth;
@@ -1799,27 +1962,55 @@ void Inkling2::run_visits(int n) {
         ~Lanes() { kernels::iq_set_slot_lanes(false); }
     } lanes;
     if (peer_) {
-        peer_dispatch(PeerCmd::kRunVisits, n);
+        peer_dispatch(gpu_route ? PeerCmd::kRunGpuVisits : PeerCmd::kRunVisits, n);
         try {
             tp2_->broadcast_from_0(0, r_, n * kWidth, st_);
-            run_visits_local(n);
+            run_visits_local(n, gpu_route);
+#if defined(STRATA_HIP_GFX906)
+            if (gpu_route) {
+                peer_wait();
+                if (gpu_route_host_->invalid || peer_->gpu_route_host_->invalid)
+                    throw std::runtime_error("Inkling GPU route found invalid routing data; call rejected; reopen the engine");
+                count_gpu_route(n);
+                peer_->count_gpu_route(n);
+            }
+#endif
         } catch (const std::exception& e) {
+#if defined(STRATA_HIP_GFX906)
+            if (gpu_route) {
+                gpu_route_failed_ = true;
+                win_ = 0;  // no previous verifier result can be kept after provisional state was overwritten
+            }
+#endif
             std::fprintf(stderr, "strata-poly: TP2 rank0 exception: %s\n", e.what());
             tp2_->abort_barrier();
             peer_wait();
             throw;
         } catch (...) {
+#if defined(STRATA_HIP_GFX906)
+            if (gpu_route) {
+                gpu_route_failed_ = true;
+                win_ = 0;
+            }
+#endif
             tp2_->abort_barrier();
             peer_wait();
             throw;
         }
-        peer_wait();
+        if (!gpu_route) peer_wait();
     } else {
         run_visits_local(n);
     }
 }
 
-void Inkling2::run_visits_local(int n) {
+void Inkling2::run_visits_local(int n, [[maybe_unused]] bool gpu_route) {
+#if defined(STRATA_HIP_GFX906)
+    if (gpu_route) {
+        // Reuse the engine's slot table with its ordinary upload-on-change guard, never a second frozen map.
+        if (!card_moe(n)) throw std::logic_error("Inkling GPU route resident slot table unavailable");
+        zero_vram(&gpu_route_dev_->invalid, sizeof(gpu_route_dev_->invalid));
+    }
+#endif
     fo_clean_ = false;   // fo_ is what the last call left
     depth_n_ = 0;
     for (visit_ = 0; visit_ < kVisits; ++visit_) {
@@ -1837,11 +2028,32 @@ void Inkling2::run_visits_local(int n) {
                     ck(cudaMemcpyAsync(ds_taps_ + (size_t) j * rows_ * kWidth, r_, (size_t) n * kWidth * sizeof(float),
                                        cudaMemcpyDeviceToDevice, cs(st_)),
                        "DSpark taps");
-        layer(physical(visit_), n);
+        const int il = physical(visit_);
+#if defined(STRATA_HIP_GFX906)
+        if (gpu_route) {
+            Layer& L = layers_[il];
+            layer_head_impl(L, il, n, true);
+            moe_shared(L, il, n);
+            gpu_route_moe(L, il, n);
+            layer_tail(L, il, n);
+            continue;
+        }
+#endif
+        layer(il, n);
     }
+#if defined(STRATA_HIP_GFX906)
+    if (gpu_route) {
+        const size_t bytes = offsetof(GpuRouteReport, ids) + (size_t) kVisits * n * inkling_route::kPicks * sizeof(int32_t);
+        ck(cudaMemcpyAsync(gpu_route_host_, gpu_route_dev_, bytes, cudaMemcpyDeviceToHost, cs(st_)),
+           "Inkling GPU route report");
+        ck(cudaStreamSynchronize(cs(st_)), "Inkling GPU route ready");
+    }
+#endif
 }
 
-void Inkling2::layer_head(Layer& L, int il, int n) {
+void Inkling2::layer_head(Layer& L, int il, int n) { layer_head_impl(L, il, n, false); }
+
+void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
     const Block& b = blocks_[il];
     // STRATA_INKLING_TAIL_MOE: this visit's cached experts wait in tail_sum_ for the tail launch, or fo_ holds
     // their add_scaled() sums as before.  One token only: the record carries no rows.  Every visit starts fresh.
@@ -1959,7 +2171,9 @@ void Inkling2::layer_head(Layer& L, int il, int n) {
     kernels::native_add_rms_norm_q8_1(cur_, nullptr, fp(L.ffn_norm), xn_, xq_, kWidth, n, rms_eps_, 128, st_);
     // with STRATA_INKLING_ROUTE_DUAL and one token, the router's gemv below also writes the host h_rl_ and h_x_,
     // and moe_router() launches no copy2 for them
-    if (!batched(L, n)) moe_router(L, n);
+    // The dual-store variant uses the same GEMV dot product, but its host copies are only needed by stock moe().
+    if (gpu_route) lin(L.gate_inp, xn_, rl_, n, xq_);
+    else if (!batched(L, n)) moe_router(L, n);
 }
 
 bool Inkling2::fused(int n) const { return decode_ && n < kStageRows; }
