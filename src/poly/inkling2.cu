@@ -4,6 +4,7 @@
 
 #include "inkling_attend.hpp"
 #include "inkling_dspark.hpp"
+#include "inkling_swa_layout.hpp"
 #include "runtime.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -42,6 +43,25 @@ constexpr int kValueTile = 128;
 int div_up(int a, int b) { return (a + b - 1) / b; }
 
 #if defined(STRATA_HIP_GFX906)
+static_assert(sizeof(uint4) == inkling::kSwaCopyAlign && alignof(uint4) <= inkling::kSwaCopyAlign);
+struct SwaCopyPlanes {
+    uint4* ring[4];
+    uint4* stage[4];
+    int stride[4];   // uint4 vectors per row
+};
+
+template <bool Gather>
+__global__ void swa_copy_kernel(SwaCopyPlanes p, int ring, int ring_head, int stage_head, int rows) {
+    const int j = blockIdx.y, stride = p.stride[j], i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * stride) return;
+    const int row = i / stride;
+    int slot = ring_head + row;
+    if (slot >= ring) slot -= ring;   // this copy visits at most one whole ring
+    const int src = slot * stride + i - row * stride, dst = stage_head * stride + i;
+    if constexpr (Gather) p.stage[j][dst] = p.ring[j][src];
+    else p.ring[j][src] = p.stage[j][dst];
+}
+
 bool gpu_route_host_fp() {
 #if defined(__x86_64__) && defined(__GLIBC__)
     // Match the x86 glibc FMA expf, with nearest rounding and no FTZ or DAZ on the CPU.
@@ -838,6 +858,23 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
     o1.draft_model.clear();
     if (o.draft && !o.draft_model.empty()) o1.window = o.window > 0 ? std::min(o.window, kDsBlock) : kDsBlock;
 
+#if defined(STRATA_HIP_GFX906)
+    const char* compact = std::getenv("STRATA_INKLING_COMPACT_SWA");
+    if (compact && std::strcmp(compact, "1") == 0) {
+        const auto gfx906 = [](int device) {
+            cudaDeviceProp props{};
+            return cudaGetDeviceProperties(&props, device) == cudaSuccess && props.warpSize == 64 &&
+                   kernels::gfx_arch_is(props.gcnArchName, "gfx906");
+        };
+        // Match the resident production TP2 path, not growing-VMM expert/cache policy.
+        const bool supported = o.kv_format == KvFmt::kQ8_0 && !o.kv_grow && !o.dump &&
+                               gfx906(r0->device_) && gfx906(r1->device_);
+        r0->compact_swa_asked_ = r1->compact_swa_asked_ = supported;
+        if (!supported)
+            std::fputs("strata-poly: STRATA_INKLING_COMPACT_SWA=1 requires two gfx906 owners, Q8_0 --kv-whole "
+                       "and no layer dump; using stock rings\n", stderr);
+    }
+#endif
     ck(cudaSetDevice(0), "tp2 setDevice 0");
     r0->load(o0);
     ck(cudaSetDevice(1), "tp2 setDevice 1");
@@ -1532,8 +1569,25 @@ size_t Inkling2::card_row_bytes() const {
 }
 
 void Inkling2::alloc_caches() {
+    constexpr int local_visits = kVisits - kVisits / kBlock;
     ring_ = std::min(opt_.max_context, kWindow + rows_ - 1);
-    auto* rings = (uint8_t*) seq_alloc((size_t) (kVisits - kVisits / kBlock) * ring_ * kv_bytes(), "Inkling SWA KV");
+#if defined(STRATA_HIP_GFX906)
+    if (compact_swa_asked_) {
+        const auto plan = inkling::plan_swa(opt_.max_context, kWindow, rows_, std::min(opt_.window, rows_),
+                                            local_visits, kv_bytes(), (size_t) rows_ * kWidth * sizeof(float),
+                                            tp_size_ == 2 && n_key_ == 512 && q8());
+        if (plan.stage_rows)
+            std::fprintf(stderr, "strata-poly: STRATA_INKLING_COMPACT_SWA=1 rank %d: %d -> %d rows per SWA visit; "
+                         "%zu-byte borrowed stage, %zu bytes saved\n", tp_rank_, ring_, plan.ring_rows,
+                         (size_t) plan.stage_rows * kv_bytes(), plan.saved_bytes);
+        else
+            std::fprintf(stderr, "strata-poly: STRATA_INKLING_COMPACT_SWA=1 rank %d: no borrowable savings; "
+                         "using stock rings\n", tp_rank_);
+        ring_ = plan.ring_rows;
+        swa_stage_rows_ = plan.stage_rows;
+    }
+#endif
+    auto* rings = (uint8_t*) seq_alloc((size_t) local_visits * ring_ * kv_bytes(), "Inkling SWA KV");
     const size_t wide = n_key_ * (q8() ? 1 : sizeof(uint16_t));
     const size_t scale = q8() ? n_key_ / 32 * sizeof(uint16_t) : 0;
     for (int i = 0; i < kVisits; ++i) {
@@ -1630,7 +1684,8 @@ void Inkling2::ring_state(int visit, int64_t pos, const uint8_t* src, uint8_t* d
     for (const auto& p : caches_[visit].planes) if (p.stride) {
         if (dst) std::memset(dst, 0, (size_t) (keep - (pos - first)) * p.stride);
         for (int64_t i = first; i < pos;) {
-            const int64_t at = i % ring_, n = std::min(pos - i, ring_ - at);
+            // Saved images are chronological plane bytes, independent of the allocation's modulus.
+            const auto [at, n] = inkling::swa_ring_span(i, pos, ring_);
             const size_t off = (size_t) (i - (pos - keep)) * p.stride, bytes = (size_t) n * p.stride;
             if (dst) ck(cudaMemcpy(dst + off, p.data + at * p.stride, bytes, cudaMemcpyDeviceToHost), "save Inkling SWA");
             else ck(cudaMemcpy(p.data + at * p.stride, src + off, bytes, cudaMemcpyHostToDevice), "load Inkling SWA");
@@ -1901,17 +1956,71 @@ void Inkling2::store(const float* x, Cache& c, int side, int n) {
     }
 }
 
+#if defined(STRATA_HIP_GFX906)
+void Inkling2::copy_swa(const Cache& live, const Cache& stage, int ring_head, int stage_head, int n, bool gather) {
+    if (!n) return;
+    SwaCopyPlanes p{};
+    for (int j = 0; j < 4; ++j) {
+        p.ring[j] = reinterpret_cast<uint4*>(live.planes[j].data);
+        p.stage[j] = reinterpret_cast<uint4*>(stage.planes[j].data);
+        p.stride[j] = (int) (live.planes[j].stride / sizeof(uint4));
+    }
+    const dim3 grid(div_up(n * p.stride[0], kThreads), 4);
+    if (gather) swa_copy_kernel<true><<<grid, kThreads, 0, cs(st_)>>>(p, ring_, ring_head, stage_head, n);
+    else swa_copy_kernel<false><<<grid, kThreads, 0, cs(st_)>>>(p, ring_, ring_head, stage_head, n);
+    ck(cudaGetLastError(), gather ? "gather Inkling SWA history" : "commit Inkling SWA rows");
+}
+#endif
+
 void Inkling2::attention(const Block& b, int n) {
-    Cache& c = caches_[visit_];
+    Cache& live = caches_[visit_];
     const bool swa = local(visit_);
+    int64_t pos = pos_;
+    int ring = swa ? ring_ : 0;
+    Cache* selected = &live;
+#if defined(STRATA_HIP_GFX906)
+    Cache stage;
+    inkling::SwaStageLayout layout;
+    if (swa && swa_stage_rows_ && pos_ + n > ring_) {
+        layout = inkling::swa_stage_layout(pos_, kWindow);
+        if (!layout.fits_ring(n, ring_)) {
+            // No verifier needs the wide path; a staged commit cannot preserve arbitrary rejected tails.
+            if (windowed_ || kv_stored_ || layout.append() + n > swa_stage_rows_)
+                throw std::logic_error("Inkling SWA stage outside its bulk input geometry");
+            // On a local visit the sink projection is the last reader of input_[0]. No clearing is needed:
+            // only written history/append rows are read, and the unused Flash tile lanes are masked. All
+            // stage accesses and the next writer of input_[0] (including drafter_kept) are ordered on st_.
+            auto* base = reinterpret_cast<uint8_t*>(input_[0]);
+            if (!base || reinterpret_cast<uintptr_t>(base) % inkling::kSwaCopyAlign)
+                throw std::logic_error("Inkling SWA stage input scratch is unaligned");
+            for (int j = 0; j < 4; ++j) {
+                const auto stride = live.planes[j].stride;
+                stage.planes[j] = {base, stride};
+                base += (size_t) swa_stage_rows_ * stride;
+            }
+            selected = &stage;
+            pos = layout.append();   // shifted by a whole Flash key tile, relative distances unchanged
+            ring = 0;
+            copy_swa(live, stage, (int) (layout.first % ring_), layout.head, layout.history, true);
+        }
+    }
+#endif
+    Cache& c = *selected;
     if (fused(n) && q8()) {
         const int blocks = 2 * (n_key_ / 32) * n;
         if (!kv_stored_)
             store2_q8_kernel<<<div_up(blocks, 256), 256, 0, cs(st_)>>>(
                 k_, v_, (int8_t*) c.planes[0].data, (__half*) c.planes[1].data, (int8_t*) c.planes[2].data,
-                (__half*) c.planes[3].data, pos_, swa ? ring_ : 0, n, n_key_);
+                (__half*) c.planes[3].data, pos, ring, n, n_key_);
         kv_stored_ = false;
-    } else {
+    }
+#if defined(STRATA_HIP_GFX906)
+    else if (selected != &live) {
+        store_q8(k_, (int8_t*) c.planes[0].data, (uint16_t*) c.planes[1].data, n_key_, pos, n, st_);
+        store_q8(v_, (int8_t*) c.planes[2].data, (uint16_t*) c.planes[3].data, n_key_, pos, n, st_);
+    }
+#endif
+    else {
         store(k_, c, 0, n);
         store(v_, c, 1, n);
     }
@@ -1923,10 +2032,10 @@ void Inkling2::attention(const Block& b, int n) {
     a.gate = gate_;
     a.k = {c.planes[0].data, (const uint16_t*) c.planes[1].data};
     a.v = {c.planes[2].data, (const uint16_t*) c.planes[3].data};
-    a.pos = pos_;
+    a.pos = pos;
     a.n = n;
     a.window = swa ? kWindow : 0;
-    a.ring = swa ? ring_ : 0;
+    a.ring = ring;
     a.kv_heads = n_kv_;
     a.out = att_;
     const auto attend_local = [&] {
@@ -1958,6 +2067,12 @@ void Inkling2::attention(const Block& b, int n) {
     }
 #endif
     attend_local();
+#if defined(STRATA_HIP_GFX906)
+    if (selected != &live) {
+        const int count = std::min(n, ring_), skip = n - count;
+        copy_swa(live, stage, (int) ((pos_ + skip) % ring_), layout.append() + skip, count, false);
+    }
+#endif
 }
 
 void Inkling2::depth_mix(const float* query, float* dst, int first, int n) {

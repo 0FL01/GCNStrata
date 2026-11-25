@@ -106,6 +106,8 @@ private:
     void* gpu_route_q8_ = nullptr;
     bool gpu_route_failed_ = false, gpu_prefill_route_ = false;
     bool prefill_depth_share_ = false;
+    bool compact_swa_asked_ = false;
+    int swa_stage_rows_ = 0;   // positive only when the stage fits in input_[0]
     inkling::kv_helpers::MirrorPtr kv_helper_;
     bool gpu_route_supported() const;
     bool gpu_decode_supported() const;
@@ -169,6 +171,9 @@ private:
     void conv(float* x, float* state, const float* w, const float* dynamic, int width, int n);
     void store(const float* x, Cache& c, int side, int n);
     void attention(const Block& b, int n);
+#if defined(STRATA_HIP_GFX906)
+    void copy_swa(const Cache& live, const Cache& stage, int ring_head, int stage_head, int n, bool gather);
+#endif
     void depth_mix(const float* query, float* dst, int first, int n);
     void control(const Block& b, int il, int stream, float* in, int n, const float* shared_depth = nullptr);
     void ring_state(int visit, int64_t pos, const uint8_t* src, uint8_t* dst);

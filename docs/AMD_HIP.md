@@ -751,6 +751,14 @@ is also Q4_0. They read the same Q8_1 activation, keep their own weights and wri
 the existing wave64 R4 dense dot order, **not** the expert dot. The Q6_K Q/head and Q8_0 K/V paths do not
 change. Disabling wave MMVQ or selecting a different Q4_0 row tile disables this grouping.
 
+`STRATA_INKLING_COMPACT_SWA=1` keeps the 40 target sliding-window caches on each TP2 owner in compact
+rings. It requires two gfx906 owners, Q8_0 whole KV, no layer dump, and enough existing input scratch
+on the rank. Otherwise it keeps the stock rings. At batch 2048 with an eight-row verifier the ring is
+1031 instead of 3071 rows; it must retain tentative rows until `keep` is known, even with `--draft-max 3`.
+Wide prefill borrows local `input_[0]` for aligned, contiguous history and commits the new tail after
+attention. The target full KV, DSpark rings, helper mirrors, maximum context and canonical checkpoint
+layout do not shrink. This frees owner VRAM; it does not create more resident experts when they already fit.
+
 ## Tuning table
 
 A hipBLASLt table holds solution ids that are valid only for one GPU architecture and one hipBLASLt version, so it
