@@ -100,6 +100,8 @@ private:
     int32_t *gpu_route_dev_ = nullptr, *gpu_route_host_ = nullptr;
     int gpu_route_rows_ = 4;
     bool gpu_down_sum_ = false;
+    float* grp_part_ = nullptr;     // STRATA_INKLING_MOE_GROUPED: [8n][2304] down partials
+    int32_t* grp_ids_ = nullptr;    // STRATA_INKLING_MOE_GROUPED: distinct-expert table of the current visit
     float *gpu_route_bias_ = nullptr, *gpu_route_gu_ = nullptr;
     void* gpu_route_q8_ = nullptr;
     bool gpu_route_failed_ = false, gpu_prefill_route_ = false;

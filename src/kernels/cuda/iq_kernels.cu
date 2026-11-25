@@ -3682,6 +3682,215 @@ __global__ void __launch_bounds__(256) inkling_down_sum_kernel(MmvqIds ids, cons
         fo[out] = sum;
     }
 }
+
+// ---- STRATA_INKLING_MOE_GROUPED: routed experts of a verifier window, one weight read per distinct expert ----
+// Every output word below equals the one-token kernels' word (inkling_gu_q4_0_r4, mmvq_slots_kernel<2>,
+// inkling_down_sum_kernel): each column's dot is row_dot's (the same calls k per lane, Split::apply(Split::load())
+// = Fmt::dot, summed in the same order, the same warp_sum), and a token's eight picks enter fo in the same order and
+// expression.  Only the schedule changes: activations are staged in LDS once per CTA (the measured limit of the
+// old kernels was re-reading them through L1/L2 for every weight row: MemUnitBusy 90-95%), and from T3 a CTA
+// applies each weight word to every column that picked its expert (an 8-row window reads ~51% of the picks'
+// distinct experts on the code tape).  Bench: artifacts/specv4-20261126/bench/moe_bench.hip.
+constexpr int kGroupCols = 8, kGroupMaxPicks = 64, kGroupStride = 2 + kGroupCols;
+// g = {U, then per distinct expert u (first-occurrence order over j = 8t + pick): expert, n, col[8]}
+__global__ void __launch_bounds__(64) inkling_moe_group_kernel(const int32_t* __restrict__ ids, int rr, int32_t* g) {
+    __shared__ int s_id[kGroupMaxPicks], s_lead[kGroupMaxPicks];
+    const int t = threadIdx.x;
+    if (t < rr) s_id[t] = ids[t];
+    __syncthreads();
+    int lead = 0;
+    if (t < rr) {
+        lead = 1;
+        for (int j = 0; j < t; ++j) lead &= s_id[j] != s_id[t];
+    }
+    s_lead[t] = lead;
+    __syncthreads();
+    int r = 0;
+    for (int j = 0; j < t; ++j) r += s_lead[j];
+    if (lead) {
+        int* o = g + 1 + r * kGroupStride;
+        int c = 0;
+        o[0] = s_id[t];
+        for (int j = t; j < rr; ++j)
+            if (s_id[j] == s_id[t]) o[2 + c++] = j;
+        o[1] = c;
+    }
+    if (t == kGroupMaxPicks - 1) g[0] = r + lead;   // leaders among all 64 slots (slots >= rr are not leaders)
+}
+
+__device__ __forceinline__ void stage_q8_1(int4* dst, const uint8_t* const* src, int n, int per, int tid, int nthr) {
+    for (int c = 0; c < n; ++c)
+        for (int i = tid; i < per; i += nthr) dst[c * per + i] = reinterpret_cast<const int4*>(src[c])[i];
+}
+__device__ __forceinline__ void stage_q8_1_words(int* dst, const uint8_t* const* src, int n, int per, int tid, int nthr) {
+    for (int c = 0; c < n; ++c)
+        for (int i = tid; i < per; i += nthr) dst[c * per + i] = reinterpret_cast<const int*>(src[c])[i];
+}
+
+// Gate/up, 2304 -> 1152 Q4_0.  G: one CTA column per distinct expert (all its window columns, LDS n x 2592 B);
+// else one per pick (one column).  WARPS logical warps x TILE rows per CTA; each lane's five k steps unrolled.
+template<int TILE, int WARPS, bool G>
+__global__ void __launch_bounds__(32 * WARPS) inkling_gu_q4_0_window_kernel(MmvqIds ids, const int32_t* __restrict__ g) {
+    using F = Fmt<2>;
+    using S = Split<2>;
+    extern __shared__ int4 s_x[];
+    constexpr int NC = G ? kGroupCols : 1;
+    int n = 1, e, col[NC];
+    if constexpr (G) {
+        if (int(blockIdx.y) >= g[0]) return;
+        const int* gu = g + 1 + int(blockIdx.y) * kGroupStride;
+        n = gu[1];
+        e = gu[0];
+#pragma unroll
+        for (int c = 0; c < NC; ++c) col[c] = gu[2 + (c < n ? c : 0)];
+    } else {
+        col[0] = blockIdx.y;
+        e = ids.ids[blockIdx.y];
+    }
+    const uint8_t* src[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        src[c] = static_cast<const uint8_t*>(ids.x) + std::size_t(col[c] / ids.x_every) * ids.x_stride;
+    constexpr int per = kInklingGuBlocks * sizeof(block_q8_1) / 16;
+    stage_q8_1(s_x, src, n, per, int(threadIdx.x) + int(threadIdx.y) * 32, 32 * WARPS);
+    __syncthreads();
+    const auto* x = reinterpret_cast<const block_q8_1*>(s_x);
+    const int lane = threadIdx.x;
+    const int first = (int(blockIdx.x) * WARPS + int(threadIdx.y)) * TILE;
+    const auto* w = reinterpret_cast<const block_q4_0*>(static_cast<const uint8_t*>(ids.table[e]) + ids.offset) +
+                    first * kInklingGuBlocks;
+    const int iqs = F::step * (lane % F::ipb);
+    float sum[TILE][NC] = {};
+#pragma unroll
+    for (int i = 0; i < 5; ++i) {   // k = lane / 2 + 16 i < 72: R4's k sequence for this lane
+        const int k = lane / F::ipb + (32 / F::ipb) * i;
+        if (i < 4 || k < kInklingGuBlocks) {
+            typename S::W wr[TILE];
+#pragma unroll
+            for (int r = 0; r < TILE; ++r) wr[r] = S::load(w + r * kInklingGuBlocks, k, iqs);
+#pragma unroll
+            for (int r = 0; r < TILE; ++r)
+#pragma unroll
+                for (int c = 0; c < NC; ++c)
+                    if (c < n) sum[r][c] += S::apply(wr[r], x + c * kInklingGuBlocks + k, iqs);
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (c >= n) break;
+        float* y = ids.y + std::size_t(col[c]) * ids.y_stride + first;
+#pragma unroll
+        for (int r = 0; r < TILE; ++r) {
+            const float v = warp_sum(sum[r][c]);
+            if (lane == 0) y[r] = v;
+        }
+    }
+}
+static_assert(5 * (32 / Fmt<2>::ipb) >= kInklingGuBlocks && 4 * (32 / Fmt<2>::ipb) < kInklingGuBlocks);
+
+// Down, 576 -> 2304, grouped: 8 warps x RW rows per CTA, every window column of the CTA's expert, partials
+// part[j][2304]; inkling_down_combine_kernel then adds a token's eight picks to fo as inkling_down_sum_kernel does.
+template<int TY, int RW>
+__global__ void __launch_bounds__(256) inkling_down_window_kernel(MmvqIds ids, const int32_t* __restrict__ g, float* part) {
+    using F = Fmt<TY>;
+    using S = Split<TY>;
+    constexpr int blocks = 576 / 32, calls = blocks * F::ipb, per = blocks * sizeof(block_q8_1) / 4;
+    constexpr int rb = blocks * (TY == 2 ? sizeof(block_q4_0) : sizeof(block_q4_1));
+    __shared__ int s_x[kGroupCols * per];
+    if (int(blockIdx.y) >= g[0]) return;
+    const int* gu = g + 1 + int(blockIdx.y) * kGroupStride;
+    const int n = gu[1], lane = threadIdx.x;
+    const uint8_t* src[kGroupCols];
+#pragma unroll
+    for (int c = 0; c < kGroupCols; ++c)
+        src[c] = static_cast<const uint8_t*>(ids.x) + std::size_t(gu[2 + (c < n ? c : 0)]) * ids.x_stride;
+    stage_q8_1_words(s_x, src, n, per, int(threadIdx.x) + int(threadIdx.y) * 32, 256);
+    __syncthreads();
+    const auto* x = reinterpret_cast<const block_q8_1*>(s_x);
+    const int first = int(blockIdx.x) * 8 * RW + int(threadIdx.y) * RW;
+    const auto* w = static_cast<const uint8_t*>(ids.table[gu[0]]) + ids.offset;
+    float s[RW][kGroupCols] = {};
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {   // row_dot's k = lane, lane + 32 (36 calls)
+        const int k = lane + 32 * i;
+        if (i == 0 || k < calls) {
+            const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+            typename S::W wr[RW];
+#pragma unroll
+            for (int r = 0; r < RW; ++r) wr[r] = S::load(w + std::size_t(first + r) * rb, kbx, iqs);
+#pragma unroll
+            for (int r = 0; r < RW; ++r)
+#pragma unroll
+                for (int c = 0; c < kGroupCols; ++c)
+                    if (c < n) s[r][c] += S::apply(wr[r], x + c * blocks + kbx * (F::qk / 32), iqs);
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < kGroupCols; ++c) {
+        if (c >= n) break;
+#pragma unroll
+        for (int r = 0; r < RW; ++r) {
+            const float v = warp_sum(s[r][c]);
+            if (lane == 0) part[std::size_t(gu[2 + c]) * 2304 + first + r] = v;
+        }
+    }
+}
+static_assert(32 < 36 && 64 >= 36);
+
+__global__ void __launch_bounds__(256) inkling_down_combine_kernel(const float* __restrict__ part,
+                                                                   const float* __restrict__ weights, float* fo) {
+    const int t = blockIdx.y, o = int(blockIdx.x) * 256 + int(threadIdx.x);
+    if (o >= 2304) return;
+    const int out = t * 2304 + o;
+    float sum = fo[out];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) sum = sum + part[std::size_t(t * 8 + k) * 2304 + o] * weights[t * 8 + k];
+    fo[out] = sum;
+}
+
+// Down for one token's eight picks (T1), inkling_down_sum_kernel with its eight activations staged in LDS.
+template<int TY>
+__global__ void __launch_bounds__(256) inkling_down_sum_lds_kernel(MmvqIds ids, const float* weights, float* fo) {
+    using F = Fmt<TY>;
+    using S = Split<TY>;
+    constexpr int rows = 4, blocks = 576 / 32, calls = blocks * F::ipb, per = blocks * sizeof(block_q8_1) / 4;
+    constexpr int rb = blocks * (TY == 2 ? sizeof(block_q4_0) : sizeof(block_q4_1));
+    const int t = blockIdx.y, first = blockIdx.x * rows, pick = threadIdx.y, lane = threadIdx.x;
+    const int j = t * 8 + pick;
+    __shared__ int s_x[8 * per];
+    __shared__ float down[8][rows];
+    {
+        const int* src = reinterpret_cast<const int*>(static_cast<const uint8_t*>(ids.x) + std::size_t(t * 8) * ids.x_stride);
+        for (int i = int(threadIdx.x) + int(threadIdx.y) * 32; i < 8 * per; i += 256) s_x[i] = src[i];
+    }
+    __syncthreads();
+    const auto* x = reinterpret_cast<const block_q8_1*>(s_x) + pick * blocks;
+    const auto* w = static_cast<const uint8_t*>(ids.table[ids.ids[j]]) + ids.offset;
+    float s[rows] = {};
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int k = lane + 32 * i;
+        if (i == 0 || k < calls) {
+            const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+#pragma unroll
+            for (int r = 0; r < rows; ++r)
+                s[r] += S::apply(S::load(w + std::size_t(first + r) * rb, kbx, iqs), x + kbx * (F::qk / 32), iqs);
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        const float y = warp_sum(s[r]);
+        if (!lane) down[pick][r] = y;
+    }
+    __syncthreads();
+    if (pick == 0 && lane < rows) {
+        const int out = t * 2304 + first + lane;
+        float sum = fo[out];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) sum = sum + down[k][lane] * weights[t * 8 + k];
+        fo[out] = sum;
+    }
+}
 }  // namespace
 
 bool inkling_gu_q4_0_r4(int t, const MmvqIds& ids, int count, int n_in, int n_out, void* stream) {
@@ -3692,6 +3901,46 @@ bool inkling_gu_q4_0_r4(int t, const MmvqIds& ids, int count, int n_in, int n_ou
     const dim3 grid(kInklingGuOut / (kInklingGuTile * kInklingGuWarps), count), block(32, kInklingGuWarps);
     inkling_gu_q4_0_r4_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(ids);
     check("Inkling routed Q4_0 gate/up R4");
+    return true;
+}
+
+bool inkling_gu_window(int t, const MmvqIds& gu, int n, int32_t* group, void* stream) {
+    const auto st = (cudaStream_t)stream;
+    const int rr = n * kInklingGuPicks;
+    if (t != 2 || n < 2 || n > kGroupCols || !gu.table || !gu.ids || !gu.x || !gu.y || gu.offset != 0 ||
+        gu.x_every != kInklingGuPicks || gu.x_stride != kInklingGuBlocks * sizeof(block_q8_1) ||
+        gu.y_stride != kInklingGuOut || !group)
+        return false;
+    inkling_moe_group_kernel<<<1, kGroupMaxPicks, 0, st>>>(gu.ids, rr, group);
+    check("Inkling window expert groups");
+    const size_t col_bytes = kInklingGuBlocks * sizeof(block_q8_1);
+    if (n == 2)
+        inkling_gu_q4_0_window_kernel<4, 4, false><<<dim3(kInklingGuOut / 16, rr), dim3(32, 4), col_bytes, st>>>(gu, group);
+    else
+        inkling_gu_q4_0_window_kernel<2, 16, true><<<dim3(kInklingGuOut / 32, rr), dim3(32, 16), n * col_bytes, st>>>(gu, group);
+    check("Inkling window gate/up");
+    return true;
+}
+
+bool inkling_down_window(int t, const MmvqIds& down, int n, const float* weights, float* fo, float* part,
+                         const int32_t* group, void* stream) {
+    const auto st = (cudaStream_t)stream;
+    if ((t != 2 && t != 3) || n < 1 || n > kGroupCols || !down.table || !down.ids || !down.x ||
+        down.x_every != 1 || down.x_stride != 18 * sizeof(block_q8_1))
+        return false;
+    if (n == 1) {
+        if (t == 2) inkling_down_sum_lds_kernel<2><<<dim3(2304 / 4, 1), dim3(32, 8), 0, st>>>(down, weights, fo);
+        else inkling_down_sum_lds_kernel<3><<<dim3(2304 / 4, 1), dim3(32, 8), 0, st>>>(down, weights, fo);
+        check("Inkling down sum (LDS)");
+        return true;
+    }
+    if (!part || !group) return false;
+    const int rr = n * 8;
+    if (t == 2) inkling_down_window_kernel<2, 2><<<dim3(2304 / 16, rr), dim3(32, 8), 0, st>>>(down, group, part);
+    else inkling_down_window_kernel<3, 2><<<dim3(2304 / 16, rr), dim3(32, 8), 0, st>>>(down, group, part);
+    check("Inkling window down");
+    inkling_down_combine_kernel<<<dim3(2304 / 256, n), 256, 0, st>>>(part, weights, fo);
+    check("Inkling window down combine");
     return true;
 }
 

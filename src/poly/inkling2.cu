@@ -1153,6 +1153,10 @@ void Inkling2::init_gpu_route(bool decode, bool prefill) {
     gpu_route_host_ = (int32_t*) hmalloc(bytes, "Inkling GPU route report");
     gpu_route_gu_ = (float*) dmalloc((size_t) rr * 2 * n_ff_exp_ * sizeof(float), "Inkling GPU route gate/up");
     gpu_route_q8_ = dmalloc((size_t) rr * kernels::native_q8_1_bytes(n_ff_exp_), "Inkling GPU route activation Q8_1");
+    if (const char* e = std::getenv("STRATA_INKLING_MOE_GROUPED"); e && !std::strcmp(e, "1")) {
+        grp_part_ = (float*) dmalloc((size_t) rr * n_embd_ * sizeof(float), "Inkling grouped down partials");
+        grp_ids_ = (int32_t*) dmalloc((1 + 64 * 10) * sizeof(int32_t), "Inkling grouped expert table");
+    }
     if (!card_moe(1)) throw std::logic_error("Inkling GPU route could not initialize resident slots");
 }
 
@@ -1176,6 +1180,19 @@ void Inkling2::gpu_route_moe(Layer& L, int il, int n) {
         const char* e = std::getenv("STRATA_INKLING_GU_R4");
         return e && e[0] == '1' && e[1] == '\0';
     }();
+    if (grp_part_ && gpu_down_sum_ && n_ff_exp_ == 576 && n_embd_ == 2304) {
+        // STRATA_INKLING_MOE_GROUPED: the same words in a schedule that reads each distinct expert of a window once
+        if (!(n == 1 ? (gu_r4 && kernels::inkling_gu_q4_0_r4((int) L.gu_type, gu, rr, n_embd_, 2 * n_ff_exp_, st_)) ||
+                           kernels::native_mmvq_ids((int) L.gu_type, gu, rr, n_embd_, 2 * n_ff_exp_, st_)
+                     : kernels::inkling_gu_window((int) L.gu_type, gu, n, grp_ids_, st_)))
+            throw std::logic_error("Inkling grouped gate/up rejected a validated shape");
+        situ_rows_q8_1(gpu_route_gu_, gpu_route_q8_, n_ff_exp_, rr, situ_.beta, situ_.linear_beta, st_, expert_scales(L, ids));
+        const kernels::MmvqIds dn{table, ids, L.gu2(), gpu_route_q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_,
+                                  (size_t) n_embd_};
+        if (!kernels::inkling_down_window((int) L.d_type, dn, n, d_wts_, fo_, grp_part_, grp_ids_, st_))
+            throw std::logic_error("Inkling grouped down rejected a validated shape");
+        return;
+    }
     if (!(n == 1 && gu_r4 && kernels::inkling_gu_q4_0_r4((int) L.gu_type, gu, rr, n_embd_, 2 * n_ff_exp_, st_)) &&
         !kernels::native_mmvq_ids((int) L.gu_type, gu, rr, n_embd_, 2 * n_ff_exp_, st_))
         throw std::logic_error("Inkling GPU route gate/up MMVQ rejected a validated shape");

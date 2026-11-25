@@ -732,6 +732,31 @@ rows kept and with mixed partial `keep()`, at 2K, 18K, across the 4096 and 8192 
 helpers): every row bitwise. Untraced window cost against stock at 2K: T2 +0.26 ms, T4 −0.28 ms, T5–8 −2.6 to
 −3.1 ms; at 64K T2 +0.31 ms, T5–8 −2.4 to −2.8 ms.
 
+### Inkling-2-Mini: row-shared verifier windows (opt-in)
+
+With the width-invariant flags above, three more flags change only the schedule of a verifier window (2-8 rows),
+never a row's arithmetic: every output word still equals the one-token kernels' word, so a window's rows stay
+bitwise those of serial decoding.
+
+- `STRATA_INKLING_MOE_GROUPED=1` (needs `STRATA_INKLING_GPU_ROUTE=1` and `STRATA_INKLING_DOWN_SUM=1`): the routed
+  experts of a window. A small kernel builds the window's distinct-expert table from the GPU route ids; from three
+  rows one gate/up CTA column per distinct expert applies each Q4_0 weight word to every row that picked it, with
+  the rows' Q8_1 activations staged in LDS once per CTA. Two-row windows keep one column per pick with LDS
+  activations. The down projection runs per distinct expert into a `[8n][2304]` partial plane, and a combine adds a
+  token's eight picks in `inkling_down_sum`'s order and expression. One token's down uses the same kernel with its
+  eight activations in LDS. On the code tape an 8-row window touches only 47-50% distinct experts of its 64 picks
+  (adjacent tokens share about 3 of 8). The old kernels were bound by re-reading activations through L1/L2 for every
+  weight row (`MemUnitBusy` 90-95%), not by weight bytes.
+- `STRATA_GEMV_ROWS_SHARED=1` (with `STRATA_GEMV_ROW_INVARIANT=1`): an FP32 GEMV of 2-8 rows in the one-row
+  block-a-row shape (the router) reads each weight float4 once for all rows, with each row's sums in
+  `gemv_rows_body`'s order.
+- `STRATA_MMVQ_WAVE_LDS=1`: `native_mmvq_wave_kernel` for 2-8 columns stages the columns' Q8_1 activations in LDS.
+
+Measured on four MI50 (Q4_0, TP2, 2K context, untraced, serial T1 against fixed windows): T1 14.34 -> 14.11 ms,
+T4 32.33 -> 26.56 ms, T8 51.42 -> 42.31 ms; at 64K with the KV helpers T4 42.3 -> 37.2 ms and T8 74.6 -> 63.5 ms.
+Every row bitwise equal to serial T1 at 2K, 18K and 65,528, with all rows kept and with mixed partial `keep()`.
+Kernel bench: `artifacts/specv4-20261126/bench/moe_bench.hip` in the control repository.
+
 ### Inkling-2-Mini: opt-in factored decode attention
 
 `STRATA_INKLING_DECODE_FACTORED=1` applies to Inkling TP2 on gfx906 with Q8_0 KV,

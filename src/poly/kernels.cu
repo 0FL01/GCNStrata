@@ -2925,6 +2925,57 @@ gemv_rows_kernel(const float* __restrict__ w, const float* __restrict__ x, float
     gemv_rows_body(w, x, y, n_in, n_out, rows_per_x);
 }
 
+// STRATA_GEMV_ROWS_SHARED=1: gemv_rows_kernel for 2..8 rows of a call in one block an output row: each weight float4
+// is read once for all rows.  Each row's sum is gemv_rows_body's own (the same float4 steps per thread, the same
+// xor shuffles, the same eight-wave sum in order), so every output word is the one-row kernel's.
+__device__ __forceinline__ void
+gemv_rows_shared_body(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int n_in,
+                      int n_out, int rows_per_x, int rows) {
+    constexpr int kMost = 8;
+    __shared__ float waves[kMost][8];
+    const int o = blockIdx.x;
+    const float4* wr = reinterpret_cast<const float4*>(w + size_t(o) * n_in);
+    const float4* xr[kMost];
+#pragma unroll
+    for (int t = 0; t < kMost; ++t)
+        xr[t] = reinterpret_cast<const float4*>(
+            x + (size_t(t < rows ? t : 0) * size_t(n_out / rows_per_x) + size_t(o / rows_per_x)) * n_in);
+    float acc[kMost];
+#pragma unroll
+    for (int t = 0; t < kMost; ++t) acc[t] = 0.0f;
+    for (int i = threadIdx.x; i < n_in / 4; i += 256) {
+        const float4 a = wr[i];
+#pragma unroll
+        for (int t = 0; t < kMost; ++t) {
+            if (t < rows) {
+                const float4 b = xr[t][i];
+                acc[t] += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < kMost; ++t) {
+        if (t < rows) {
+#pragma unroll
+            for (int d = 16; d > 0; d /= 2) acc[t] += __shfl_xor(acc[t], d, 32);
+            if (threadIdx.x % 32 == 0) waves[t][threadIdx.x / 32] = acc[t];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < rows) {
+        const int t = threadIdx.x;
+        float sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sum += waves[t][i];
+        y[size_t(t) * n_out + o] = sum;
+    }
+}
+__global__ void __launch_bounds__(256)
+gemv_rows_shared_kernel(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y, int n_in,
+                        int n_out, int rows_per_x, int rows) {
+    gemv_rows_shared_body(w, x, y, n_in, n_out, rows_per_x, rows);
+}
+
 __global__ void __launch_bounds__(256)
 gemv_rows_dual_kernel(const float* __restrict__ w, const float* __restrict__ x, float* __restrict__ y,
                       float* __restrict__ y2, float* __restrict__ x_host, int n_in, int n_out, int rows_per_x) {
@@ -2942,6 +2993,11 @@ __global__ void __launch_bounds__(256) gemv_rows_segments_kernel(F32Segments s, 
     const int g = blockIdx.z;
     gemv_rows_body(s.w[g], s.x[g], s.y[g], n_in, n_out, rows_per_x);
 }
+__global__ void __launch_bounds__(256) gemv_rows_shared_segments_kernel(F32Segments s, int n_in, int n_out,
+                                                                        int rows_per_x, int rows) {
+    const int g = blockIdx.z;
+    gemv_rows_shared_body(s.w[g], s.x[g], s.y[g], n_in, n_out, rows_per_x, rows);
+}
 
 }  // namespace
 
@@ -2956,6 +3012,15 @@ int gemv_shape_rows(int rows) {
     return invariant && rows <= 8 ? 1 : rows;
 }
 
+// STRATA_GEMV_ROWS_SHARED=1 (with STRATA_GEMV_ROW_INVARIANT=1's one-row shape choice): 2..8 rows share the weights
+bool gemv_rows_shared(int rows) {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_GEMV_ROWS_SHARED");
+        return v && v[0] == '1' && !v[1];
+    }();
+    return on && rows >= 2 && rows <= 8 && gemv_shape_rows(rows) == 1;
+}
+
 void gemv_f32_waves(const float* w, const float* x, float* y, int n_in, int n_out, int rows_per_x, int rows,
                     void* stream) {
     // float4 rows: the engine's buffers are aligned and every product of a model that asks for this is whole float4s
@@ -2967,8 +3032,11 @@ void gemv_f32_waves(const float* w, const float* x, float* y, int n_in, int n_ou
                                                                                        rows_per_x);
     };
     // fewer blocks than two a compute unit of an RX 6700 XT at 32 lanes a row: a block a row instead
-    if (n_in >= 1024 && (n_out + 7) / 8 * gemv_shape_rows(rows) < 80)
-        gemv_rows_kernel<<<dim3(n_out, rows), 256, 0, st>>>(w, x, y, n_in, n_out, rows_per_x);
+    if (n_in >= 1024 && (n_out + 7) / 8 * gemv_shape_rows(rows) < 80) {
+        if (gemv_rows_shared(rows))
+            gemv_rows_shared_kernel<<<dim3(n_out), 256, 0, st>>>(w, x, y, n_in, n_out, rows_per_x, rows);
+        else gemv_rows_kernel<<<dim3(n_out, rows), 256, 0, st>>>(w, x, y, n_in, n_out, rows_per_x);
+    }
     else if (n_in >= 256) launch.template operator()<32>();
     else if (n_in >= 128) launch.template operator()<16>();
     else if (n_in >= 64) launch.template operator()<8>();
@@ -3006,8 +3074,11 @@ void gemv_f32_waves_segments(const F32Segments& s, int count, int n_in, int n_ou
             s, n_in, n_out, rows_per_x);
     };
     // the choice gemv_f32_waves() makes for one segment
-    if (n_in >= 1024 && (n_out + 7) / 8 * gemv_shape_rows(rows) < 80)
-        gemv_rows_segments_kernel<<<dim3(n_out, rows, count), 256, 0, st>>>(s, n_in, n_out, rows_per_x);
+    if (n_in >= 1024 && (n_out + 7) / 8 * gemv_shape_rows(rows) < 80) {
+        if (gemv_rows_shared(rows))
+            gemv_rows_shared_segments_kernel<<<dim3(n_out, 1, count), 256, 0, st>>>(s, n_in, n_out, rows_per_x, rows);
+        else gemv_rows_segments_kernel<<<dim3(n_out, rows, count), 256, 0, st>>>(s, n_in, n_out, rows_per_x);
+    }
     else if (n_in >= 256) launch.template operator()<32>();
     else if (n_in >= 128) launch.template operator()<16>();
     else if (n_in >= 64) launch.template operator()<8>();

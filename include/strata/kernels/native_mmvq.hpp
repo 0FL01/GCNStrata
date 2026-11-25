@@ -227,6 +227,13 @@ bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int
 bool inkling_gu_q4_0_r4(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream);
 // Resident Inkling TP2 down projections (8 ordered Q4 picks, 576 -> 2304).
 bool inkling_down_sum(int ggml_type, const MmvqIds& ids, const float* weights, float* fo, int n, void* stream);
+// STRATA_INKLING_MOE_GROUPED: the routed experts of a window of n <= 8 rows (GPU route ids).  Every output word
+// equals inkling_gu_q4_0_r4 / the slots kernel and inkling_down_sum.  inkling_gu_window (n >= 2) also writes the
+// window's distinct-expert table to group (1 + 64 * 10 ints), which inkling_down_window reads (n >= 2; part: 8n x
+// 2304 floats).  inkling_down_window with n == 1 is inkling_down_sum with its activations staged in LDS.
+bool inkling_gu_window(int ggml_type, const MmvqIds& gu, int n, std::int32_t* group, void* stream);
+bool inkling_down_window(int ggml_type, const MmvqIds& down, int n, const float* weights, float* fo, float* part,
+                         const std::int32_t* group, void* stream);
 #endif
 
 struct MmvqSegments {

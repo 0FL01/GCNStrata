@@ -1897,6 +1897,52 @@ __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w,
         }
 }
 
+// STRATA_MMVQ_WAVE_LDS=1: native_mmvq_wave_kernel for 2..8 columns with the columns' Q8_1 activations staged in
+// LDS once per block.  The same rows, lanes, loads, applies and butterfly: every output word is the stock kernel's.
+// The stock kernel re-read each column's activation block through L1/L2 for every weight row it applied it to.
+template<typename F, int NCOLS, int R>
+__launch_bounds__(256)
+__global__ void native_mmvq_wave_lds_kernel(const typename F::Block* __restrict__ w, const Q81Block* __restrict__ xg,
+                                            float* __restrict__ y, int n_in, int n_out, int ldy) {
+    extern __shared__ int4 s_xw[];
+    constexpr int BPIW = 64 / F::T;
+    const int x_stride = n_in / Q8K;
+    {
+        const int words = NCOLS * x_stride * int(sizeof(Q81Block)) / 16;
+        const int4* src = reinterpret_cast<const int4*>(xg);
+        for (int i = int(threadIdx.x); i < words; i += 256) s_xw[i] = src[i];
+    }
+    __syncthreads();
+    const Q81Block* x = reinterpret_cast<const Q81Block*>(s_xw);
+    const int lane = int(threadIdx.x) & 63;
+    const int row0 = (int(blockIdx.x) * 4 + (int(threadIdx.x) >> 6)) * R;
+    if (row0 >= n_out) return;
+    const int blocks_per_row = n_in / F::DIV;
+    const int kqs = F::kqs(lane);
+    float tmp[NCOLS][R] = {};
+    for (int kbx = lane / F::T; kbx < blocks_per_row; kbx += BPIW) {
+        const int kby = kbx * F::KBY;
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            if (row0 + i < n_out) {
+                const typename F::W wv = F::load(w + std::size_t(row0 + i) * blocks_per_row + kbx, kqs);
+#pragma unroll
+                for (int j = 0; j < NCOLS; ++j) tmp[j][i] += F::apply(wv, x + std::size_t(j) * x_stride + kby, kqs);
+            }
+        }
+    }
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            float v = tmp[j][i];
+#pragma unroll
+            for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+            if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * ldy + row0 + i] = v;
+        }
+}
+bool g_wave_lds = std::getenv("STRATA_MMVQ_WAVE_LDS") && std::string(std::getenv("STRATA_MMVQ_WAVE_LDS")) == "1";
+
 // One CTA owns one existing R4 tile, entirely within one projection. Reuse the
 // stock Q4_0 dot traits and the exact T1 R4 lane order, without touching stock.
 constexpr int kInklingQ40Kin = 2304, kInklingQ40Large = 1536, kInklingQ40Rel = 192;
@@ -1984,6 +2030,11 @@ void wave_launch_n(const void* weights, const void* x_q8_1, float* y, int n_in, 
     const auto* w = static_cast<const typename F::Block*>(weights);
     const auto* x = static_cast<const Q81Block*>(x_q8_1);
     const unsigned blocks = unsigned((std::size_t(n_out) + 4 * R - 1) / (4 * R));
+    const std::size_t lds = std::size_t(NCOLS) * std::size_t(n_in / Q8K) * sizeof(Q81Block);
+    if (NCOLS >= 2 && g_wave_lds && lds <= 48 * 1024 && lds % 16 == 0 && reinterpret_cast<std::uintptr_t>(x) % 16 == 0) {
+        native_mmvq_wave_lds_kernel<F, NCOLS, R><<<blocks, 256, lds, s>>>(w, x, y, n_in, n_out, ldy > 0 ? ldy : n_out);
+        return;
+    }
     native_mmvq_wave_kernel<F, NCOLS, R><<<blocks, 256, 0, s>>>(w, x, y, n_in, n_out, ldy > 0 ? ldy : n_out);
 }
 template<typename F, int R = 1>
