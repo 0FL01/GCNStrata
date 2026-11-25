@@ -222,6 +222,9 @@ struct MmvqIds {
 bool native_mmvq_ids_supported(int ggml_type);
 bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream);
 #if defined(STRATA_HIP_GFX906)
+// Trusted resident Inkling TP2 device ids, one token (8 picks), packed Q4_0 gate/up (2304 -> 1152).
+// Returns false without launching on any other shape or descriptor layout.
+bool inkling_gu_q4_0_r4(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream);
 // Resident Inkling TP2 down projections (8 ordered Q4 picks, 576 -> 2304).
 bool inkling_down_sum(int ggml_type, const MmvqIds& ids, const float* weights, float* fo, int n, void* stream);
 #endif

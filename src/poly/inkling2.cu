@@ -1111,7 +1111,12 @@ void Inkling2::gpu_route_moe(Layer& L, int il, int n) {
     select(rl_, gpu_route_bias_ + il * kExperts, expert_scale_, ids, d_wts_, n, &gpu_route_dev_->invalid, st_);
     const size_t ff = (size_t) n_ff_exp_;
     const kernels::MmvqIds gu{table, ids, 0, xq_, kernels::native_q8_1_bytes(n_embd_), kPicks, gpu_route_gu_, 2 * ff};
-    if (!kernels::native_mmvq_ids((int) L.gu_type, gu, rr, n_embd_, 2 * n_ff_exp_, st_))
+    static const bool gu_r4 = [] {
+        const char* e = std::getenv("STRATA_INKLING_GU_R4");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    if (!(n == 1 && gu_r4 && kernels::inkling_gu_q4_0_r4((int) L.gu_type, gu, rr, n_embd_, 2 * n_ff_exp_, st_)) &&
+        !kernels::native_mmvq_ids((int) L.gu_type, gu, rr, n_embd_, 2 * n_ff_exp_, st_))
         throw std::logic_error("Inkling GPU route gate/up MMVQ rejected a validated shape");
     situ_rows_q8_1(gpu_route_gu_, gpu_route_q8_, n_ff_exp_, rr, situ_.beta, situ_.linear_beta, st_, expert_scales(L, ids));
     const kernels::MmvqIds down{table, ids, L.gu2(), gpu_route_q8_, kernels::native_q8_1_bytes(n_ff_exp_),

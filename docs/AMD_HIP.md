@@ -742,6 +742,10 @@ Each stream still runs its own message controller. Full-attention visits, other 
 expert contributions on the producing CTA. It preserves the lane reduction, pick order and initial FO value;
 the ordinary TP2 collective still runs afterwards. Other model shapes, bulk prompt batches and host routing are unchanged.
 
+`STRATA_INKLING_GU_R4=1` tiles four adjacent Q4_0 gate/up rows over the same Q8_1 input in the resident TP2
+device route. It applies only to the single-token, eight-pick, 2304→1152 layout. Each row retains the original
+logical warp32 dot and reduction on wave64. This switch neither enables resident routing nor modifies down+sum.
+
 ## Tuning table
 
 A hipBLASLt table holds solution ids that are valid only for one GPU architecture and one hipBLASLt version, so it

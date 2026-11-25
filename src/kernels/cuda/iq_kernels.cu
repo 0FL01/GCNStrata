@@ -3630,6 +3630,33 @@ void iq_mmvq_ids(int t, const MmvqIds& ids, int count, int n_in, int n_out, void
 
 #if defined(STRATA_HIP_GFX906)
 namespace {
+constexpr int kInklingGuIn = 2304, kInklingGuOut = 1152, kInklingGuPicks = 8;
+constexpr int kInklingGuTile = 4, kInklingGuWarps = 4;
+constexpr int kInklingGuBlocks = kInklingGuIn / Fmt<2>::qk;
+static_assert(kInklingGuIn % Fmt<2>::qk == 0 && kInklingGuOut % (kInklingGuTile * kInklingGuWarps) == 0);
+
+__global__ void __launch_bounds__(128) inkling_gu_q4_0_r4_kernel(MmvqIds ids) {
+    using F = Fmt<2>;
+    const int lane = threadIdx.x;
+    const int first = (int(blockIdx.x) * kInklingGuWarps + int(threadIdx.y)) * kInklingGuTile;
+    const SlotPtrs at = slot_ptrs(ids, int(blockIdx.y));
+    const auto* w = static_cast<const block_q4_0*>(at.w) + first * kInklingGuBlocks;
+    const auto* x = static_cast<const block_q8_1*>(at.x);
+    const int iqs = F::step * (lane % F::ipb);
+    float sum[kInklingGuTile] = {};
+    // Each lane visits K in row_dot's order. Unrolling across rows lets the same Q8_1 loads feed all four dots.
+    for (int k = lane / F::ipb; k < kInklingGuBlocks; k += 32 / F::ipb) {
+#pragma unroll
+        for (int r = 0; r < kInklingGuTile; ++r)
+            sum[r] += F::dot(w + r * kInklingGuBlocks, x + k, k, iqs);
+    }
+#pragma unroll
+    for (int r = 0; r < kInklingGuTile; ++r) {
+        const float y = warp_sum(sum[r]);
+        if (lane == 0) at.y[first + r] = y;
+    }
+}
+
 // Keep the eight down partials on the producing CTA, not a [T,8,2304] VRAM plane.
 // One logical warp per pick, identical lane-to-K map and row_dot reduction to slots_of().
 template<int TY>
@@ -3656,6 +3683,17 @@ __global__ void __launch_bounds__(256) inkling_down_sum_kernel(MmvqIds ids, cons
     }
 }
 }  // namespace
+
+bool inkling_gu_q4_0_r4(int t, const MmvqIds& ids, int count, int n_in, int n_out, void* stream) {
+    if (t != 2 || count != kInklingGuPicks || n_in != kInklingGuIn || n_out != kInklingGuOut ||
+        !ids.table || !ids.ids || !ids.x || !ids.y || ids.offset != 0 || ids.x_every != kInklingGuPicks ||
+        ids.x_stride != kInklingGuBlocks * sizeof(block_q8_1) || ids.y_stride != kInklingGuOut)
+        return false;
+    const dim3 grid(kInklingGuOut / (kInklingGuTile * kInklingGuWarps), count), block(32, kInklingGuWarps);
+    inkling_gu_q4_0_r4_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(ids);
+    check("Inkling routed Q4_0 gate/up R4");
+    return true;
+}
 
 bool inkling_down_sum(int t, const MmvqIds& ids, const float* weights, float* fo, int n, void* stream) {
     const dim3 grid(2304 / 4, n), block(32, 8);
