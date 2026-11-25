@@ -700,6 +700,12 @@ For comparison on the same machine: llama.cpp (3cf0325, ROCm) on the same Coder 
 same gfx906 ISA; not run), a single-card run, the tensor-split experiment (the halves of every layer on two cards;
 it works but is not part of this build).
 
+### Inkling-2-Mini: exact full-vocabulary sampling on x86-64
+
+`STRATA_POLY_AVX2_SAMPLE=1` opts `strata-poly` into PolyStrata's AVX2 host sampler (reference commit `50effa3a`). It applies to a positive-temperature draw with no vocabulary cut. It does not speed up greedy, top-k/top-p filtering, the GPU head, or prefill. AVX2 is detected at runtime; builds using fast math or FMA in the scalar sampler translation unit keep the old path. No flag means the scalar implementation.
+
+The vector loop preserves the FP32 polynomial operations, the order of the four FP64 mass sums and the RNG draw. Equal logits and RNG therefore do not require similar wall times. Conversely the **speculative policy uses wall time**: even a repeat of the old engine with the same seed can take different verifier windows. Compare the sampled-from logits and picks at matched windows before attributing a different live transcript to sampling.
+
 ### Inkling-2-Mini: opt-in factored decode attention
 
 `STRATA_INKLING_DECODE_FACTORED=1` applies to Inkling TP2 on gfx906 with Q8_0 KV,
