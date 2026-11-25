@@ -5,9 +5,13 @@ but NVIDIA CUDA, other AMD architectures and SYCL are not supported qualificatio
 (`src/`, `include/`), a Python server with an OpenAI- and Anthropic-compatible API and a web app (`serve/`), and a
 one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
 
-Compare prefill changes on the four-MI50 rig to the [B3 Q4_0 production baseline](bench/results/2026-11-22-gfx906-prefill/README.md), not the earlier Q4_1 deployment.
-A token-divergence check of a kernel change needs `--adapt-every 0` and greedy decoding: the adaptive expert cache
-makes outputs depend on timing.
+Focus development and optimization on **Inkling 2 Mini** inference in `strata-poly` (`src/poly/`) on gfx906.
+Use [PolyStrata's Inkling 2 Mini inference graph](https://github.com/0FL01/PolyStrata/blob/main/docs/INKLING2.md)
+as the architecture reference. Qwen-specific work is deferred.
+
+For Qwen only: compare four-MI50 prefill against the [B3 Q4_0 baseline](bench/results/2026-11-22-gfx906-prefill/README.md),
+not the older Q4_1 deployment. Use `--adapt-every 0` and greedy decoding for token-divergence checks because the
+adaptive expert cache makes outputs depend on timing.
 
 ## Installing Strata for a user
 
