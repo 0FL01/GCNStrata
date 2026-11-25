@@ -734,6 +734,15 @@ configured context row across eight
 full visits, plus 96 bytes per row for scores and about 2 MiB of fixed scratch. At 131,072 rows this is
 about 558 MiB per spare GPU, plus about 1.1 MiB of staging on each owner. The option is off by default.
 
+`STRATA_INKLING_FLASH_HELPERS=1` additionally uses those same 0↔2 and 1↔3 links during **full prompt
+attention**. It requires enabled KV helpers and Q8 Lean Flash with lane probabilities, not H2. At position
+8192 or later and exactly 2047–2048 input rows, each helper computes the first whole 16-query tiles while
+its owner computes the remaining tiles. The result has the original FP32 row order. A temporary packet
+copies the visible keys/values from one visit, even after restore; it never owns a KV or ShortConv row.
+Its size per helper is 1088 bytes per configured context row plus about 18.9 MiB. Decode mirror seeding
+has its own stream dependencies and is still subject to the answer budget above. Smaller appends and
+sliding-window visits use the previous path. This prompt option is off by default.
+
 `STRATA_INKLING_PREFILL_DEPTH_SHARE=1` is independent of decode. On two gfx906 cards, a 2047/2048-row prompt
 chunk can share one raw depth mix and its RMS between Q, K and V on the 20 sliding-window visits with messages.
 Each stream still runs its own message controller. Full-attention visits, other widths and verifier windows do not use it.

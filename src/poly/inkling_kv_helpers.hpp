@@ -19,6 +19,9 @@ using MirrorPtr = std::unique_ptr<Mirror, FreeMirror>;
 
 // Either both links are usable and both mirrors are allocated, or setup throws before either rank uses one.
 std::array<MirrorPtr, 2> create_pair(int capacity, std::array<cudaStream_t, 2> owner_streams);
+// Optional disposable packet per helper. No replica validity or checkpoint semantics for prompt rows.
+void enable_flash_rows(std::array<MirrorPtr, 2>& mirrors);
+bool try_flash_rows(Mirror& mirror, const Attend& a);
 void invalidate(Mirror& mirror, int64_t first);
 void set_budget(Mirror& mirror, int64_t prompt_rows, int64_t max_new);
 

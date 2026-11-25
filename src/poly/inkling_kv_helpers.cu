@@ -2,6 +2,7 @@
 #include "inkling_kv_helpers.hpp"
 
 #if defined(STRATA_HIP_GFX906)
+#include "inkling_attend_lean.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 
 #include <hip/hip_runtime.h>
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
 namespace strata::poly::inkling::kv_helpers {
 namespace {
@@ -87,7 +89,7 @@ struct Resources {
     explicit Resources(int device) : device(device) {}
     const int device;
     hipStream_t stream = nullptr;
-    hipEvent_t ready = nullptr, sent = nullptr;
+    hipEvent_t ready = nullptr, sent = nullptr, bulk_input = nullptr;
     Word* memory = nullptr;
 
     void init(size_t words, bool owner) {
@@ -115,6 +117,7 @@ struct Resources {
         if (stream) (void) hipStreamDestroy(stream);
         if (ready) (void) hipEventDestroy(ready);
         if (sent) (void) hipEventDestroy(sent);
+        if (bulk_input) (void) hipEventDestroy(bulk_input);
         if (memory) (void) hipFree(memory);
     }
 };
@@ -138,6 +141,7 @@ struct Mirror {
         : owner(rank), helper(rank + 2), capacity(capacity), model_stream(model_stream) {}
 
     Resources owner, helper;
+    std::unique_ptr<Resources> bulk;
     const int capacity;
     const hipStream_t model_stream;
     bool used = false, long_answer = false;
@@ -176,6 +180,7 @@ struct Mirror {
     ~Mirror() {
         // All three streams may still reference one of the two allocations. Drain before destroying either bundle.
         if (!used) return;
+        if (bulk) bulk->wait(bulk->stream);
         owner.wait(owner.stream);
         helper.wait(helper.stream);
         owner.wait(model_stream);
@@ -211,6 +216,81 @@ std::array<MirrorPtr, 2> create_pair(int capacity, std::array<cudaStream_t, 2> o
 
 void invalidate(Mirror& mirror, int64_t first) {
     for (int& end : mirror.valid) end = static_cast<int>(std::min<int64_t>(end, first));
+}
+
+namespace {
+constexpr int kBulkHalf = 1024, kBulkQ = kOwnerKvHeads * kQueriesPerKv * kHeadWidth;
+constexpr int kBulkHeads = kOwnerKvHeads * kQueriesPerKv, kBulkRel = kBulkHeads * kRelativeWidth;
+constexpr int kBulkCode = kOwnerKvHeads * kHeadWidth, kBulkScale = kBulkCode / kQ8BlockValues;
+}
+
+void enable_flash_rows(std::array<MirrorPtr, 2>& mirrors) {
+    int device;
+    check(hipGetDevice(&device), "get bulk Flash setup device");
+    RestoreDevice restore(device);
+    std::array<std::unique_ptr<Resources>, 2> scratch;
+    for (int r : {0, 1}) {
+        scratch[r] = std::make_unique<Resources>(mirrors[r]->helper.device);
+        const size_t kv_bytes = size_t(mirrors[r]->capacity) * 2 * (kBulkCode + kBulkScale * sizeof(uint16_t));
+        scratch[r]->init(kv_bytes / sizeof(Word) + kTableWords + kBulkHalf * (3 * kBulkQ + kBulkRel + kBulkHeads), false);
+        check(hipSetDevice(mirrors[r]->owner.device), "select bulk Flash input device");
+        check(hipEventCreateWithFlags(&mirrors[r]->owner.bulk_input, hipEventDisableTiming), "create bulk Flash input event");
+    }
+    for (int r : {0, 1}) mirrors[r]->bulk = std::move(scratch[r]);
+}
+
+bool try_flash_rows(Mirror& m, const Attend& a) {
+    // Stay on the owners for small prompts and short appends: the full-prefix DMA would not pay back.
+    if (!m.bulk || a.n < 2047 || a.n > 2048 || a.pos < 8192 || a.pos > m.capacity - a.n ||
+        a.window || a.ring || a.kv_heads != kOwnerKvHeads || !a.k.scales || !a.v.scales) return false;
+    const int cut = (a.n / 32) * 16;  // unchanged complete 16-query CTAs, including the final ragged tile
+    auto& w = *m.bulk;
+    RestoreDevice restore(m.owner.device);
+    m.used = true;
+    // The previous reply follows its input event and all transfers. Never re-record a pending event;
+    // prompt preseed on the other stream owns a distinct pair of events, including on this same visit.
+    check(hipSetDevice(w.device), "select bulk Flash workspace");
+    check(hipEventSynchronize(w.ready), "release previous bulk Flash packet");
+    check(hipSetDevice(m.owner.device), "select bulk Flash producer");
+    check(hipEventRecord(m.owner.bulk_input, m.model_stream), "publish bulk Flash inputs");
+    Attend tail = a;
+    tail.q += cut * kBulkQ; tail.gate += cut * kBulkQ; tail.out += cut * kBulkQ;
+    tail.rel += cut * kBulkRel; tail.sink += cut * kBulkHeads; tail.pos += cut; tail.n -= cut;
+    attend_flash_lean(tail, m.model_stream);
+
+    check(hipSetDevice(w.device), "select bulk Flash helper");
+    try {
+        check(hipStreamWaitEvent(w.stream, m.owner.bulk_input, 0), "wait for bulk Flash inputs");
+        // Only one visit is staged. Never read beyond this tile range's final visible key. Recopy from
+        // canonical storage also after restore, with no persistent mirror cursor or rollback protocol.
+        auto* p = reinterpret_cast<uint8_t*>(w.memory);
+        const auto copy = [&](auto* src, size_t count) {
+            using T = std::remove_pointer_t<decltype(src)>;
+            auto* dst = reinterpret_cast<T*>(p);
+            const size_t bytes = count * sizeof(T);
+            check(hipMemcpyPeerAsync(p, w.device, src, m.owner.device, bytes, w.stream), "stage bulk Flash inputs");
+            p += bytes;
+            return dst;
+        };
+        Attend h = a;
+        h.n = cut;
+        const size_t keys = a.pos + cut;
+        h.k.data = copy(a.k.data, keys * kBulkCode); h.k.scales = copy(a.k.scales, keys * kBulkScale);
+        h.v.data = copy(a.v.data, keys * kBulkCode); h.v.scales = copy(a.v.scales, keys * kBulkScale);
+        h.q = copy(a.q, cut * kBulkQ); h.gate = copy(a.gate, cut * kBulkQ);
+        h.rel = copy(a.rel, cut * kBulkRel); h.sink = copy(a.sink, cut * kBulkHeads);
+        h.table = copy(a.table, kTableWords); h.out = reinterpret_cast<float*>(p);
+        attend_flash_lean(h, w.stream);
+        check(hipMemcpyPeerAsync(a.out, m.owner.device, h.out, w.device, size_t(cut) * kBulkQ * sizeof(float),
+                                 w.stream), "return bulk Flash rows");
+        check(hipEventRecord(w.ready, w.stream), "publish bulk Flash result");
+        check(hipSetDevice(m.owner.device), "select bulk Flash owner");
+        check(hipStreamWaitEvent(m.model_stream, w.ready, 0), "join bulk Flash results");
+    } catch (...) {
+        w.wait(w.stream);
+        throw;
+    }
+    return true;
 }
 
 void set_budget(Mirror& mirror, int64_t prompt_rows, int64_t max_new) {

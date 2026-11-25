@@ -924,6 +924,17 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
         } else {
             try {
                 auto mirrors = inkling::kv_helpers::create_pair(r0->opt_.max_context, {cs(r0->st_), cs(r1->st_)});
+                if (enabled("STRATA_INKLING_FLASH_HELPERS") && r0->flash_ && r1->flash_ &&
+                    enabled("STRATA_INKLING_FLASH_LEAN") && enabled("STRATA_INKLING_LANE_PROB") &&
+                    !enabled("STRATA_INKLING_FLASH_H2")) {
+                    try {
+                        inkling::kv_helpers::enable_flash_rows(mirrors);
+                        std::fputs("strata-poly: STRATA_INKLING_FLASH_HELPERS=1: split bulk full Flash query tiles\n", stderr);
+                    } catch (const std::runtime_error& e) {
+                        (void) cudaGetLastError();
+                        std::fprintf(stderr, "strata-poly: bulk Flash helpers unavailable: %s; keeping decode helpers\n", e.what());
+                    }
+                }
                 r0->kv_helper_ = std::move(mirrors[0]);
                 r1->kv_helper_ = std::move(mirrors[1]);
                 std::fputs("strata-poly: STRATA_INKLING_KV_HELPERS=1: TP2 full-attention decode on GPUs 0/2 and 1/3\n",
@@ -2039,6 +2050,9 @@ void Inkling2::attention(const Block& b, int n) {
     a.kv_heads = n_kv_;
     a.out = att_;
     const auto attend_local = [&] {
+#if defined(STRATA_HIP_GFX906)
+        if (n >= 2047 && !swa && kv_helper_ && inkling::kv_helpers::try_flash_rows(*kv_helper_, a)) return;
+#endif
         // Prompt batches only: a token's answer and short calls keep the usual kernels and their sums.
         if (flash_ && n >= kStageRows) inkling::attend_flash(a, cs(st_));
         else if (decode_ && n < kStageRows) {
