@@ -10,8 +10,10 @@
 // With STRATA_INKLING_FLASH_H2=1 (and LANE_PROB=1) the flash cases on a Q8_0 cache take the half-product kernel:
 // its operands are rounded to 11 bits, so those cases are held to 1e-3 instead.
 // On gfx906, --factored compares the partials, FP32 output and Q8_1 bytes against stock decode.
-// Run once with STRATA_INKLING_DECODE_DPP=1 (split and fallback), once with it unset (fallback only).
+// Run once with STRATA_INKLING_DECODE_DPP=1 (split, fallback and both KV helper half-head layouts on one GPU),
+// once with it unset (fallback only).
 #include "inkling_attend.hpp"
+#include "inkling_kv_helpers.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 
 #include <cuda_fp16.h>
@@ -69,7 +71,64 @@ struct FactoredCheck {
     int kv = 4;
     bool dpp = false;
     Capacity limit = Capacity::Real;
+    bool halves = false;
 };
+
+#if defined(STRATA_HIP_GFX906)
+bool half_matches(const Attend& a, float* scores, void* q8, const std::vector<uint8_t>& ref_out,
+                  const std::vector<uint8_t>& ref_q8) {
+    using namespace kv_helpers;
+    const auto check = [](cudaError_t err) {
+        if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
+    };
+    std::vector<void*> compact;
+    const auto pack_upper = [&](const void* src, size_t half_row, int64_t rows) {
+        uint8_t* dst = nullptr;
+        check(cudaMalloc(&dst, half_row * rows));
+        compact.push_back(dst);
+        check(cudaMemcpy2D(dst, half_row, static_cast<const uint8_t*>(src) + half_row, 2 * half_row,
+                           half_row, rows, cudaMemcpyDeviceToDevice));
+        return dst;
+    };
+    const auto matches = [&](const std::vector<uint8_t>& ref, const void* actual, bool upper) {
+        const size_t half_row = ref.size() / (2 * a.n);
+        const size_t pitch = half_row * (upper ? 1 : 2);
+        std::vector<uint8_t> half(half_row * a.n);
+        check(cudaMemcpy2D(half.data(), half_row, actual, pitch, half_row, a.n, cudaMemcpyDeviceToHost));
+        for (int row = 0; row < a.n; ++row)
+            if (std::memcmp(ref.data() + (2 * row + upper) * half_row, half.data() + row * half_row, half_row))
+                return false;
+        return true;
+    };
+
+    const auto poison = [&] {
+        check(cudaMemset(a.out, 0xff, ref_out.size()));
+        check(cudaMemset(q8, 0xff, ref_q8.size()));
+        check(cudaMemset(chunks, 0xff, decode_floats() * sizeof(float)));
+    };
+    poison();
+    attend_decode_half(a, chunks, scores, q8, nullptr);
+    const bool owner = matches(ref_out, a.out, false) && matches(ref_q8, q8, false);
+
+    constexpr int heads = kHalfKvHeads * kQueriesPerKv;
+    constexpr size_t code_row = kHalfKvHeads * kHeadWidth, scale_row = code_row / kQ8BlockValues * sizeof(uint16_t);
+    const int64_t span = a.pos + a.n;
+    Attend b = a;
+    b.q = reinterpret_cast<float*>(pack_upper(a.q, heads * kHeadWidth * sizeof(float), a.n));
+    b.gate = reinterpret_cast<float*>(pack_upper(a.gate, heads * kHeadWidth * sizeof(float), a.n));
+    b.rel = reinterpret_cast<float*>(pack_upper(a.rel, heads * kRelativeWidth * sizeof(float), a.n));
+    b.sink = reinterpret_cast<float*>(pack_upper(a.sink, heads * sizeof(float), a.n));
+    b.k = {pack_upper(a.k.data, code_row, span), reinterpret_cast<uint16_t*>(pack_upper(a.k.scales, scale_row, span))};
+    b.v = {pack_upper(a.v.data, code_row, span), reinterpret_cast<uint16_t*>(pack_upper(a.v.scales, scale_row, span))};
+    b.kv_heads = kHalfKvHeads;
+    poison();
+    attend_decode_half(b, chunks, scores, q8, nullptr);
+    const bool helper = matches(ref_out, b.out, true) && matches(ref_q8, q8, true);
+    for (void* p : compact) check(cudaFree(p));
+    std::printf("  half heads FP32 + Q8_1: owner stride 4 %d, helper stride 2 %d\n", owner, helper);
+    return owner && helper;
+}
+#endif
 
 bool factored_matches(const char* name, const Attend& a, float* scores, size_t capacity, const FactoredCheck& test) {
     const size_t heads = a.kv_heads * (kHeads / kKv);
@@ -113,8 +172,12 @@ bool factored_matches(const char* name, const Attend& a, float* scores, size_t c
     const std::vector<uint8_t> untouched(sizeof(float), 0xff);
     const bool split = download(scores, sizeof(float)) != untouched;
     const bool guard_ok = offered == capacity || download(scores + offered, sizeof(float)) == untouched;
+    bool halves_ok = true;
+#if defined(STRATA_HIP_GFX906)
+    if (test.halves && test.dpp) halves_ok = half_matches(a, scores, q8, ref_out, ref_q8);
+#endif
     check(cudaFree(q8));
-    const bool ok = partials_ok && out_ok && q8_ok && split == expect_split && guard_ok;
+    const bool ok = partials_ok && out_ok && q8_ok && split == expect_split && guard_ok && halves_ok;
     std::printf("%-31s expected %-8s partials %d FP32 %d Q8_1 %d dispatch %d guard %d%s\n", name,
                 expect_split ? "split" : "stock", partials_ok, out_ok, q8_ok, split == expect_split, guard_ok,
                 ok ? "" : " FAIL");
@@ -323,6 +386,12 @@ int main(int argc, char** argv) {
         check({"full T4 one float short", 19127, 4, false, true}, 4, Capacity::Short);
         check({"full T4 256K capacity", kFactoredContext - 4, 4, false, true});
         check({"window T4 at 256K, no sink", kFactoredContext - 4, 4, true, true, -INFINITY});
+        if (dpp) {
+            const FactoredCheck halves{4, true, Capacity::Exact, true};
+            for (int n = 1; n <= 4; ++n)
+                ok = run({"full half-heads after 64K", 65536, n, false, true}, scores, nullptr, tiles, false, &halves)
+                     && ok;
+        }
         check({"window T5", 2048, 5, true, true});
         check({"full T8 after 64K", 65536, 8, false, true});
         check({"full T7 at 256K", kFactoredContext - 7, 7, false, true});

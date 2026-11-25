@@ -2,6 +2,7 @@
 #pragma once
 
 #include "engine.hpp"
+#include "inkling_kv_helpers.hpp"
 #include "tp2_comm.hpp"
 
 #include <array>
@@ -20,6 +21,9 @@ public:
     ~Inkling2() override;
 
     bool sees() const override { return true; }
+#if defined(STRATA_HIP_GFX906)
+    void request_budget(int64_t prompt_rows, int64_t max_new) override;
+#endif
     size_t card_row_bytes() const override;
     void save_card_rows(int64_t first, int64_t n, uint8_t* dst) override;
     void load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) override;
@@ -102,6 +106,7 @@ private:
     void* gpu_route_q8_ = nullptr;
     bool gpu_route_failed_ = false, gpu_prefill_route_ = false;
     bool prefill_depth_share_ = false;
+    inkling::kv_helpers::MirrorPtr kv_helper_;
     bool gpu_route_supported() const;
     bool gpu_decode_supported() const;
     void init_gpu_route(bool decode, bool prefill);

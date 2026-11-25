@@ -294,6 +294,9 @@ public:
         if (stage_lent_) narrow_stage();
     }
 
+    /// Optional cost hint before a request. Does not change the tokens read, generated or kept.
+    virtual void request_budget(int64_t /*prompt_rows*/, int64_t /*max_new*/) {}
+
     /// Whether the architecture reads pictures.
     virtual bool sees() const { return false; }
     /// The pictures of the sequence, in its order, in place of the ones set before.  eval() reads a row that lies

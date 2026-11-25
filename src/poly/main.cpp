@@ -461,6 +461,7 @@ struct Session {
         Result r;
         const int64_t n = (int64_t) ids.size();
         Clock::time_point t0 = Clock::now(), shown = t0;   // bringing a parked conversation back is prompt time
+        engine.request_budget(n, max_new);
         engine.images(pictures.at.data(), (int) pictures.at.size());
         r.resume = kept.resume(ids);
         if (const size_t freed = engine.trim_kv(n)) {

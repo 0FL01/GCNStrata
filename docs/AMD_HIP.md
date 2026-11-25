@@ -711,6 +711,23 @@ score buffer, with no extra allocation. Calls that do not fit or do not meet the
 when the score plane cannot hold the whole call. Each row still uses the original call's chunk boundaries, and
 all rows use the original combine. If even one row does not fit, the fused path is used. No change to MoE routing.
 
+`STRATA_INKLING_KV_HELPERS=1` optionally uses two spare gfx906 GPUs for the upper half of each TP2 rank's
+full-attention heads. It requires exactly four visible gfx906 GPUs, bidirectional P2P for 0↔2 and 1↔3, Q8_0 KV,
+`STRATA_INKLING_DECODE=1`, `STRATA_INKLING_DECODE_DPP=1`, `STRATA_INKLING_DECODE_FACTORED=1`, and a maximum context
+above 65,536. The ordinary TP2 ranks remain on visible GPUs 0 and 1. If setup is unavailable, both ranks stay on
+the ordinary path. Flash prefill and `DECODE_SCORE_BATCH` are optional and independent.
+
+Only a request with at least 65,536 prompt rows and a budget of at least 256 output tokens is eligible. In it,
+prompt calls of at least 32 rows ending at or past row 32,768 can seed the mirrors alongside ordinary attention.
+Decode offload starts at position 65,536, only for one to four rows whose full, unsplit factored score plane fits
+the ordinary buffer. Wider or otherwise ineligible calls and all sliding-window visits stay local. The canonical
+K/V rows, checkpoints, experts and TP2 collectives stay on the two owners. A gap of more than 32,768 rows (e.g.
+after restoring a long session) stays on the owners rather than paying for a cold copy. A high output budget
+is not a promise that the answer will actually be long. Each helper reserves 4,352 bytes of compact K/V per
+configured context row across eight
+full visits, plus 96 bytes per row for scores and about 2 MiB of fixed scratch. At 131,072 rows this is
+about 558 MiB per spare GPU, plus about 1.1 MiB of staging on each owner. The option is off by default.
+
 `STRATA_INKLING_PREFILL_DEPTH_SHARE=1` is independent of decode. On two gfx906 cards, a 2047/2048-row prompt
 chunk can share one raw depth mix and its RMS between Q, K and V on the 20 sliding-window visits with messages.
 Each stream still runs its own message controller. Full-attention visits, other widths and verifier windows do not use it.

@@ -879,6 +879,25 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
             std::fputs("strata-poly: STRATA_INKLING_PREFILL_DEPTH_SHARE=1: TP2 SWA message input reuse at T=2047/2048\n",
                        stderr);
     }
+    if (enabled("STRATA_INKLING_KV_HELPERS")) {
+        if (!r0->factored_decode_ || !r1->factored_decode_ || !enabled("STRATA_INKLING_DECODE_DPP") ||
+            r0->opt_.max_context != r1->opt_.max_context || !r0->attq_ || !r1->attq_) {
+            std::fputs("strata-poly: STRATA_INKLING_KV_HELPERS=1 unavailable: both TP2 ranks need gfx906, Q8_0 KV, "
+                       "DECODE, DECODE_DPP, DECODE_FACTORED and matching context limits; using ordinary TP2\n", stderr);
+        } else {
+            try {
+                auto mirrors = inkling::kv_helpers::create_pair(r0->opt_.max_context, {cs(r0->st_), cs(r1->st_)});
+                r0->kv_helper_ = std::move(mirrors[0]);
+                r1->kv_helper_ = std::move(mirrors[1]);
+                std::fputs("strata-poly: STRATA_INKLING_KV_HELPERS=1: TP2 full-attention decode on GPUs 0/2 and 1/3\n",
+                           stderr);
+            } catch (const std::runtime_error& e) {
+                (void) cudaGetLastError();
+                std::fprintf(stderr, "strata-poly: STRATA_INKLING_KV_HELPERS=1 unavailable: %s; using ordinary TP2\n",
+                             e.what());
+            }
+        }
+    }
 #endif
     ck(cudaSetDevice(0), "tp2 setDevice 0");
     r0->peer_ = std::move(r1);
@@ -1000,6 +1019,13 @@ void Inkling2::peer_wait() {
 }
 
 void Inkling2::on_loaded() {
+#if defined(STRATA_HIP_GFX906)
+    if (tp_size_ != 2) {
+        const char* helpers = std::getenv("STRATA_INKLING_KV_HELPERS");
+        if (helpers && !std::strcmp(helpers, "1"))
+            std::fputs("strata-poly: STRATA_INKLING_KV_HELPERS=1 unavailable without TP2\n", stderr);
+    }
+#endif
     if (tp_size_ == 2 && all_cached()) {
         for (size_t il = 0; il < layers_.size(); ++il) {
             layers_[il].exp_gate = nullptr;
@@ -1118,7 +1144,19 @@ void Inkling2::count_gpu_route(int n) {
 }
 #endif
 
+#if defined(STRATA_HIP_GFX906)
+void Inkling2::request_budget(int64_t prompt_rows, int64_t max_new) {
+    if (!kv_helper_ || !peer_) return;
+    // Both ranks are idle between requests. Ordinary TP2 and the speculation controller need no hint.
+    inkling::kv_helpers::set_budget(*kv_helper_, prompt_rows, max_new);
+    inkling::kv_helpers::set_budget(*peer_->kv_helper_, prompt_rows, max_new);
+}
+#endif
+
 void Inkling2::on_reset() {
+#if defined(STRATA_HIP_GFX906)
+    if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, 0);
+#endif
     if (!peer_) return;
     peer_dispatch(PeerCmd::kReset);
     peer_wait();
@@ -1549,6 +1587,9 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
     if (from < 0 || first < from || n < 0 || first + n > from + count || first + n > opt_.max_context)
         throw std::logic_error("load_rows: outside saved rows");
     if (!n) return;
+#if defined(STRATA_HIP_GFX906)
+    if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, first);
+#endif
     cover(first + n);
     ck(cudaStreamSynchronize(cs(st_)), "load Inkling rows");
     for (int i = 0; i < kVisits; ++i) if (!local(i)) {
@@ -1729,6 +1770,10 @@ void Inkling2::save_layer(int il, int64_t pos, uint8_t* dst) {
 }
 
 void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
+#if defined(STRATA_HIP_GFX906)
+    // A restored state can refer to a different prefix at the same position. Rebuild only from canonical rows.
+    if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, 0);
+#endif
     const size_t one = (size_t) std::min(opt_.max_context, kWindow - 1) * kv_bytes();
     for (int i = 0; i < kVisits; ++i) if (local(i)) {
         ring_state(i, pos, src, nullptr);
@@ -1879,12 +1924,35 @@ void Inkling2::attention(const Block& b, int n) {
     a.ring = swa ? ring_ : 0;
     a.kv_heads = n_kv_;
     a.out = att_;
-    // Prompt batches only: a token's answer and short calls keep the plain kernels and their sums.
-    if (flash_ && n >= kStageRows) inkling::attend_flash(a, cs(st_));
-    else if (decode_ && n < kStageRows) {
-        inkling::attend_decode(a, chunks_, cs(st_), attq_, factored_decode_ ? scores_ : nullptr,
-                               factored_decode_ ? inkling::plain_score_floats(attend_tiles_) : 0);
-    } else inkling::attend_plain(a, scores_, partial_, attend_tiles_, cs(st_));
+    const auto attend_local = [&] {
+        // Prompt batches only: a token's answer and short calls keep the usual kernels and their sums.
+        if (flash_ && n >= kStageRows) inkling::attend_flash(a, cs(st_));
+        else if (decode_ && n < kStageRows) {
+            inkling::attend_decode(a, chunks_, cs(st_), attq_, factored_decode_ ? scores_ : nullptr,
+                                   factored_decode_ ? inkling::plain_score_floats(attend_tiles_) : 0);
+        } else inkling::attend_plain(a, scores_, partial_, attend_tiles_, cs(st_));
+    };
+#if defined(STRATA_HIP_GFX906)
+    if (kv_helper_ && !swa) {
+        using namespace inkling::kv_helpers;
+        static_assert(kVisits / kBlock == kFullVisits && kKv / 2 == kOwnerKvHeads && kWindow == kTableRows &&
+                      kRelative == kRelativeWidth && kHead == kHeadWidth && kMaxRows < kStageRows);
+        const auto path = try_visit(*kv_helper_, a, visit_ / kBlock, chunks_, scores_,
+                                    inkling::plain_score_floats(attend_tiles_), attq_);
+        if (path == Visit::Offloaded) return;
+        if (path == Visit::Seeding) {
+            try {
+                attend_local();
+            } catch (...) {
+                join_seed(*kv_helper_);
+                throw;
+            }
+            join_seed(*kv_helper_);
+            return;
+        }
+    }
+#endif
+    attend_local();
 }
 
 void Inkling2::depth_mix(const float* query, float* dst, int first, int n) {
