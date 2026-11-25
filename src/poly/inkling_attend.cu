@@ -1088,16 +1088,28 @@ void attend_decode(const Attend& a, float* scratch, cudaStream_t st, void* q8,
         const char* value = std::getenv("STRATA_INKLING_DECODE_DPP");
         return value && value[0] == '1' && value[1] == '\0';
     }();
-    if (scores && dpp && a.kv_heads == 4 && a.k.scales && a.v.scales && a.n >= 1 && a.n <= 4) {
+    static const bool batch_rows = [] {
+        const char* value = std::getenv("STRATA_INKLING_DECODE_SCORE_BATCH");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (scores && dpp && a.kv_heads == 4 && a.k.scales && a.v.scales && a.n >= 1 && a.n <= (batch_rows ? 8 : 4)) {
         const int span = int(a.window ? std::min<int64_t>(a.window, a.pos + a.n) : a.pos + a.n);
-        if (span > 0 && size_t(span) <= capacity / (a.n * 12)) {
-            // At T <= 4, the original decode budget allows all 128 target chunks.
+        const bool whole = span > 0 && size_t(span) <= capacity / (a.n * 12);
+        const int fit = whole ? a.n : (span > 0 && batch_rows ? int(capacity / (size_t(span) * 12)) : 0);
+        if (fit) {
+            // At T <= 8 the original decode budget still allows 128 target chunks. Batching scores may
+            // move independent rows, but never recompute a row's chunks as if it had a shorter call.
             const int chunk = std::max(32, div_up(div_up(span, 128), 8) * 8), chunks = div_up(span, chunk);
             const int packet = a.n <= 2 ? 16 : chunk;
-            decode_q8_score_kernel<<<dim3(div_up(span, packet), a.n), 128, 0, st>>>(
-                a.q, a.rel, a.table, a.k, a.pos, a.window, a.ring, packet, span, scores);
-            decode_q8_value_kernel<<<dim3(chunks, a.n), 128, 0, st>>>(
-                a.v, a.pos, a.window, a.ring, chunk, scores, span, scratch);
+            const int batch = whole ? a.n : div_up(a.n, div_up(a.n, fit));
+            for (int row = 0; row < a.n; row += batch) {
+                const int n = std::min(batch, a.n - row);
+                decode_q8_score_kernel<<<dim3(div_up(span, packet), n), 128, 0, st>>>(
+                    a.q + row * 12 * kHead, a.rel + row * 12 * kRelative, a.table, a.k, a.pos + row, a.window,
+                    a.ring, packet, span, scores);
+                decode_q8_value_kernel<<<dim3(chunks, n), 128, 0, st>>>(a.v, a.pos + row, a.window, a.ring, chunk,
+                    scores, span, scratch + (size_t) row * 4 * chunks * kChunkFloats);
+            }
             decode_combine_kernel<4><<<dim3(12, a.n), kHead, 0, st>>>(scratch, chunks, a.sink, a.gate, a.out,
                                                                       static_cast<Q81*>(q8));
             check("Inkling factored decode attention");

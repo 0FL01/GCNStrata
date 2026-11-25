@@ -52,6 +52,7 @@ void attend_decode(const Attend& a, float* scratch, cudaStream_t st, void* q8 = 
 
 /// On gfx906, an opted-in TP2 caller can lend the existing plain score buffer and its capacity in floats.
 /// If Q8_0, DPP, T=1..4 and capacity permit, split the scores from the value scan without changing its order.
+/// SCORE_BATCH also covers T<=8 and can stage subsets of rows with the original full call's chunk geometry.
 /// Otherwise the buffer is untouched and the usual fused producer runs. It must not overlap `scratch`.
 void attend_decode(const Attend& a, float* scratch, cudaStream_t st, void* q8, float* scores, size_t score_floats);
 

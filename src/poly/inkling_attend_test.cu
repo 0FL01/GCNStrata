@@ -65,7 +65,7 @@ int64_t cache_rows(const Case& c) { return c.swa ? kWindow + 512 - 1 : c.pos + c
 float* chunks = nullptr;   // attend_decode()'s scratch
 
 struct FactoredCheck {
-    enum class Capacity { Real, Exact, Short };
+    enum class Capacity { Real, Exact, Short, LessThanRow };
     int kv = 4;
     bool dpp = false;
     Capacity limit = Capacity::Real;
@@ -78,9 +78,13 @@ bool factored_matches(const char* name, const Attend& a, float* scores, size_t c
     const int64_t span = a.window ? std::min<int64_t>(a.window, a.pos + a.n) : a.pos + a.n;
     const size_t required = a.n * heads * span;
     const size_t offered = test.limit == FactoredCheck::Capacity::Real ? capacity :
-                           test.limit == FactoredCheck::Capacity::Exact ? required : required - 1;
+                           test.limit == FactoredCheck::Capacity::Exact ? required :
+                           test.limit == FactoredCheck::Capacity::LessThanRow ? required / a.n - 1 : required - 1;
     if (offered > capacity) throw std::runtime_error("factored test offers more scratch than allocated");
-    const bool expect_split = test.dpp && a.k.scales && test.kv == 4 && a.n <= 4 && offered >= required;
+    const char* batch = std::getenv("STRATA_INKLING_DECODE_SCORE_BATCH");
+    const bool wide = batch && !std::strcmp(batch, "1");
+    const bool expect_split = test.dpp && a.k.scales && test.kv == 4 && a.n <= (wide ? 8 : 4) &&
+                              offered >= (wide ? required / a.n : required);
     const auto check = [](cudaError_t err) {
         if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
     };
@@ -319,7 +323,11 @@ int main(int argc, char** argv) {
         check({"full T4 one float short", 19127, 4, false, true}, 4, Capacity::Short);
         check({"full T4 256K capacity", kFactoredContext - 4, 4, false, true});
         check({"window T4 at 256K, no sink", kFactoredContext - 4, 4, true, true, -INFINITY});
-        check({"window T5 fallback", 2048, 5, true, true});
+        check({"window T5", 2048, 5, true, true});
+        check({"full T8 after 64K", 65536, 8, false, true});
+        check({"full T7 at 256K", kFactoredContext - 7, 7, false, true});
+        check({"full T6 cannot fit one row", 5003, 6, false, true}, 4, Capacity::LessThanRow);
+        check({"window T9 fallback", 4095, 9, true, true});
         check({"FP16 fallback", 2048, 4, true, false});
         check({"TP1 fallback", 2048, 4, true, true}, 8);
         cudaFree(chunks);
