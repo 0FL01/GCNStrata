@@ -4565,7 +4565,11 @@ void Engine::moe_add(int n) { axpy(h_cpu_, 1.f, fo_, n * n_embd_, true, st_); }
 // With every routed expert in VRAM, a few tokens' experts are routed on the card and found there by its picks
 // (moe_card()), so a layer never waits for the host.  The cache's slots go to the card again when they changed.
 bool Engine::card_moe(int n) {
-    if (!all_cached() || !d_slots_ || n * n_used_ > card_rows() || opt_.dump) return false;
+    return n * n_used_ <= card_rows() && refresh_card_slots();
+}
+
+bool Engine::refresh_card_slots() {
+    if (!all_cached() || !d_slots_ || opt_.dump) return false;
     bool same = !h_slots_.empty();
     for (int il = lo_; il < hi_ && same; ++il) {
         const Layer& L = layers_[(size_t) il];

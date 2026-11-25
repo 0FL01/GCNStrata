@@ -610,6 +610,7 @@ protected:
     void moe_router(const Layer& L, int n);
     bool moe(Layer& L, int il, int n, const std::function<void()>* first = nullptr);
     bool card_moe(int n);
+    bool refresh_card_slots();   // residency + pointer-table refresh, independent of the caller's row scratch
     bool moe_card(Layer& L, int il, int n);
     const float* biased(const Layer& L, const float* scores);
     /// Whether n tokens take layer L's routed experts as a prompt batch, through MMQ (moe_rows()), and not a few at

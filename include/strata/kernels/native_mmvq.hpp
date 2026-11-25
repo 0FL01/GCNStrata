@@ -238,6 +238,14 @@ struct MmvqSegments {
     int rows[kMost] = {};
 };
 bool native_mmvq_segments(int ggml_type, const MmvqSegments& s, int n_in, void* stream);
+/// Q8_0 y[c][row] for ncols 1..8 Q8_1 columns (n_in / 32 blocks a column, back to back): each column's sum in exactly
+/// native_mmvq_segments()'s order (one 32-lane warp a row, the same lane-to-block map and warp_sum), so a window's
+/// row equals the one-token projection bit for bit.  False when the shape is not supported.
+bool native_q8_0_segments_cols(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                               void* stream);
+/// The same for several Q8_0 matrices of n_in inputs in one launch, as native_mmvq_segments() groups them for one
+/// token: segment j's ncols columns at s.x[j], its rows s.rows[j], y[c * rows + row] at s.y[j].
+bool native_q8_0_segments_cols_grouped(const MmvqSegments& s, int n_in, int ncols, void* stream);
 #if defined(STRATA_HIP_GFX906)
 // Single-token Inkling TP2 Q4_0 [Q,] gate, rel. One shared Q8_1 input, disjoint
 // outputs, existing gfx906 wave64 R4 dispatch. Caller verifies gfx906 wave64.

@@ -865,6 +865,107 @@ decode_q8_score_kernel(const float* q, const float* rel, const float* table, KvV
 }
 
 
+// decode_q8_value_kernel with each row's own T1 chunk partition (STRATA_INKLING_ROW_CHUNKS): the same sums, a
+// row whose span crosses a step of factored_chunk() keeps the chunks it has alone.  `pitch` chunks a row in part.
+template <int KvStride, bool PerHead = false>
+__global__ void __launch_bounds__(128, 2)
+decode_q8_value_rows_kernel(KvView v, int64_t pos, int window,
+                 int ring, int pitch, const float* scores, int span, float* part) {
+    const int c = blockIdx.x, row = blockIdx.y, g = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int sub = lane & 7, quad = lane >> 3;   // the 16 dimensions of the lane, and which of four keys
+    const int64_t end = pos + row + 1, start = oldest(end, window);
+    const int count = (int) (end - start);
+    // this row's own T1 partition (factored_chunk() of its own span), not the call's widest row's
+    const int chunk = max(32, ((count + 127) / 128 + 7) / 8 * 8);
+    if (c >= (count + chunk - 1) / chunk) return;
+    const int first = c * chunk, last = min(first + chunk, count);
+    constexpr int queries = PerHead ? 1 : kGroup;
+    const int first_query = PerHead ? blockIdx.z : 0;
+    float m[queries], l[queries], acc[queries][16];
+#pragma unroll
+    for (int r = 0; r < queries; ++r) {
+        m[r] = -INFINITY;
+        l[r] = 0.f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) acc[r][j] = 0.f;
+    }
+    const int8_t* vd = reinterpret_cast<const int8_t*>(v.data);
+    const __half* vsc = reinterpret_cast<const __half*>(v.scales);
+    for (int i0 = first; i0 < last; i0 += 4 * kAttUnroll) {
+        int4 vw[kAttUnroll];
+        float vs[kAttUnroll];
+        // every key's loads before any is used
+#pragma unroll
+        for (int u = 0; u < kAttUnroll; ++u) {
+            const int i = i0 + 4 * u + quad;
+            if (i < last) {
+                const int64_t key = start + i;
+                const size_t at = ((size_t) (ring ? key % ring : key) * KvStride + g) * kHead + 16 * sub;
+                vw[u] = *reinterpret_cast<const int4*>(vd + at);
+                vs[u] = __half2float(vsc[at / 32]);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kAttUnroll; ++u) {
+            const int i = i0 + 4 * u + quad;
+            if (i >= last) continue;   // a whole group of eight lanes: the shuffles below stay inside it
+            const float* sc = scores + (((size_t) row * span + i) * KvStride + g) * kGroup + first_query;
+            const int vwords[4] = {vw[u].x, vw[u].y, vw[u].z, vw[u].w};
+            float val[16];
+#pragma unroll
+            for (int x = 0; x < 4; ++x)
+#pragma unroll
+                for (int y = 0; y < 4; ++y) val[4 * x + y] = (float) (int8_t) (vwords[x] >> (8 * y)) * vs[u];
+#pragma unroll
+            for (int r = 0; r < queries; ++r) {
+                const float next = fmaxf(m[r], sc[r]);
+                // every score so far -inf (overflowed terms): the exponentials are 0, as attend_plain() gives them
+                const float base = next == -INFINITY ? 0.f : next;
+                const float keep = expf(m[r] - base), p = expf(sc[r] - base);
+                m[r] = next;
+                l[r] = l[r] * keep + p;
+#pragma unroll
+                for (int j = 0; j < 16; ++j) {
+                    // gfx906's grouped value kernel rounds the rescale before fusing the new term.
+                    if constexpr (PerHead) acc[r][j] = fmaf(p, val[j], acc[r][j] * keep);
+                    else acc[r][j] = acc[r][j] * keep + p * val[j];
+                }
+            }
+        }
+    }
+    // the wave's four groups of keys into one (lanes 8 and 16 apart hold the same dimensions)
+#pragma unroll
+    for (int r = 0; r < queries; ++r) {
+        float top = fmaxf(m[r], decode_xor<8, true>(m[r]));
+        top = fmaxf(top, decode_xor<16, true>(top));
+        const float base = top == -INFINITY ? 0.f : top;
+        const float f = expf(m[r] - base);
+        float sum = l[r] * f;
+        sum += decode_xor<8, true>(sum);
+        sum += decode_xor<16, true>(sum);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            float a = acc[r][j] * f;
+            a += decode_xor<8, true>(a);
+            a += decode_xor<16, true>(a);
+            acc[r][j] = a;
+        }
+        m[r] = top;
+        l[r] = sum;
+    }
+    if (quad != 0) return;
+    float* dst = part + (((size_t) row * KvStride + g) * pitch + c) * kChunkFloats + first_query * (kHead + 2);
+#pragma unroll
+    for (int r = 0; r < queries; ++r) {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) dst[r * (kHead + 2) + 2 + 16 * sub + j] = acc[r][j];
+        if (sub == 0) {
+            dst[r * (kHead + 2)] = m[r];
+            dst[r * (kHead + 2) + 1] = l[r];
+        }
+    }
+}
+
 template <int KvStride, bool PerHead = false>
 __global__ void __launch_bounds__(128, 2)
 decode_q8_value_kernel(KvView v, int64_t pos, int window,
@@ -962,6 +1063,27 @@ decode_q8_value_kernel(KvView v, int64_t pos, int window,
 
 constexpr int kFactoredTargetChunks = 128;
 int factored_chunk(int span) { return std::max(32, div_up(div_up(span, kFactoredTargetChunks), 8) * 8); }
+bool row_chunks() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_INKLING_ROW_CHUNKS");
+        return v && v[0] == '1' && !v[1];
+    }();
+    return on;
+}
+// The most chunks any row of a call at pos takes with its own T1 partition, or 0 when every row's partition is the
+// call's (chunk step and count): then the stock kernels already sum each row as it would alone.
+int row_pitch(int64_t pos, int window, int n, int chunks) {
+    const auto span = [&](int r) { const int64_t e = pos + r + 1; return (int) (window && e > window ? window : e); };
+    const int step = factored_chunk(span(n - 1));
+    bool same = true;
+    int most = 0;
+    for (int r = 0; r < n; ++r) {
+        const int s = span(r), k = factored_chunk(s), m = div_up(s, k);
+        same = same && k == step && m == chunks;
+        most = std::max(most, m);
+    }
+    return same ? 0 : most;
+}
 #endif
 
 // A chunk with no keys left -inf, 0 and zeros. The sink as probs_kernel takes it, -inf (no sink) included.
@@ -977,6 +1099,47 @@ __global__ void decode_combine_kernel(const float* part, int chunks, const float
     const int h = blockIdx.x, row = blockIdx.y, d = threadIdx.x, g = h / kGroup, r = h % kGroup;
     const size_t qh = (size_t) row * Heads + h;
     const float* base = part + ((size_t) row * KvHeads + g) * chunks * kChunkFloats + r * (kHead + 2);
+    const float s = sink[qh];
+    float top = s;
+    // unrolled for the loads, the max and the sums in chunk order as one chunk at a time
+#pragma unroll 8
+    for (int c = 0; c < chunks; ++c) top = fmaxf(top, base[(size_t) c * kChunkFloats]);
+    const float at = top == -INFINITY ? 0.f : top;
+    float sum = expf(s - at), o = 0.f;
+#pragma unroll 8
+    for (int c = 0; c < chunks; ++c) {
+        const float* p = base + (size_t) c * kChunkFloats;
+        const float w = expf(p[0] - at);
+        sum += p[1] * w;
+        o += p[2 + d] * w;
+    }
+    const float y = o / sum / (1.f + expf(-gate[qh * kHead + d]));
+    out[qh * kHead + d] = y;
+    if (q8) {   // a warp holds a block's 32 values in lane order, as native_quantize_q8_1_kernel's do
+        float amax = fabsf(y), bsum = y;
+#pragma unroll
+        for (int o2 = 16; o2 > 0; o2 >>= 1) {
+            amax = fmaxf(amax, __shfl_xor(amax, o2, 32));
+            bsum += __shfl_xor(bsum, o2, 32);
+        }
+        const float dq = kernels::q8_1_finite(amax / 127.0f);
+        Q81& b = q8[(qh * kHead + d) / 32];
+        b.qs[d % 32] = kernels::q8_1_quant(y, dq, amax);
+        if (d % 32 == 0) b.ds = kernels::q8_1_ds(dq, bsum);
+    }
+}
+
+// decode_combine_kernel for decode_q8_value_rows_kernel's partials: each row its own chunk count.
+template <int KvHeads = kKv>
+__global__ void decode_combine_rows_kernel(const float* part, int pitch, int64_t pos, int window, const float* sink,
+                                           const float* gate, float* out, Q81* q8) {
+    constexpr int Heads = KvHeads * kGroup;
+    const int h = blockIdx.x, row = blockIdx.y, d = threadIdx.x, g = h / kGroup, r = h % kGroup;
+    const size_t qh = (size_t) row * Heads + h;
+    const int64_t end = pos + row + 1;
+    const int count = (int) (window && end > window ? window : end);
+    const int step = max(32, ((count + 127) / 128 + 7) / 8 * 8), chunks = (count + step - 1) / step;
+    const float* base = part + ((size_t) row * KvHeads + g) * pitch * kChunkFloats + r * (kHead + 2);
     const float s = sink[qh];
     float top = s;
     // unrolled for the loads, the max and the sums in chunk order as one chunk at a time
@@ -1057,10 +1220,18 @@ void kv_helpers::attend_decode_half(const Attend& a, float* partial, float* scor
                   kHead == kHeadWidth && kGroup == kQueriesPerKv);
     const int span = static_cast<int>(a.pos + a.n);
     const int chunk = factored_chunk(span), chunks = div_up(span, chunk), packet = a.n <= 2 ? 16 : chunk;
+    const int pitch = row_chunks() ? row_pitch(a.pos, 0, a.n, chunks) : 0;
     const auto run = [&]<int Stride>() {
         constexpr int threads = 32 * kHalfKvHeads;
         decode_q8_score_kernel<Stride><<<dim3(div_up(span, packet), a.n), threads, 0, st>>>(
             a.q, a.rel, a.table, a.k, a.pos, 0, 0, packet, span, scores);
+        if (pitch) {
+            decode_q8_value_rows_kernel<Stride><<<dim3(pitch, a.n), threads, 0, st>>>(
+                a.v, a.pos, 0, 0, pitch, scores, span, partial);
+            decode_combine_rows_kernel<Stride><<<dim3(kHalfKvHeads * kGroup, a.n), kHead, 0, st>>>(
+                partial, pitch, a.pos, 0, a.sink, a.gate, a.out, static_cast<Q81*>(q8));
+            return;
+        }
         decode_q8_value_kernel<Stride><<<dim3(chunks, a.n), threads, 0, st>>>(
             a.v, a.pos, 0, 0, chunk, scores, span, partial);
         decode_combine_kernel<Stride><<<dim3(kHalfKvHeads * kGroup, a.n), kHead, 0, st>>>(
@@ -1142,11 +1313,22 @@ void attend_decode(const Attend& a, float* scratch, cudaStream_t st, void* q8,
                 const char* v = std::getenv("STRATA_INKLING_SWA_VALUE_HEADS");
                 return v && v[0] == '1' && !v[1];
             }();
+            const int pitch = row_chunks() ? row_pitch(a.pos, a.window, a.n, chunks) : 0;
             for (int row = 0; row < a.n; row += batch) {
                 const int n = std::min(batch, a.n - row);
                 decode_q8_score_kernel<4><<<dim3(div_up(span, packet), n), 128, 0, st>>>(
                     a.q + row * 12 * kHead, a.rel + row * 12 * kRelative, a.table, a.k, a.pos + row, a.window,
                     a.ring, packet, span, scores);
+                if (pitch) {
+                    float* part = scratch + (size_t) row * 4 * pitch * kChunkFloats;
+                    if (split_value && a.window && a.n <= 2)
+                        decode_q8_value_rows_kernel<4, true><<<dim3(pitch, n, kGroup), 128, 0, st>>>(
+                            a.v, a.pos + row, a.window, a.ring, pitch, scores, span, part);
+                    else
+                        decode_q8_value_rows_kernel<4><<<dim3(pitch, n), 128, 0, st>>>(
+                            a.v, a.pos + row, a.window, a.ring, pitch, scores, span, part);
+                    continue;
+                }
                 float* part = scratch + (size_t) row * 4 * chunks * kChunkFloats;
                 // Few SWA chunks at narrow widths: give each query its own wave without splitting a reduction.
                 if (split_value && a.window && a.n <= 2)
@@ -1156,8 +1338,12 @@ void attend_decode(const Attend& a, float* scratch, cudaStream_t st, void* q8,
                     decode_q8_value_kernel<4><<<dim3(chunks, n), 128, 0, st>>>(
                         a.v, a.pos + row, a.window, a.ring, chunk, scores, span, part);
             }
-            decode_combine_kernel<4><<<dim3(12, a.n), kHead, 0, st>>>(scratch, chunks, a.sink, a.gate, a.out,
-                                                                      static_cast<Q81*>(q8));
+            if (pitch)
+                decode_combine_rows_kernel<4><<<dim3(12, a.n), kHead, 0, st>>>(scratch, pitch, a.pos, a.window, a.sink,
+                                                                           a.gate, a.out, static_cast<Q81*>(q8));
+            else
+                decode_combine_kernel<4><<<dim3(12, a.n), kHead, 0, st>>>(scratch, chunks, a.sink, a.gate, a.out,
+                                                                          static_cast<Q81*>(q8));
             check("Inkling factored decode attention");
             return;
         }

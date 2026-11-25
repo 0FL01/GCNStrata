@@ -2945,6 +2945,17 @@ __global__ void __launch_bounds__(256) gemv_rows_segments_kernel(F32Segments s, 
 
 }  // namespace
 
+// STRATA_GEMV_ROW_INVARIANT=1: a call of at most eight rows (a token, a verifier window, a rollback) chooses its
+// launch shape as one row does, so each row's sum does not depend on how many rows ride along; prompt batches keep
+// the stock choice (the block-a-row shape only while the whole call has few blocks).
+int gemv_shape_rows(int rows) {
+    static const bool invariant = [] {
+        const char* v = std::getenv("STRATA_GEMV_ROW_INVARIANT");
+        return v && v[0] == '1' && !v[1];
+    }();
+    return invariant && rows <= 8 ? 1 : rows;
+}
+
 void gemv_f32_waves(const float* w, const float* x, float* y, int n_in, int n_out, int rows_per_x, int rows,
                     void* stream) {
     // float4 rows: the engine's buffers are aligned and every product of a model that asks for this is whole float4s
@@ -2956,7 +2967,7 @@ void gemv_f32_waves(const float* w, const float* x, float* y, int n_in, int n_ou
                                                                                        rows_per_x);
     };
     // fewer blocks than two a compute unit of an RX 6700 XT at 32 lanes a row: a block a row instead
-    if (n_in >= 1024 && (n_out + 7) / 8 * rows < 80)
+    if (n_in >= 1024 && (n_out + 7) / 8 * gemv_shape_rows(rows) < 80)
         gemv_rows_kernel<<<dim3(n_out, rows), 256, 0, st>>>(w, x, y, n_in, n_out, rows_per_x);
     else if (n_in >= 256) launch.template operator()<32>();
     else if (n_in >= 128) launch.template operator()<16>();
@@ -2995,7 +3006,7 @@ void gemv_f32_waves_segments(const F32Segments& s, int count, int n_in, int n_ou
             s, n_in, n_out, rows_per_x);
     };
     // the choice gemv_f32_waves() makes for one segment
-    if (n_in >= 1024 && (n_out + 7) / 8 * rows < 80)
+    if (n_in >= 1024 && (n_out + 7) / 8 * gemv_shape_rows(rows) < 80)
         gemv_rows_segments_kernel<<<dim3(n_out, rows, count), 256, 0, st>>>(s, n_in, n_out, rows_per_x);
     else if (n_in >= 256) launch.template operator()<32>();
     else if (n_in >= 128) launch.template operator()<16>();

@@ -706,6 +706,32 @@ it works but is not part of this build).
 
 The vector loop preserves the FP32 polynomial operations, the order of the four FP64 mass sums and the RNG draw. Equal logits and RNG therefore do not require similar wall times. Conversely the **speculative policy uses wall time**: even a repeat of the old engine with the same seed can take different verifier windows. Compare the sampled-from logits and picks at matched windows before attributing a different live transcript to sampling.
 
+### Inkling-2-Mini: width-invariant verifier (opt-in)
+
+Four flags together make every logical row of a verifier window (2–8 rows, including the rows a `keep()` rollback
+runs again) compute exactly what that token computes alone at its own position. One-token arithmetic and prompt
+batches are unchanged. A window's logits, its committed K/V and the recurrent state are then bitwise those of serial
+decoding, so the token stream no longer depends on the drafter, the lookup, the wall-clock speculative policy or the
+window width. Greedy and sampled answers equal `--no-draft --lookup 0` decoding of the same binary.
+
+- `STRATA_INKLING_Q8_COLS=1`: a window's Q8_0 projections of the group that one token computes with
+  `native_mmvq_segments` (K/V and any other Q8_0 member of Q, gate, rel) use `native_q8_0_segments_cols_grouped`,
+  the same warp-per-row lane map, expression and `warp_sum` for each of the window's columns. The stock
+  `native_mmvq_wave` path summed these columns in a different order; the few-ULP difference survived in the FP32
+  ShortConv history and later flipped a Q8 K/V code.
+- `STRATA_INKLING_ROW_CHUNKS=1`: when the rows of a factored decode call (owner or KV helper) would otherwise take a
+  chunk step or count from the call's widest row, each row uses its own one-token partition
+  (`decode_q8_value_rows_kernel` and `decode_combine_rows_kernel`). Uniform calls keep the stock kernels.
+- `STRATA_INKLING_GPU_ROUTE_WIDE=1`: exact resident GPU routing and the fused down sum for 5–8 rows as for 1–4
+  (needs `STRATA_INKLING_GPU_ROUTE=1`, `STRATA_INKLING_DOWN_SUM=1` and at least 8 scratch rows on both ranks).
+- `STRATA_GEMV_ROW_INVARIANT=1`: an FP32 GEMV of at most 8 rows chooses its launch shape as one row does
+  (`gemv_rows` or `gemv_waves`); the router's 128 outputs had switched shape between 4 and 5 rows.
+
+Measured on four MI50 (`0d973ac9` base, Q4_0, TP2 + KV helpers): serial T1 against fixed windows T2–T8 with all
+rows kept and with mixed partial `keep()`, at 2K, 18K, across the 4096 and 8192 chunk steps and at 65,528 (KV
+helpers): every row bitwise. Untraced window cost against stock at 2K: T2 +0.26 ms, T4 −0.28 ms, T5–8 −2.6 to
+−3.1 ms; at 64K T2 +0.31 ms, T5–8 −2.4 to −2.8 ms.
+
 ### Inkling-2-Mini: opt-in factored decode attention
 
 `STRATA_INKLING_DECODE_FACTORED=1` applies to Inkling TP2 on gfx906 with Q8_0 KV,

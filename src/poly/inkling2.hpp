@@ -96,12 +96,10 @@ private:
     void load_moe_tp2(int il);
 
 #if defined(STRATA_HIP_GFX906)
-    static constexpr int kGpuRouteRows = 4;
-    struct GpuRouteReport {
-        int32_t invalid;
-        int32_t ids[kVisits * kGpuRouteRows * 8];
-    };
-    GpuRouteReport *gpu_route_dev_ = nullptr, *gpu_route_host_ = nullptr;
+    // First word is the sticky invalid flag; the rest are all visited rows' ordered picks.
+    int32_t *gpu_route_dev_ = nullptr, *gpu_route_host_ = nullptr;
+    int gpu_route_rows_ = 4;
+    bool gpu_down_sum_ = false;
     float *gpu_route_bias_ = nullptr, *gpu_route_gu_ = nullptr;
     void* gpu_route_q8_ = nullptr;
     bool gpu_route_failed_ = false, gpu_prefill_route_ = false;
@@ -141,6 +139,7 @@ private:
     bool decode_ = false;   // STRATA_INKLING_DECODE=1 (load_geometry())
     bool factored_decode_ = false;   // STRATA_INKLING_DECODE_FACTORED=1 (load_geometry())
     bool norm_q8_ = false;  // STRATA_INKLING_NORM_Q8=1 (load_geometry()): a visit's stream norms and Q8_1 together
+    bool q8_cols_ = false;  // STRATA_INKLING_Q8_COLS=1 (load_geometry()): a window's Q8_0 projections in T1's order
     bool moe_tail_ = false; // STRATA_INKLING_TAIL_MOE=1 (load_geometry()): a fused visit's expert sum in the tail
     bool cpu_sum_ = false;  // moe_add() left the CPU experts' sum for layer_tail()
     bool fo_clean_ = false; // layer_tail() left fo_ 0 for the next layer's experts (moe_shared())
@@ -151,6 +150,8 @@ private:
     // and those as Q8_1, for decode rows
     float *s3cur_ = nullptr, *s3msg_ = nullptr, *s3pair_ = nullptr, *s3rank_ = nullptr, *s3in_ = nullptr;
     void* s3q8_ = nullptr;
+    void project_cols(const Block& b, const float* xq, const float* xk, const float* xv, bool shared_kv,
+                      const void* q8, const void* k8, const void* v8, int n);
     void project(const Block& b, const float* xq, const float* xk, const float* xv, bool shared_kv, const void* q8,
                  const void* k8 = nullptr, const void* v8 = nullptr);
     bool heads(const Block& b, int il, bool swa, bool loop, int n, const Dev* const* norm);

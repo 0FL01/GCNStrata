@@ -3633,6 +3633,62 @@ __global__ void native_q8_0_segments_kernel(MmvqSegments s, int n_in) {
     if (threadIdx.x == 0) s.y[j][row] = acc;
 }
 
+// native_q8_0_segments_kernel's grid and sum (a row a warp across the segments), NC columns a weight load.
+template<int NC>
+__launch_bounds__(4 * WARP, 1)
+__global__ void native_q8_0_segments_cols_grouped_kernel(MmvqSegments s, int n_in) {
+    int row = int(blockIdx.x) * 4 + int(threadIdx.y);
+    int j = 0;
+    while (j < s.count && row >= s.rows[j]) row -= s.rows[j++];
+    if (j >= s.count) return;
+    const int nb = n_in / 32, part = int(threadIdx.x) % 8, sub = int(threadIdx.x) / 8;
+    const Q80Block* wr = static_cast<const Q80Block*>(s.w[j]) + std::size_t(row) * nb;
+    const Q81Block* x = static_cast<const Q81Block*>(s.x[j]);
+    float acc[NC] = {};
+    for (int kb = sub; kb < nb; kb += 4) {
+        const Q80Block* b = wr + kb;
+        const int v = load_int_b2(b->qs, part);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const Q81Block* xc = x + std::size_t(c) * nb;
+            const int u = reinterpret_cast<const int*>(xc[kb].qs)[part];
+            acc[c] += __half2float(b->d) * __low2float(xc[kb].ds) * float(STRATA_DP4A(v, u, 0));
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float t = warp_sum(acc[c]);
+        if (threadIdx.x == 0) s.y[j][std::size_t(c) * s.rows[j] + row] = t;
+    }
+}
+
+// native_q8_0_segments_kernel's sum, for NC columns that share each weight load.  Keep the expression identical.
+template<int NC>
+__launch_bounds__(4 * WARP, 1)
+__global__ void native_q8_0_segments_cols_kernel(const Q80Block* __restrict__ w, const Q81Block* __restrict__ x,
+                                                 float* __restrict__ y, int n_in, int n_out) {
+    const int row = int(blockIdx.x) * 4 + int(threadIdx.y);
+    if (row >= n_out) return;
+    const int nb = n_in / 32, part = int(threadIdx.x) % 8, sub = int(threadIdx.x) / 8;
+    const Q80Block* wr = w + std::size_t(row) * nb;
+    float acc[NC] = {};
+    for (int kb = sub; kb < nb; kb += 4) {
+        const Q80Block* b = wr + kb;
+        const int v = load_int_b2(b->qs, part);
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const Q81Block* xc = x + std::size_t(c) * nb;
+            const int u = reinterpret_cast<const int*>(xc[kb].qs)[part];
+            acc[c] += __half2float(b->d) * __low2float(xc[kb].ds) * float(STRATA_DP4A(v, u, 0));
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        const float t = warp_sum(acc[c]);
+        if (threadIdx.x == 0) y[std::size_t(c) * n_out + row] = t;
+    }
+}
+
 bool poly_slots_type_ok(int t) noexcept {
     return t == 8 || t == 13 || t == 40 || t == 2 || t == 3 || t == 6 || t == 7 || t == 12 || t == 14 ||
            t == 20 || t == 23 || t == 42 || t == 16 || t == 17 || t == 18 || t == 21 || t == 22 || t == 29;
@@ -3661,6 +3717,53 @@ bool native_mmvq_segments(int ggml_type, const MmvqSegments& s, int n_in, void* 
     validate_stream(stream);
     native_q8_0_segments_kernel<<<unsigned((total_rows + 3) / 4), dim3(WARP, 4), 0, static_cast<cudaStream_t>(stream)>>>(
         s, n_in);
+    launch_check();
+    return true;
+}
+bool native_q8_0_segments_cols_grouped(const MmvqSegments& s, int n_in, int ncols, void* stream) {
+    if (s.count < 1 || s.count > MmvqSegments::kMost || n_in <= 0 || n_in % 128 || ncols < 1 || ncols > 8) return false;
+    int total_rows = 0;
+    for (int j = 0; j < s.count; ++j) {
+        if (s.rows[j] <= 0) return false;
+        total_rows += s.rows[j];
+    }
+    validate_stream(stream);
+    const auto st = static_cast<cudaStream_t>(stream);
+    const dim3 grid(unsigned((total_rows + 3) / 4)), block(WARP, 4);
+    switch (ncols) {
+    case 1: native_q8_0_segments_cols_grouped_kernel<1><<<grid, block, 0, st>>>(s, n_in); break;
+    case 2: native_q8_0_segments_cols_grouped_kernel<2><<<grid, block, 0, st>>>(s, n_in); break;
+    case 3: native_q8_0_segments_cols_grouped_kernel<3><<<grid, block, 0, st>>>(s, n_in); break;
+    case 4: native_q8_0_segments_cols_grouped_kernel<4><<<grid, block, 0, st>>>(s, n_in); break;
+    case 5: native_q8_0_segments_cols_grouped_kernel<5><<<grid, block, 0, st>>>(s, n_in); break;
+    case 6: native_q8_0_segments_cols_grouped_kernel<6><<<grid, block, 0, st>>>(s, n_in); break;
+    case 7: native_q8_0_segments_cols_grouped_kernel<7><<<grid, block, 0, st>>>(s, n_in); break;
+    case 8: native_q8_0_segments_cols_grouped_kernel<8><<<grid, block, 0, st>>>(s, n_in); break;
+    }
+    launch_check();
+    return true;
+}
+bool native_q8_0_segments_cols(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
+                               void* stream) {
+    if (n_in <= 0 || n_in % 128 || n_out <= 0 || ncols < 1 || ncols > 8) return false;
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const auto st = static_cast<cudaStream_t>(stream);
+    const auto* w = static_cast<const Q80Block*>(weights);
+    const auto* x = static_cast<const Q81Block*>(x_q8_1);
+    const dim3 grid(unsigned((n_out + 3) / 4)), block(WARP, 4);
+    switch (ncols) {
+    case 1: native_q8_0_segments_cols_kernel<1><<<grid, block, 0, st>>>(w, x, y, n_in, n_out); break;
+    case 2: native_q8_0_segments_cols_kernel<2><<<grid, block, 0, st>>>(w, x, y, n_in, n_out); break;
+    case 3: native_q8_0_segments_cols_kernel<3><<<grid, block, 0, st>>>(w, x, y, n_in, n_out); break;
+    case 4: native_q8_0_segments_cols_kernel<4><<<grid, block, 0, st>>>(w, x, y, n_in, n_out); break;
+    case 5: native_q8_0_segments_cols_kernel<5><<<grid, block, 0, st>>>(w, x, y, n_in, n_out); break;
+    case 6: native_q8_0_segments_cols_kernel<6><<<grid, block, 0, st>>>(w, x, y, n_in, n_out); break;
+    case 7: native_q8_0_segments_cols_kernel<7><<<grid, block, 0, st>>>(w, x, y, n_in, n_out); break;
+    case 8: native_q8_0_segments_cols_kernel<8><<<grid, block, 0, st>>>(w, x, y, n_in, n_out); break;
+    }
     launch_check();
     return true;
 }
