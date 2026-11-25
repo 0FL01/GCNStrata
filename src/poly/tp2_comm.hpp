@@ -20,6 +20,9 @@ public:
 
     int device(int rank) const { return dev_[rank]; }
 
+    /// STRATA_TP2_SMALL_PUSH=1: publish FP32 to peer inboxes. The experimental F16 mode takes precedence.
+    static bool small_push_enabled();
+
     /// In-place sum across rank 0 and rank 1: on return, `data[0..n)` on both GPUs holds data_0 + data_1.
     /// For n <= kSmallMax, uses a single HIP-graph-safe uncached P2P ping-pong kernel (~7.5 us at T=1).
     /// For n > kSmallMax, uses FP16 hipMemcpyPeerAsync (~523 us at T=512) with host event handoff.

@@ -26,10 +26,11 @@ struct DeviceGuard {
 };
 
 // Single-block ping-pong P2P all-reduce for T <= 8 (n <= 18432 floats, n % 4 == 0).
-// Uses uncached VRAM buffers & generation flags; 100% HIP-graph capture/replay safe.
+// Pull reads the peer's outbox. Push writes the peer's inbox and publishes only after all lanes finish.
+template<bool Push>
 __global__ void p2p_ar_pingpong_f32(float* __restrict__ data,
                                     float* __restrict__ self_b0, float* __restrict__ self_b1,
-                                    const float* __restrict__ peer_b0, const float* __restrict__ peer_b1,
+                                    float* __restrict__ peer_b0, float* __restrict__ peer_b1,
                                     volatile uint32_t* __restrict__ self_flag,
                                     volatile uint32_t* __restrict__ peer_flag,
                                     uint32_t* __restrict__ gen_slot,
@@ -39,7 +40,7 @@ __global__ void p2p_ar_pingpong_f32(float* __restrict__ data,
     __shared__ uint32_t s_aborted;
     if (threadIdx.x == 0) {
         uint32_t g = *gen_slot + 1u;
-        if (g == 0u) g = 1u;   // keep 0 reserved for initial state
+        if (!Push && g == 0u) g = 1u;   // Push must alternate inboxes even at uint32 wrap.
         *gen_slot = g;
         s_slot = g & 1u;
         s_aborted = 0u;
@@ -47,23 +48,36 @@ __global__ void p2p_ar_pingpong_f32(float* __restrict__ data,
     __syncthreads();
     const uint32_t slot = s_slot;
     float* __restrict__ sb = slot ? self_b1 : self_b0;
-    const float* __restrict__ pb = slot ? peer_b1 : peer_b0;
+    float* __restrict__ pb = slot ? peer_b1 : peer_b0;
 
     const int n4 = n >> 2;
     float4* __restrict__ d4 = reinterpret_cast<float4*>(data);
-    float4* __restrict__ sb4 = reinterpret_cast<float4*>(sb);
-    const float4* __restrict__ pb4 = reinterpret_cast<const float4*>(pb);
+    float4* __restrict__ send = reinterpret_cast<float4*>(Push ? pb : sb);
+    const float4* __restrict__ recv = reinterpret_cast<const float4*>(Push ? sb : pb);
 
-    // Stage local partial sum into uncached P2P buffer
-    for (int i = threadIdx.x; i < n4; i += blockDim.x) sb4[i] = d4[i];
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) send[i] = d4[i];
+    if constexpr (Push) __threadfence_system();   // lane 0 alone cannot publish the other lanes' PCIe writes
     __syncthreads();
 
     if (threadIdx.x == 0) {
         const uint32_t g = *gen_slot;
-        __threadfence_system();
-        peer_flag[slot] = g;
-        __threadfence_system();
-        while (self_flag[slot] != g) {
+#if defined(STRATA_HIP_GFX906)
+        if constexpr (Push) {
+            __hip_atomic_store(const_cast<uint32_t*>(peer_flag) + slot, g, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+        } else
+#endif
+        {
+            __threadfence_system();
+            peer_flag[slot] = g;
+            __threadfence_system();
+        }
+        for (;;) {
+#if defined(STRATA_HIP_GFX906)
+            if constexpr (Push) {
+                if (__hip_atomic_load(const_cast<uint32_t*>(self_flag) + slot, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) == g) break;
+            } else
+#endif
+            if (self_flag[slot] == g) break;
             if (*abort_dev != 0u) {
                 s_aborted = 1u;
                 break;
@@ -72,15 +86,15 @@ __global__ void p2p_ar_pingpong_f32(float* __restrict__ data,
             __builtin_amdgcn_s_sleep(1);
 #endif
         }
-        __threadfence_system();
+        if constexpr (!Push) __threadfence_system();
     }
     __syncthreads();
     if (s_aborted) return;
 
-    // Sum local (from L1/L2-cached data) + peer (from uncached peer P2P buffer) into data
+    // The next inbox is distinct. Reaching this slot again requires both ranks to have started the next hop.
     for (int i = threadIdx.x; i < n4; i += blockDim.x) {
         const float4 a = d4[i];
-        const float4 b = pb4[i];
+        const float4 b = recv[i];
         d4[i] = make_float4(a.x + b.x, a.y + b.y, a.z + b.z, a.w + b.w);
     }
 }
@@ -285,6 +299,19 @@ void Tp2Comm::host_barrier(int rank) {
     }
 }
 
+bool Tp2Comm::small_push_enabled() {
+#if defined(STRATA_HIP_GFX906)
+    static const bool enabled = [] {
+        const char* push = std::getenv("STRATA_TP2_SMALL_PUSH");
+        const char* half = std::getenv("STRATA_TP2_P2P_F16");
+        return push && push[0] == '1' && !push[1] && !(half && half[0] == '1' && !half[1]);
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
 void Tp2Comm::all_reduce(int rank, float* data, int n, void* stream) {
     if (bar_aborted_.load(std::memory_order_acquire))
         throw std::runtime_error("Tp2Comm::all_reduce: communicator aborted");
@@ -300,8 +327,12 @@ void Tp2Comm::all_reduce(int rank, float* data, int n, void* stream) {
                 reinterpret_cast<__half2*>(p2p_buf_[rank][0]), reinterpret_cast<__half2*>(p2p_buf_[rank][1]),
                 reinterpret_cast<const __half2*>(p2p_buf_[peer][0]), reinterpret_cast<const __half2*>(p2p_buf_[peer][1]),
                 p2p_flag_[rank], p2p_flag_[peer], p2p_gen_[rank], abort_dev_, n);
+        } else if (small_push_enabled()) {
+            p2p_ar_pingpong_f32<true><<<1, 256, 0, cs(stream)>>>(
+                data, p2p_buf_[rank][0], p2p_buf_[rank][1], p2p_buf_[peer][0], p2p_buf_[peer][1],
+                p2p_flag_[rank], p2p_flag_[peer], p2p_gen_[rank], abort_dev_, n);
         } else {
-            p2p_ar_pingpong_f32<<<1, 256, 0, cs(stream)>>>(
+            p2p_ar_pingpong_f32<false><<<1, 256, 0, cs(stream)>>>(
                 data, p2p_buf_[rank][0], p2p_buf_[rank][1], p2p_buf_[peer][0], p2p_buf_[peer][1],
                 p2p_flag_[rank], p2p_flag_[peer], p2p_gen_[rank], abort_dev_, n);
         }
