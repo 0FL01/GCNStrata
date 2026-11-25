@@ -2351,6 +2351,37 @@ void Inkling2::project(const Block& b, const float* xq, const float* xk, const f
                   {&b.k, xk, shared_kv ? q8 : k8, k_, false},
                   {&b.v, xv, shared_kv ? q8 : v8, v_, false}};
     const auto fits = [](const Dev& w) { return w.n_in == kWidth && w.scale == 1.f; };
+#if defined(STRATA_HIP_GFX906)
+    static const bool group_q4 = [] {
+        const char* e = std::getenv("STRATA_INKLING_Q4_0_DENSE");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    const auto q4 = [&](int i) { return parts[i].w->type == GGML_TYPE_Q4_0 && fits(*parts[i].w); };
+    if (group_q4 && tp_size_ == 2 && !block_pass_ && q8 && q4(1) && q4(2)) {
+        // Cache once per worker/device, not once per visit. The gfx906 build may
+        // also contain code objects for other architectures.
+        static thread_local int arch_device = -1;
+        static thread_local bool arch_ok = false;
+        if (arch_device != device_) {
+            cudaDeviceProp p{};
+            arch_ok = cudaGetDeviceProperties(&p, device_) == cudaSuccess && p.warpSize == 64 &&
+                      kernels::gfx_arch_is(p.gcnArchName, "gfx906");
+            arch_device = device_;
+        }
+        if (arch_ok) {
+            kernels::MmvqSegments s;
+            const int first = q4(0) ? 0 : 1;
+            for (int i = first; i < 3; ++i) {
+                s.w[s.count] = parts[i].w->p;
+                s.x[s.count] = parts[i].xq;
+                s.y[s.count] = parts[i].y;
+                s.rows[s.count++] = parts[i].w->n_out;
+            }
+            if (kernels::native_inkling_q4_0_segments(s, kWidth, st_))
+                for (int i = first; i < 3; ++i) parts[i].done = true;
+        }
+    }
+#endif
     for (int i = 0; i < 5; ++i) {
         if (parts[i].done || !fits(*parts[i].w)) continue;
         kernels::MmvqSegments s;

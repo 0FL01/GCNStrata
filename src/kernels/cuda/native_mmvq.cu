@@ -1896,6 +1896,52 @@ __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w,
             if (lane == 0 && row0 + i < n_out) y[std::size_t(j) * ldy + row0 + i] = v;
         }
 }
+
+// One CTA owns one existing R4 tile, entirely within one projection. Reuse the
+// stock Q4_0 dot traits and the exact T1 R4 lane order, without touching stock.
+constexpr int kInklingQ40Kin = 2304, kInklingQ40Large = 1536, kInklingQ40Rel = 192;
+constexpr int kInklingQ40Tile = 4 * 4;
+static_assert(kInklingQ40Large % kInklingQ40Tile == 0 && kInklingQ40Rel % kInklingQ40Tile == 0);
+struct InklingQ40Projection {
+    const Q40Block* w[3];
+    float* y[3];
+    const Q81Block* x;
+};
+template<int Large>
+__global__ __launch_bounds__(256) void inkling_q40_segments_wave_kernel(InklingQ40Projection s) {
+    constexpr int BigTiles = kInklingQ40Large / kInklingQ40Tile;
+    const int b = int(blockIdx.x);
+    int local = b, segment = 0;
+    if (b >= Large * BigTiles) {
+        segment = Large;
+        local -= Large * BigTiles;
+    } else if (Large == 2 && b >= BigTiles) {
+        segment = 1;
+        local -= BigTiles;
+    }
+    const int row0 = local * kInklingQ40Tile + (int(threadIdx.x) >> 6) * 4;
+    using F = SmallTraits<Q40Block, 4>;
+    constexpr int BPIW = 64 / F::T, NB = kInklingQ40Kin / F::DIV;
+    const int lane = int(threadIdx.x) & 63, kqs = F::kqs(lane);
+    const auto* w = s.w[segment];
+    float* y = s.y[segment];
+    float tmp[4] = {};
+    for (int kbx = lane / F::T; kbx < NB; kbx += BPIW) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const F::W wv = F::load(w + std::size_t(row0 + i) * NB + kbx, kqs);
+            tmp[i] += F::apply(wv, s.x + kbx * F::KBY, kqs);
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        float v = tmp[i];
+#pragma unroll
+        for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+        if (lane == 0) y[row0 + i] = v;
+    }
+}
+
 // Indexed MTP head component only. Existing wave kernel and dispatch stay unchanged.
 template<typename F, int NCOLS, int R>
 __launch_bounds__(256)
@@ -3618,6 +3664,30 @@ bool native_mmvq_segments(int ggml_type, const MmvqSegments& s, int n_in, void* 
     launch_check();
     return true;
 }
+#if defined(STRATA_HIP_GFX906)
+bool native_inkling_q4_0_segments(const MmvqSegments& s, int n_in, void* stream) {
+    if (g_wave_off || q40_rows() != 4 || n_in != kInklingQ40Kin || (s.count != 2 && s.count != 3)) return false;
+    InklingQ40Projection p{};
+    const int large = s.count - 1;
+    for (int i = 0; i < s.count; ++i) {
+        const int expected = i < large ? kInklingQ40Large : kInklingQ40Rel;
+        if (s.rows[i] != expected || s.x[i] != s.x[0]) return false;
+        validate_pointer(s.w[i]);
+        validate_pointer(s.y[i]);
+        p.w[i] = static_cast<const Q40Block*>(s.w[i]);
+        p.y[i] = s.y[i];
+    }
+    validate_pointer(s.x[0]);
+    validate_stream(stream);
+    p.x = static_cast<const Q81Block*>(s.x[0]);
+    const auto st = static_cast<cudaStream_t>(stream);
+    const int blocks = (large * kInklingQ40Large + kInklingQ40Rel) / kInklingQ40Tile;
+    if (large == 1) inkling_q40_segments_wave_kernel<1><<<blocks, 256, 0, st>>>(p);
+    else inkling_q40_segments_wave_kernel<2><<<blocks, 256, 0, st>>>(p);
+    launch_check();
+    return true;
+}
+#endif
 bool native_q6_k_mmvq_warps(const void*, const void*, float*, int, int, void*) { return false; }
 bool native_q6_k_mmvq_warps_cols(const void*, const void*, float*, int, int, int, void*) { return false; }
 bool native_q8_0_mmvq_warps_cols(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,

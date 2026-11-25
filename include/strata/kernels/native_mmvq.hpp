@@ -238,6 +238,11 @@ struct MmvqSegments {
     int rows[kMost] = {};
 };
 bool native_mmvq_segments(int ggml_type, const MmvqSegments& s, int n_in, void* stream);
+#if defined(STRATA_HIP_GFX906)
+// Single-token Inkling TP2 Q4_0 [Q,] gate, rel. One shared Q8_1 input, disjoint
+// outputs, existing gfx906 wave64 R4 dispatch. Caller verifies gfx906 wave64.
+bool native_inkling_q4_0_segments(const MmvqSegments& s, int n_in, void* stream);
+#endif
 bool native_q6_k_mmvq_warps(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, void* stream);
 bool native_q6_k_mmvq_warps_cols(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,
                                  void* stream);

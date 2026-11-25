@@ -746,6 +746,11 @@ the ordinary TP2 collective still runs afterwards. Other model shapes, bulk prom
 device route. It applies only to the single-token, eight-pick, 2304→1152 layout. Each row retains the original
 logical warp32 dot and reduction on wave64. This switch neither enables resident routing nor modifies down+sum.
 
+`STRATA_INKLING_Q4_0_DENSE=1` groups the TP2 single-token Q4_0 gate and relative projections, plus Q when it
+is also Q4_0. They read the same Q8_1 activation, keep their own weights and write disjoint outputs. This is
+the existing wave64 R4 dense dot order, **not** the expert dot. The Q6_K Q/head and Q8_0 K/V paths do not
+change. Disabling wave MMVQ or selecting a different Q4_0 row tile disables this grouping.
+
 ## Tuning table
 
 A hipBLASLt table holds solution ids that are valid only for one GPU architecture and one hipBLASLt version, so it
