@@ -4754,7 +4754,12 @@ bool Engine::moe_rows_inkling_gpu(Layer& L, int il, int n) {
     int32_t* place = tok + cap;
     int32_t* cb = tab_ + 3 * cap + 3 * (experts + 1);
     const bool inverse = tp2_q4_scatter();
-    plan(s, d_ids_, n, order, cb, st_);
+    // A/B control: keep the resident selector and tables but use only stock MMQ geometry.
+    static const bool compact = [] {
+        const char* v = std::getenv("STRATA_INKLING_GPU_PREFILL_COMPACT");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    plan(s, d_ids_, n, order, cb, compact, st_);
     ck(cudaMemcpyAsync(h_inkling_prefill_, &s->summary, sizeof(s->summary), cudaMemcpyDeviceToHost, cs(st_)),
        "Inkling prefill summary");
     ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "Inkling prefill summary");
@@ -4781,26 +4786,30 @@ bool Engine::moe_rows_inkling_gpu(Layer& L, int il, int n) {
     if (inverse) Mmq::quantize_q4_scatter(xn_, tok, mq_, width, n, picks, st_);
     else Mmq::quantize(xn_, tok, mq_, GGML_TYPE_Q4_0, width, width, rr, st_);
     const uint8_t* w = L.slot[(size_t) order.expert[0]];
+    int compact_gu = 0, compact_down = 0;
     const auto mul = [&](bool down, int c) {
-        if (summary.most[c] == 0) return;
+        if (summary.most[c] == 0) return false;
         const int type = down ? (int) L.d_type : GGML_TYPE_Q4_0;
         const uint8_t* a = down ? w + L.gu2() : w;
         const void* xq = down ? mq2_ : mq_;
         const int32_t* ids = down ? place : iota_;
         float* out = down ? dx_ : gu_;
         const int m = down ? width : 2 * ff, k = down ? ff : width;
+        if (compact && Mmq::try_inkling_prefill_compact(a, type, down, L.slot_bytes, xq, ids, n, c, summary.most[c],
+                                                       s, out, st_)) return true;
         mmq_->mul(a, type, m, k, L.slot_bytes, experts, xq, cb + (size_t) c * (experts + 1), ids, rr, summary.most[c],
                   out, m, st_);
+        return false;
     };
-    for (int c = 0; c < classes; ++c) mul(false, c);
+    for (int c = 0; c < classes; ++c) compact_gu += mul(false, c);
     expert_activation(gu_, hx_, rr, clamp_exp_[(size_t) il], ExpertScales{});
     Mmq::quantize(hx_, nullptr, mq2_, (int) L.d_type, ff, ff, rr, st_);
-    for (int c = 0; c < classes; ++c) mul(true, c);
+    for (int c = 0; c < classes; ++c) compact_down += mul(true, c);
     ck(cudaEventRecord((cudaEvent_t) ev_free_, cs(st_)), "expert staging");
     moe_sum(dx_, d_wts_, fo_, width, picks, n, st_);
     if (!inkling_prefill_logged_) {
-        std::fprintf(stderr, "strata-poly: Inkling GPU prefill on device %d, T=%d, stable device tables\n",
-                     device_, n);
+        std::fprintf(stderr, "strata-poly: Inkling GPU prefill on device %d, T=%d, compact GU/down classes %d/%d\n",
+                     device_, n, compact_gu, compact_down);
         inkling_prefill_logged_ = true;
     }
     return true;

@@ -178,11 +178,11 @@ void Mmq::quantize_q4_scatter(const float* x, const int32_t* slot, void* xq, int
 
 namespace inkling_prefill {
 
-void plan(Scratch* s, const int32_t* ids, int tokens, SlotOrder order, int32_t* cb, void* stream) {
+void plan(Scratch* s, const int32_t* ids, int tokens, SlotOrder order, int32_t* cb, bool lists, void* stream) {
     const int r = tokens * picks, parts = ceil_div(r, slice);
     auto st = (cudaStream_t) stream;
     mask_picks<<<dim3(experts, parts), threads, 0, st>>>(s, ids, r, order);
-    make_plan<<<1, experts, 0, st>>>(s, cb, parts, tokens);
+    make_plan<<<1, experts, 0, st>>>(s, cb, parts, tokens, lists);
     ck("Inkling prefill plan");
 }
 
@@ -194,7 +194,57 @@ void scatter(const Scratch* s, int tokens, bool inverse, int32_t* tok, int32_t* 
 
 }  // namespace inkling_prefill
 
-
+bool Mmq::try_inkling_prefill_compact(const void* w, int type, bool down, size_t stride, const void* xq,
+                                      const int32_t* ids, int tokens, int c, int most,
+                                      const inkling_prefill::Scratch* scratch, float* dst, void* stream) {
+    using namespace inkling_prefill;
+    if (tokens < max_tokens - 1 || tokens > max_tokens || c < 0 || c >= classes || most <= 0 || most > tokens ||
+        (type != GGML_TYPE_Q4_0 && (!down || type != GGML_TYPE_Q4_1))) return false;
+    const auto& dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    if (dev.cc != GGML_CUDA_CC_VEGA20 || dev.warp_size != 64) return false;
+    const auto t = (ggml_type) type;
+    // Exactly the pinned ggml selection order; equal tile counts do NOT replace an earlier J.
+    int best = 0, nt = INT_MAX;
+    for (int j = 8; j <= 128 && nt > 1; j += 8) {
+        const auto cfg = ggml_cuda_mmq_get_config(t, j, false, dev.cc);
+        if (cfg.type == GGML_TYPE_COUNT || mmq_get_nbytes_shared(cfg, dev.cc) > dev.smpbo) continue;
+        const int nx = ceil_div(most, cfg.J);
+        if (nx < nt) { best = j; nt = nx; }
+    }
+    if (best != tiles[c]) return false;
+    const auto cfg = ggml_cuda_mmq_get_config(t, best, false, dev.cc);
+    if (cfg.I != 64 || cfg.J != best || cfg.nthreads != threads || cfg.K_vram != 256 || cfg.stream_k ||
+        cfg.use_mma_data_layout(dev.cc)) return false;
+    const size_t bs = ggml_type_size(t), stride_blocks = stride / bs;
+    const int matrix_blocks = width / 32 * (down ? ff : 2 * ff);
+    if (stride % bs || stride_blocks < (size_t) matrix_blocks ||
+        stride_blocks > (size_t) (INT_MAX - matrix_blocks - 8) / (experts - 1)) return false;
+    static const bool tail = [] {
+        const char* v = std::getenv("STRATA_TP2_PREFILL_Q4_TAIL");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    const int cap = task_cap(tokens, c), lds = mmq_get_nbytes_shared(cfg, dev.cc);
+    const auto launch = [&]<ggml_type Q, int J, int K, int M, bool Tail = false>() {
+        CUDA_SET_SHARED_MEMORY_LIMIT((compact_mmq<Q, J, K, M, Tail>), lds);
+        compact_mmq<Q, J, K, M, Tail><<<dim3(M / 64, cap), dim3(64, 4), lds, (cudaStream_t) stream>>>(
+            (const char*) w, (const int*) xq, ids, scratch->list + Scratch::list_offset(c), scratch->used + c,
+            dst, (int) stride_blocks, tokens * picks);
+    };
+    const auto launch_j = [&]<int J>() {
+        if (!down) launch.template operator()<GGML_TYPE_Q4_0, J, width, 2 * ff>();
+        else if (t == GGML_TYPE_Q4_0) {
+            if (tail) launch.template operator()<GGML_TYPE_Q4_0, J, ff, width, true>();
+            else launch.template operator()<GGML_TYPE_Q4_0, J, ff, width>();
+        } else {
+            if (tail) launch.template operator()<GGML_TYPE_Q4_1, J, ff, width, true>();
+            else launch.template operator()<GGML_TYPE_Q4_1, J, ff, width>();
+        }
+    };
+    if (best == 32) launch_j.template operator()<32>();
+    else launch_j.template operator()<64>();
+    ck("Inkling prefill compact MMQ");
+    return true;
+}
 #endif
 
 void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t stride, int n, const void* xq,

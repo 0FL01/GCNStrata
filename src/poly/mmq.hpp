@@ -10,6 +10,10 @@
 
 namespace strata::poly {
 
+#if defined(STRATA_HIP_GFX906)
+namespace inkling_prefill { struct Scratch; }
+#endif
+
 class Mmq {
 public:
     Mmq();
@@ -39,6 +43,11 @@ public:
     /// The slot map must cover every packed row exactly once. Input rows have stride cols.
     static void quantize_q4_scatter(const float* x, const int32_t* slot, void* xq, int64_t cols, int64_t tokens,
                                     int picks, void* stream);
+    /// Inkling TP2: empty CTAs are bounded by the shape, actual tasks read from the device. Returns false with
+    /// nothing launched unless this class's fixed J is also the stock first-best tile for `most`.
+    static bool try_inkling_prefill_compact(const void* w, int type, bool down, size_t stride, const void* xq,
+                                            const int32_t* ids, int tokens, int c, int most,
+                                            const inkling_prefill::Scratch* scratch, float* dst, void* stream);
 #endif
 
     /// One launch over n matrices of [w_rows, w_cols], `stride` bytes apart from w: matrix e times the rows
