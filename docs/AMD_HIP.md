@@ -707,6 +707,10 @@ it works but is not part of this build).
 from the value scan, keeping the stock chunks, softmax order and output quantization. It uses the existing plain
 score buffer, with no extra allocation. Calls that do not fit or do not meet these conditions use the usual path.
 
+`STRATA_INKLING_PREFILL_DEPTH_SHARE=1` is independent of decode. On two gfx906 cards, a 2047/2048-row prompt
+chunk can share one raw depth mix and its RMS between Q, K and V on the 20 sliding-window visits with messages.
+Each stream still runs its own message controller. Full-attention visits, other widths and verifier windows do not use it.
+
 ## Tuning table
 
 A hipBLASLt table holds solution ids that are valid only for one GPU architecture and one hipBLASLt version, so it

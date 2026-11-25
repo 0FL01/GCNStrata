@@ -240,6 +240,15 @@ __global__ void control_kernel(float* cur, const float* msg, const float* gain, 
     if (i < count) cur[i] = (1.f - tanhf(forget[i])) * cur[i] + tanhf(gain[i]) * msg[i];
 }
 
+#if defined(STRATA_HIP_GFX906)
+// Same expression as control_kernel, but keep the raw depth mix intact for the next stream.
+__global__ void control_from_shared(const float* depth, float* cur, const float* msg, const float* gain,
+                                    const float* forget, int count) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < count) cur[i] = (1.f - tanhf(forget[i])) * depth[i] + tanhf(gain[i]) * msg[i];
+}
+#endif
+
 // One thread owns one channel and keeps its raw input history across the chunk. In GGUF the static taps
 // run oldest to newest; the input-dependent taps of each KV head start with the current token.
 // With `snap`, a window's (Engine::window()): the state after each of its tokens but the last as well, token t's
@@ -857,6 +866,18 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
         }
         if (want_prefill && !prefill)
             std::fputs("strata-poly: STRATA_INKLING_GPU_PREFILL=1 exact selector unavailable; using host routing\n", stderr);
+    }
+    if (enabled("STRATA_INKLING_PREFILL_DEPTH_SHARE")) {
+        const auto gfx906 = [](int device) {
+            cudaDeviceProp props{};
+            return cudaGetDeviceProperties(&props, device) == cudaSuccess &&
+                   kernels::gfx_arch_is(props.gcnArchName, "gfx906");
+        };
+        const bool share = gfx906(r0->device_) && gfx906(r1->device_);
+        r0->prefill_depth_share_ = r1->prefill_depth_share_ = share;
+        if (share)
+            std::fputs("strata-poly: STRATA_INKLING_PREFILL_DEPTH_SHARE=1: TP2 SWA message input reuse at T=2047/2048\n",
+                       stderr);
     }
 #endif
     ck(cudaSetDevice(0), "tp2 setDevice 0");
@@ -1869,7 +1890,7 @@ void Inkling2::depth_mix(const float* query, float* dst, int first, int n) {
     mix_kernel<<<n, kMixThreads, 0, cs(st_)>>>(m, depth_n_ + 1, query, dst);
 }
 
-void Inkling2::control(const Block& b, int il, int stream, float* in, int n) {
+void Inkling2::control(const Block& b, int il, int stream, float* in, int n, const float* shared_depth) {
     const size_t row = 2 * (size_t) (il - kStart) + (stream >= 2 ? 1 : 0);
     const float* query = b.msg_query.p
                              ? fp(b.msg_query) + (size_t) stream * kWidth
@@ -1877,7 +1898,7 @@ void Inkling2::control(const Block& b, int il, int stream, float* in, int n) {
     if (fused(n)) control_in_kernel<<<n, kMixThreads, 0, cs(st_)>>>(bank0_, bank1_, query, in, msg_, pair_);
     else {
         mix_kernel<<<n, kMixThreads, 0, cs(st_)>>>(MixInputs{{bank0_, bank1_}}, 2, query, msg_);
-        rms_norm(in, nullptr, pair_, kWidth, n, 1.e-6f, st_, 2 * kWidth);
+        if (!shared_depth) rms_norm(in, nullptr, pair_, kWidth, n, 1.e-6f, st_, 2 * kWidth);
         rms_norm(msg_, nullptr, pair_ + kWidth, kWidth, n, 1.e-6f, st_, 2 * kWidth);
     }
     const Control& c = b.control[stream];
@@ -1891,6 +1912,13 @@ void Inkling2::control(const Block& b, int il, int stream, float* in, int n) {
     lin(c.down, pair_, rank_, n);
     lin(c.gain, rank_, gain_, n);
     lin(c.forget, rank_, forget_, n);
+#if defined(STRATA_HIP_GFX906)
+    if (shared_depth) {
+        control_from_shared<<<div_up(n * kWidth, kThreads), kThreads, 0, cs(st_)>>>(
+            shared_depth, in, msg_, gain_, forget_, n * kWidth);
+        return;
+    }
+#endif
     control_kernel<<<div_up(n * kWidth, kThreads), kThreads, 0, cs(st_)>>>(in, msg_, gain_, forget_, n * kWidth);
 }
 
@@ -2104,10 +2132,20 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
         kq = (const uint8_t*) s3q8_ + wq;
         vq = (const uint8_t*) s3q8_ + 2 * wq;
     } else {
+        const float* shared_depth = nullptr;
+#if defined(STRATA_HIP_GFX906)
+        if (prefill_depth_share_ && swa && loop && !windowed_ && (n == 2047 || n == 2048)) {
+            // Only SWA shares a depth query. Keep its raw mix in input_[2] until V's control reads it,
+            // then V's final norm overwrites it on the same stream. Each bank norm writes only pair_'s second half.
+            depth_mix(fp(b.aquery), input_[2], 0, n);
+            rms_norm(input_[2], nullptr, pair_, kWidth, n, 1.e-6f, st_, 2 * kWidth);
+            shared_depth = input_[2];
+        }
+#endif
         for (int i = 0; i < streams; ++i) {
             if (il == 0) axpy(r_, 1.f, cur_, n * kWidth, false, st_);
-            else depth_mix(fp(b.aquery) + (swa ? 0 : i * kWidth), cur_, 0, n);
-            if (loop) control(b, il, i, cur_, n);
+            else if (!shared_depth) depth_mix(fp(b.aquery) + (swa ? 0 : i * kWidth), cur_, 0, n);
+            if (loop) control(b, il, i, cur_, n, shared_depth);
             // this stream's norm and its Q8_1 in one launch; K and V write their own single-row buffers
             if (norm_q8_ && mmv && (streams == 1 || n == 1)) {
                 void* q = streams == 1 || i == 0 ? xq_ : i == 1 ? (void*) kq8_ : (void*) vq8_;

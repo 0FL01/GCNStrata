@@ -101,6 +101,7 @@ private:
     float *gpu_route_bias_ = nullptr, *gpu_route_gu_ = nullptr;
     void* gpu_route_q8_ = nullptr;
     bool gpu_route_failed_ = false, gpu_prefill_route_ = false;
+    bool prefill_depth_share_ = false;
     bool gpu_route_supported() const;
     bool gpu_decode_supported() const;
     void init_gpu_route(bool decode, bool prefill);
@@ -164,7 +165,7 @@ private:
     void store(const float* x, Cache& c, int side, int n);
     void attention(const Block& b, int n);
     void depth_mix(const float* query, float* dst, int first, int n);
-    void control(const Block& b, int il, int stream, float* in, int n);
+    void control(const Block& b, int il, int stream, float* in, int n, const float* shared_depth = nullptr);
     void ring_state(int visit, int64_t pos, const uint8_t* src, uint8_t* dst);
     bool try_pack_state(uint8_t* dst);
 
