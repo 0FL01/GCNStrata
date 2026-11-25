@@ -22,6 +22,9 @@ offers the same steps as tools.
 
 ## Working on the code
 
+- gfx906 experiments use separate Git worktrees; local `main` can lag `origin/main` while holding unfinished work.
+  Before resuming, use `git worktree list` and `git status -sb -uall` in the relevant tree. For unrelated work,
+  fetch `origin` and create a new worktree from `origin/main`; leave dirty trees and their untracked files in place.
 - How the engine works, every measured number, the API and all settings: [docs/DETAILS.md](docs/DETAILS.md) and
   the [paper](docs/paper/Strata-Paper.pdf).
 - gfx906 builds use `-DSTRATA_HIP_GFX906=ON -DCMAKE_HIP_ARCHITECTURES=gfx906` (CUDA-source HIP compatibility),
