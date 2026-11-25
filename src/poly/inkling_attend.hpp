@@ -5,6 +5,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstddef>
 #include <cstdint>
 
 namespace strata::poly::inkling {
@@ -48,6 +49,11 @@ size_t decode_floats();
 /// sink. FP32 products of the same dequantized values; the order of the sums differs. With q8, the output's Q8_1
 /// blocks too, as native_quantize_q8_1() makes them of the rows back to back.
 void attend_decode(const Attend& a, float* scratch, cudaStream_t st, void* q8 = nullptr);
+
+/// On gfx906, an opted-in TP2 caller can lend the existing plain score buffer and its capacity in floats.
+/// If Q8_0, DPP, T=1..4 and capacity permit, split the scores from the value scan without changing its order.
+/// Otherwise the buffer is untouched and the usual fused producer runs. It must not overlap `scratch`.
+void attend_decode(const Attend& a, float* scratch, cudaStream_t st, void* q8, float* scores, size_t score_floats);
 
 /// The same in one launch (STRATA_INKLING_FLASH=1, prompt batches): 16 tokens of one K/V group a block, keys 16 at
 /// a time with an online softmax in base 2, FP32 products of the same dequantized values; the order of the sums and

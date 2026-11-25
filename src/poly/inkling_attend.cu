@@ -781,6 +781,178 @@ decode_q8_kernel(const float* q, const float* rel, const float* table, KvView k,
     }
 }
 
+#if defined(STRATA_HIP_GFX906)
+// Two independent producer shapes: only scores may change their key packet size.
+// Keep the qualified fused kernel above unchanged for the fallback.
+
+__global__ void __launch_bounds__(128, 2)
+decode_q8_score_kernel(const float* q, const float* rel, const float* table, KvView k, int64_t pos, int window,
+                 int ring, int chunk, int span, float* scores) {
+    constexpr int Heads = 12;
+    const int c = blockIdx.x, row = blockIdx.y, g = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int sub = lane & 7, quad = lane >> 3;   // the 16 dimensions of the lane, and which of four keys
+    const int64_t end = pos + row + 1, start = oldest(end, window);
+    const int count = (int) (end - start), first = c * chunk, last = min(first + chunk, count);
+    const size_t qh0 = (size_t) row * Heads + g * kGroup;
+    float qr[kGroup][16], rr[kGroup][2];
+#pragma unroll
+    for (int r = 0; r < kGroup; ++r) {
+        const float4* qv = reinterpret_cast<const float4*>(q + (qh0 + r) * kHead + 16 * sub);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const float4 x = qv[j];
+            qr[r][4 * j] = x.x;
+            qr[r][4 * j + 1] = x.y;
+            qr[r][4 * j + 2] = x.z;
+            qr[r][4 * j + 3] = x.w;
+        }
+        rr[r][0] = rel[(qh0 + r) * kRelative + 2 * sub];
+        rr[r][1] = rel[(qh0 + r) * kRelative + 2 * sub + 1];
+    }
+    const int8_t* kd = reinterpret_cast<const int8_t*>(k.data);
+    const __half* ksc = reinterpret_cast<const __half*>(k.scales);
+    for (int i0 = first; i0 < last; i0 += 4 * kAttUnroll) {
+        int4 kw[kAttUnroll];
+        float ks[kAttUnroll];
+        // every key's loads before any is used
+#pragma unroll
+        for (int u = 0; u < kAttUnroll; ++u) {
+            const int i = i0 + 4 * u + quad;
+            if (i < last) {
+                const int64_t key = start + i;
+                const size_t at = ((size_t) (ring ? key % ring : key) * 4 + g) * kHead + 16 * sub;
+                kw[u] = *reinterpret_cast<const int4*>(kd + at);
+                ks[u] = __half2float(ksc[at / 32]);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kAttUnroll; ++u) {
+            const int i = i0 + 4 * u + quad;
+            if (i >= last) continue;   // a whole group of eight lanes: the shuffles below stay inside it
+            const int64_t key = start + i, delta = end - 1 - key;
+            const int kwords[4] = {kw[u].x, kw[u].y, kw[u].z, kw[u].w};
+            float sc[kGroup];
+#pragma unroll
+            for (int r = 0; r < kGroup; ++r) {
+                float d = 0.f;
+#pragma unroll
+                for (int x = 0; x < 4; ++x)
+#pragma unroll
+                    for (int y = 0; y < 4; ++y) d += qr[r][4 * x + y] * (float) (int8_t) (kwords[x] >> (8 * y));
+                sc[r] = d * ks[u] * 0.08838834764831845f;
+            }
+            if (delta < kExtent) {
+                const float* tb = table + delta * kRelative + 2 * sub;
+                const float b0 = tb[0], b1 = tb[1];
+#pragma unroll
+                for (int r = 0; r < kGroup; ++r) sc[r] += rr[r][0] * b0 + rr[r][1] * b1;
+            }
+#pragma unroll
+            for (int r = 0; r < kGroup; ++r) {
+                sc[r] += decode_xor<4, true>(sc[r]);
+                sc[r] += decode_xor<2, true>(sc[r]);
+                sc[r] += decode_xor<1, true>(sc[r]);
+            }
+            if (sub == 0) {
+                const size_t at = (((size_t) row * span + i) * 4 + g) * kGroup;
+#pragma unroll
+                for (int r = 0; r < kGroup; ++r) scores[at + r] = sc[r];
+            }
+        }
+    }
+}
+
+
+__global__ void __launch_bounds__(128, 2)
+decode_q8_value_kernel(KvView v, int64_t pos, int window,
+                 int ring, int chunk, const float* scores, int span, float* part) {
+    const int c = blockIdx.x, row = blockIdx.y, g = threadIdx.x / 32, lane = threadIdx.x & 31;
+    const int sub = lane & 7, quad = lane >> 3;   // the 16 dimensions of the lane, and which of four keys
+    const int64_t end = pos + row + 1, start = oldest(end, window);
+    const int count = (int) (end - start), first = c * chunk, last = min(first + chunk, count);
+    float m[kGroup], l[kGroup], acc[kGroup][16];
+#pragma unroll
+    for (int r = 0; r < kGroup; ++r) {
+        m[r] = -INFINITY;
+        l[r] = 0.f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) acc[r][j] = 0.f;
+    }
+    const int8_t* vd = reinterpret_cast<const int8_t*>(v.data);
+    const __half* vsc = reinterpret_cast<const __half*>(v.scales);
+    for (int i0 = first; i0 < last; i0 += 4 * kAttUnroll) {
+        int4 vw[kAttUnroll];
+        float vs[kAttUnroll];
+        // every key's loads before any is used
+#pragma unroll
+        for (int u = 0; u < kAttUnroll; ++u) {
+            const int i = i0 + 4 * u + quad;
+            if (i < last) {
+                const int64_t key = start + i;
+                const size_t at = ((size_t) (ring ? key % ring : key) * 4 + g) * kHead + 16 * sub;
+                vw[u] = *reinterpret_cast<const int4*>(vd + at);
+                vs[u] = __half2float(vsc[at / 32]);
+            }
+        }
+#pragma unroll
+        for (int u = 0; u < kAttUnroll; ++u) {
+            const int i = i0 + 4 * u + quad;
+            if (i >= last) continue;   // a whole group of eight lanes: the shuffles below stay inside it
+            const float* sc = scores + (((size_t) row * span + i) * 4 + g) * kGroup;
+            const int vwords[4] = {vw[u].x, vw[u].y, vw[u].z, vw[u].w};
+            float val[16];
+#pragma unroll
+            for (int x = 0; x < 4; ++x)
+#pragma unroll
+                for (int y = 0; y < 4; ++y) val[4 * x + y] = (float) (int8_t) (vwords[x] >> (8 * y)) * vs[u];
+#pragma unroll
+            for (int r = 0; r < kGroup; ++r) {
+                const float next = fmaxf(m[r], sc[r]);
+                // every score so far -inf (overflowed terms): the exponentials are 0, as attend_plain() gives them
+                const float base = next == -INFINITY ? 0.f : next;
+                const float keep = expf(m[r] - base), p = expf(sc[r] - base);
+                m[r] = next;
+                l[r] = l[r] * keep + p;
+#pragma unroll
+                for (int j = 0; j < 16; ++j) acc[r][j] = acc[r][j] * keep + p * val[j];
+            }
+        }
+    }
+    // the wave's four groups of keys into one (lanes 8 and 16 apart hold the same dimensions)
+#pragma unroll
+    for (int r = 0; r < kGroup; ++r) {
+        float top = fmaxf(m[r], decode_xor<8, true>(m[r]));
+        top = fmaxf(top, decode_xor<16, true>(top));
+        const float base = top == -INFINITY ? 0.f : top;
+        const float f = expf(m[r] - base);
+        float sum = l[r] * f;
+        sum += decode_xor<8, true>(sum);
+        sum += decode_xor<16, true>(sum);
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            float a = acc[r][j] * f;
+            a += decode_xor<8, true>(a);
+            a += decode_xor<16, true>(a);
+            acc[r][j] = a;
+        }
+        m[r] = top;
+        l[r] = sum;
+    }
+    if (quad != 0) return;
+    float* dst = part + (((size_t) row * 4 + g) * gridDim.x + c) * kChunkFloats;
+#pragma unroll
+    for (int r = 0; r < kGroup; ++r) {
+#pragma unroll
+        for (int j = 0; j < 16; ++j) dst[r * (kHead + 2) + 2 + 16 * sub + j] = acc[r][j];
+        if (sub == 0) {
+            dst[r * (kHead + 2)] = m[r];
+            dst[r * (kHead + 2) + 1] = l[r];
+        }
+    }
+}
+
+#endif
+
 // A chunk with no keys left -inf, 0 and zeros. The sink as probs_kernel takes it, -inf (no sink) included.
 struct Q81 {
     __half2 ds;
@@ -907,6 +1079,33 @@ void attend_decode(const Attend& a, float* scratch, cudaStream_t st, void* q8) {
     if (a.kv_heads == 4) run.template operator()<4>();
     else run.template operator()<8>();
     check("Inkling decode attention");
+}
+
+void attend_decode(const Attend& a, float* scratch, cudaStream_t st, void* q8,
+                   [[maybe_unused]] float* scores, [[maybe_unused]] size_t capacity) {
+#if defined(STRATA_HIP_GFX906)
+    static const bool dpp = [] {
+        const char* value = std::getenv("STRATA_INKLING_DECODE_DPP");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    if (scores && dpp && a.kv_heads == 4 && a.k.scales && a.v.scales && a.n >= 1 && a.n <= 4) {
+        const int span = int(a.window ? std::min<int64_t>(a.window, a.pos + a.n) : a.pos + a.n);
+        if (span > 0 && size_t(span) <= capacity / (a.n * 12)) {
+            // At T <= 4, the original decode budget allows all 128 target chunks.
+            const int chunk = std::max(32, div_up(div_up(span, 128), 8) * 8), chunks = div_up(span, chunk);
+            const int packet = a.n <= 2 ? 16 : chunk;
+            decode_q8_score_kernel<<<dim3(div_up(span, packet), a.n), 128, 0, st>>>(
+                a.q, a.rel, a.table, a.k, a.pos, a.window, a.ring, packet, span, scores);
+            decode_q8_value_kernel<<<dim3(chunks, a.n), 128, 0, st>>>(
+                a.v, a.pos, a.window, a.ring, chunk, scores, span, scratch);
+            decode_combine_kernel<4><<<dim3(12, a.n), kHead, 0, st>>>(scratch, chunks, a.sink, a.gate, a.out,
+                                                                      static_cast<Q81*>(q8));
+            check("Inkling factored decode attention");
+            return;
+        }
+    }
+#endif
+    attend_decode(a, scratch, st, q8);
 }
 
 void attend_flash(const Attend& a, cudaStream_t st) {

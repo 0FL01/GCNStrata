@@ -700,6 +700,13 @@ For comparison on the same machine: llama.cpp (3cf0325, ROCm) on the same Coder 
 same gfx906 ISA; not run), a single-card run, the tensor-split experiment (the halves of every layer on two cards;
 it works but is not part of this build).
 
+### Inkling-2-Mini: opt-in factored decode attention
+
+`STRATA_INKLING_DECODE_FACTORED=1` applies to Inkling TP2 on gfx906 with Q8_0 KV,
+`STRATA_INKLING_DECODE=1` and `STRATA_INKLING_DECODE_DPP=1`. For one to four rows it separates score production
+from the value scan, keeping the stock chunks, softmax order and output quantization. It uses the existing plain
+score buffer, with no extra allocation. Calls that do not fit or do not meet these conditions use the usual path.
+
 ## Tuning table
 
 A hipBLASLt table holds solution ids that are valid only for one GPU architecture and one hipBLASLt version, so it

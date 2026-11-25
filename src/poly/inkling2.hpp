@@ -131,6 +131,7 @@ private:
     int floor_ = 0, ring_ = 0, visit_ = 0, depth_n_ = 0, attend_tiles_ = 0;
     bool flash_ = false;    // STRATA_INKLING_FLASH=1 (load_geometry())
     bool decode_ = false;   // STRATA_INKLING_DECODE=1 (load_geometry())
+    bool factored_decode_ = false;   // STRATA_INKLING_DECODE_FACTORED=1 (load_geometry())
     bool norm_q8_ = false;  // STRATA_INKLING_NORM_Q8=1 (load_geometry()): a visit's stream norms and Q8_1 together
     bool moe_tail_ = false; // STRATA_INKLING_TAIL_MOE=1 (load_geometry()): a fused visit's expert sum in the tail
     bool cpu_sum_ = false;  // moe_add() left the CPU experts' sum for layer_tail()

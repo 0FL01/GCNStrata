@@ -9,7 +9,10 @@
 //                                    77: no card)
 // With STRATA_INKLING_FLASH_H2=1 (and LANE_PROB=1) the flash cases on a Q8_0 cache take the half-product kernel:
 // its operands are rounded to 11 bits, so those cases are held to 1e-3 instead.
+// On gfx906, --factored compares the partials, FP32 output and Q8_1 bytes against stock decode.
+// Run once with STRATA_INKLING_DECODE_DPP=1 (split and fallback), once with it unset (fallback only).
 #include "inkling_attend.hpp"
+#include "strata/kernels/gfx_arch.hpp"
 
 #include <cuda_fp16.h>
 #include <cstdlib>
@@ -22,6 +25,7 @@
 #include <cstdio>
 #include <cstring>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 namespace {
@@ -60,10 +64,64 @@ int64_t cache_rows(const Case& c) { return c.swa ? kWindow + 512 - 1 : c.pos + c
 
 float* chunks = nullptr;   // attend_decode()'s scratch
 
-bool run(const Case& c, float* scores, float* partial, int tiles, bool timed) {
+struct FactoredCheck {
+    enum class Capacity { Real, Exact, Short };
+    int kv = 4;
+    bool dpp = false;
+    Capacity limit = Capacity::Real;
+};
+
+bool factored_matches(const char* name, const Attend& a, float* scores, size_t capacity, const FactoredCheck& test) {
+    const size_t heads = a.kv_heads * (kHeads / kKv);
+    const size_t out_n = a.n * heads * kHead, q8_bytes = out_n / 32 * 36;
+    const size_t chunk_bytes = decode_floats() * sizeof(float);
+    const int64_t span = a.window ? std::min<int64_t>(a.window, a.pos + a.n) : a.pos + a.n;
+    const size_t required = a.n * heads * span;
+    const size_t offered = test.limit == FactoredCheck::Capacity::Real ? capacity :
+                           test.limit == FactoredCheck::Capacity::Exact ? required : required - 1;
+    if (offered > capacity) throw std::runtime_error("factored test offers more scratch than allocated");
+    const bool expect_split = test.dpp && a.k.scales && test.kv == 4 && a.n <= 4 && offered >= required;
+    const auto check = [](cudaError_t err) {
+        if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
+    };
+    const auto download = [&](const void* src, size_t bytes) {
+        std::vector<uint8_t> host(bytes);
+        check(cudaMemcpy(host.data(), src, bytes, cudaMemcpyDeviceToHost));
+        return host;
+    };
+    void* q8 = nullptr;
+    check(cudaMalloc(&q8, q8_bytes));
+    const auto prepare = [&] {
+        check(cudaMemset(chunks, 0xff, chunk_bytes));
+        check(cudaMemset(a.out, 0xff, out_n * sizeof(float)));
+        check(cudaMemset(q8, 0xff, q8_bytes));
+    };
+    prepare();
+    attend_decode(a, chunks, nullptr, q8);
+    const auto ref_chunks = download(chunks, chunk_bytes), ref_out = download(a.out, out_n * sizeof(float)),
+               ref_q8 = download(q8, q8_bytes);
+    prepare();
+    check(cudaMemset(scores, 0xff, capacity * sizeof(float)));
+    attend_decode(a, chunks, nullptr, q8, scores, offered);
+    const bool partials_ok = ref_chunks == download(chunks, chunk_bytes);
+    const bool out_ok = ref_out == download(a.out, out_n * sizeof(float));
+    const bool q8_ok = ref_q8 == download(q8, q8_bytes);
+    const std::vector<uint8_t> untouched(sizeof(float), 0xff);
+    const bool split = download(scores, sizeof(float)) != untouched;
+    const bool guard_ok = offered == capacity || download(scores + offered, sizeof(float)) == untouched;
+    check(cudaFree(q8));
+    const bool ok = partials_ok && out_ok && q8_ok && split == expect_split && guard_ok;
+    std::printf("%-31s expected %-8s partials %d FP32 %d Q8_1 %d dispatch %d guard %d%s\n", name,
+                expect_split ? "split" : "stock", partials_ok, out_ok, q8_ok, split == expect_split, guard_ok,
+                ok ? "" : " FAIL");
+    return ok;
+}
+
+bool run(const Case& c, float* scores, float* partial, int tiles, bool timed, const FactoredCheck* factored = nullptr) {
     std::mt19937 rng(1234 + (unsigned) c.pos + 7u * (unsigned) c.n);
     const int64_t rows = cache_rows(c);
-    const size_t width = (size_t) kKv * kHead;
+    const int kv = factored ? factored->kv : kKv, heads = kv * (kHeads / kKv);
+    const size_t width = (size_t) kv * kHead;
     std::vector<uint8_t> kd, vd;
     std::vector<uint16_t> ksc, vsc;
     auto fill = [&](std::vector<uint8_t>& data, std::vector<uint16_t>& scales) {
@@ -96,14 +154,14 @@ bool run(const Case& c, float* scores, float* partial, int tiles, bool timed) {
         }
     }
     // queries a little larger than a clipped head; relative terms and the table in the range the model's are
-    auto q = normal((size_t) c.n * kHeads * kHead, 0.35f, rng);
+    auto q = normal((size_t) c.n * heads * kHead, 0.35f, rng);
     if (c.spike)
         for (auto& x : q) x = std::fabs(x);
-    const auto rel = normal((size_t) c.n * kHeads * kRelative, 0.5f, rng);
+    const auto rel = normal((size_t) c.n * heads * kRelative, 0.5f, rng);
     const auto table = normal((size_t) kWindow * kRelative, 0.5f, rng);
-    auto sink = normal((size_t) c.n * kHeads, 1.5f, rng);
+    auto sink = normal((size_t) c.n * heads, 1.5f, rng);
     for (auto& x : sink) x += c.sink_add;
-    const auto gate = normal((size_t) c.n * kHeads * kHead, 1.f, rng);
+    const auto gate = normal((size_t) c.n * heads * kHead, 1.f, rng);
 
     Attend a;
     a.q = upload(q);
@@ -117,13 +175,25 @@ bool run(const Case& c, float* scores, float* partial, int tiles, bool timed) {
     a.n = c.n;
     a.window = c.swa ? kWindow : 0;
     a.ring = c.swa ? (int) rows : 0;
-    const size_t out_n = (size_t) c.n * kHeads * kHead;
+    a.kv_heads = kv;
+    const size_t out_n = (size_t) c.n * heads * kHead;
     float *plain = nullptr, *flash = nullptr;
     cudaMalloc(&plain, out_n * sizeof(float));
+    const auto free_case = [&] {
+        for (const void* p : {(const void*) a.q, (const void*) a.rel, (const void*) a.table, (const void*) a.sink,
+                              (const void*) a.gate, (const void*) a.k.data, (const void*) a.k.scales,
+                              (const void*) a.v.data, (const void*) a.v.scales, (const void*) plain, (const void*) flash})
+            if (p) cudaFree(const_cast<void*>(p));
+    };
+    a.out = plain;
+    if (factored) {
+        const bool ok = factored_matches(c.name, a, scores, plain_score_floats(tiles), *factored);
+        free_case();
+        return ok;
+    }
     cudaMalloc(&flash, out_n * sizeof(float));
     cudaMemset(flash, 0xff, out_n * sizeof(float));   // NaN wherever a row is left unwritten
 
-    a.out = plain;
     attend_plain(a, scores, partial, tiles, nullptr);
     a.out = flash;
     const auto other = [&] {
@@ -203,28 +273,61 @@ bool run(const Case& c, float* scores, float* partial, int tiles, bool timed) {
         cudaEventDestroy(t0);
         cudaEventDestroy(t1);
     }
-    for (const void* p : {(const void*) a.q, (const void*) a.rel, (const void*) a.table, (const void*) a.sink,
-                          (const void*) a.gate, (const void*) a.k.data, (const void*) a.k.scales,
-                          (const void*) a.v.data, (const void*) a.v.scales, (const void*) plain, (const void*) flash})
-        if (p) cudaFree(const_cast<void*>(p));
+    free_case();
     return ok;
 }
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool factored = argc == 2 && std::strcmp(argv[1], "--factored") == 0;
+    if (argc != 1 && !factored) {
+        std::fprintf(stderr, "usage: %s [--factored]\n", argv[0]);
+        return 2;
+    }
     int count = 0;
     if (cudaGetDeviceCount(&count) != cudaSuccess || count == 0) {
         std::puts("no card");
         return 77;
     }
-    // the engine's scratch at 200,000 tokens of context and batches of 512 (Inkling2::assign_scratch)
-    const int value_tiles = (kContext + 127) / 128, target = (1 << 20) / (kHeads * 128);
+    constexpr int kFactoredContext = 262144;
+    // The engine's scratch at the chosen context limit and batches of 512 (Inkling2::assign_scratch).
+    const int context = factored ? kFactoredContext : kContext;
+    const int value_tiles = (context + 127) / 128, target = (1 << 20) / (kHeads * 128);
     const int tiles = std::max(value_tiles, std::min(target, 512 * value_tiles));
     float *scores = nullptr, *partial = nullptr;
     cudaMalloc(&scores, plain_score_floats(tiles) * sizeof(float));
-    cudaMalloc(&partial, plain_partial_floats(tiles) * sizeof(float));
     cudaMalloc(&chunks, decode_floats() * sizeof(float));
+    if (factored) {
+        cudaDeviceProp props{};
+        if (cudaGetDeviceProperties(&props, 0) != cudaSuccess || !strata::kernels::gfx_arch_is(props.gcnArchName, "gfx906")) {
+            std::puts("--factored needs gfx906");
+            return 77;
+        }
+        const char* dpp_env = std::getenv("STRATA_INKLING_DECODE_DPP");
+        const bool dpp = dpp_env && std::strcmp(dpp_env, "1") == 0;
+        bool ok = true;
+        using Capacity = FactoredCheck::Capacity;
+        const auto check = [&](const Case& c, int kv = 4, Capacity limit = Capacity::Real) {
+            const FactoredCheck test{kv, dpp, limit};
+            ok = run(c, scores, nullptr, tiles, false, &test) && ok;
+        };
+        check({"full T1 first", 0, 1, false, true});
+        check({"full T2 bias boundary", 1023, 2, false, true});
+        check({"window T3 ring wrap", kWindow + 509, 3, true, true});
+        check({"full T4 exact capacity", 19127, 4, false, true}, 4, Capacity::Exact);
+        check({"full T4 one float short", 19127, 4, false, true}, 4, Capacity::Short);
+        check({"full T4 256K capacity", kFactoredContext - 4, 4, false, true});
+        check({"window T4 at 256K, no sink", kFactoredContext - 4, 4, true, true, -INFINITY});
+        check({"window T5 fallback", 2048, 5, true, true});
+        check({"FP16 fallback", 2048, 4, true, false});
+        check({"TP1 fallback", 2048, 4, true, true}, 8);
+        cudaFree(chunks);
+        cudaFree(scores);
+        std::puts(ok ? "PASS" : "FAIL");
+        return ok ? 0 : 1;
+    }
+    cudaMalloc(&partial, plain_partial_floats(tiles) * sizeof(float));
     const Case cases[] = {
         {"window, first batch", 0, 512, true, true},
         {"window, inside the ring", 512, 512, true, true},

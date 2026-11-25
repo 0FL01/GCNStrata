@@ -660,7 +660,8 @@ void Inkling2::load_geometry() {
     cudaDeviceProp p{};
     ck(cudaGetDevice(&device), "Inkling device");
     ck(cudaGetDeviceProperties(&p, device), "Inkling device properties");
-    bool supported_arch = kernels::gfx_arch_is(p.gcnArchName, "gfx906");
+    const bool gfx906 = kernels::gfx_arch_is(p.gcnArchName, "gfx906");
+    bool supported_arch = gfx906;
     for (const char* gcn : {"gfx1030", "gfx1031", "gfx1032", "gfx1033", "gfx1034", "gfx1035", "gfx1036"})
         supported_arch = supported_arch || kernels::gfx_arch_is(p.gcnArchName, gcn);
     if (!supported_arch) throw std::runtime_error("Inkling-2-Mini requires a HIP gfx906 or RDNA2 card");
@@ -679,6 +680,10 @@ void Inkling2::load_geometry() {
         std::fputs("strata-poly: STRATA_INKLING_PREFETCH=1: prompt experts queued before router readback\n", stderr);
     const char* decode = std::getenv("STRATA_INKLING_DECODE");
     decode_ = decode && decode[0] == '1' && decode[1] == '\0';
+#if defined(STRATA_HIP_GFX906)
+    const char* factored = std::getenv("STRATA_INKLING_DECODE_FACTORED");
+    factored_decode_ = gfx906 && tp_size_ == 2 && q8() && decode_ && factored && std::strcmp(factored, "1") == 0;
+#endif
     wave_gemv_ = head_warps_ = situ_q8_ = decode_;
     // A miss in a once-visited layer (0-5, 18-23) stalls the card: the CPU's experts there are 2-3 a visit and the
     // card waited 200-340 us a visit for them, against 5-70 us in the core visits, whose card experts hide one or two.
@@ -1849,8 +1854,10 @@ void Inkling2::attention(const Block& b, int n) {
     a.out = att_;
     // Prompt batches only: a token's answer and short calls keep the plain kernels and their sums.
     if (flash_ && n >= kStageRows) inkling::attend_flash(a, cs(st_));
-    else if (decode_ && n < kStageRows) inkling::attend_decode(a, chunks_, cs(st_), attq_);
-    else inkling::attend_plain(a, scores_, partial_, attend_tiles_, cs(st_));
+    else if (decode_ && n < kStageRows) {
+        inkling::attend_decode(a, chunks_, cs(st_), attq_, factored_decode_ ? scores_ : nullptr,
+                               factored_decode_ ? inkling::plain_score_floats(attend_tiles_) : 0);
+    } else inkling::attend_plain(a, scores_, partial_, attend_tiles_, cs(st_));
 }
 
 void Inkling2::depth_mix(const float* query, float* dst, int first, int n) {
