@@ -759,6 +759,12 @@ Wide prefill borrows local `input_[0]` for aligned, contiguous history and commi
 attention. The target full KV, DSpark rings, helper mirrors, maximum context and canonical checkpoint
 layout do not shrink. This frees owner VRAM; it does not create more resident experts when they already fit.
 
+`STRATA_INKLING_SWA_VALUE_HEADS=1` gives each of the three queries in a GQA group an independent workgroup
+in the factored SWA value pass at T1/T2. It keeps the original chunks, packed output and DPP tree, and explicitly
+rounds the accumulator rescale before fusing the new term, as the qualified grouped kernel does. Wider windows
+and full attention (including helpers) stay grouped. To test, run `poly_inkling_attend_test --factored` with both
+`STRATA_INKLING_DECODE_DPP=1` and `STRATA_INKLING_SWA_VALUE_HEADS=1`; the narrow-window cases compare partials as well as output bytes.
+
 ## Tuning table
 
 A hipBLASLt table holds solution ids that are valid only for one GPU architecture and one hipBLASLt version, so it

@@ -381,6 +381,9 @@ int main(int argc, char** argv) {
         };
         check({"full T1 first", 0, 1, false, true});
         check({"full T2 bias boundary", 1023, 2, false, true});
+        // With STRATA_INKLING_SWA_VALUE_HEADS=1 these hit the per-head numerator, not the grouped fallback.
+        check({"window T1 value contraction", 65560, 1, true, true});
+        check({"window T2 value contraction", 65560, 2, true, true});
         check({"window T3 ring wrap", kWindow + 509, 3, true, true});
         check({"full T4 exact capacity", 19127, 4, false, true}, 4, Capacity::Exact);
         check({"full T4 one float short", 19127, 4, false, true}, 4, Capacity::Short);

@@ -865,7 +865,7 @@ decode_q8_score_kernel(const float* q, const float* rel, const float* table, KvV
 }
 
 
-template <int KvStride>
+template <int KvStride, bool PerHead = false>
 __global__ void __launch_bounds__(128, 2)
 decode_q8_value_kernel(KvView v, int64_t pos, int window,
                  int ring, int chunk, const float* scores, int span, float* part) {
@@ -873,9 +873,11 @@ decode_q8_value_kernel(KvView v, int64_t pos, int window,
     const int sub = lane & 7, quad = lane >> 3;   // the 16 dimensions of the lane, and which of four keys
     const int64_t end = pos + row + 1, start = oldest(end, window);
     const int count = (int) (end - start), first = c * chunk, last = min(first + chunk, count);
-    float m[kGroup], l[kGroup], acc[kGroup][16];
+    constexpr int queries = PerHead ? 1 : kGroup;
+    const int first_query = PerHead ? blockIdx.z : 0;
+    float m[queries], l[queries], acc[queries][16];
 #pragma unroll
-    for (int r = 0; r < kGroup; ++r) {
+    for (int r = 0; r < queries; ++r) {
         m[r] = -INFINITY;
         l[r] = 0.f;
 #pragma unroll
@@ -901,7 +903,7 @@ decode_q8_value_kernel(KvView v, int64_t pos, int window,
         for (int u = 0; u < kAttUnroll; ++u) {
             const int i = i0 + 4 * u + quad;
             if (i >= last) continue;   // a whole group of eight lanes: the shuffles below stay inside it
-            const float* sc = scores + (((size_t) row * span + i) * KvStride + g) * kGroup;
+            const float* sc = scores + (((size_t) row * span + i) * KvStride + g) * kGroup + first_query;
             const int vwords[4] = {vw[u].x, vw[u].y, vw[u].z, vw[u].w};
             float val[16];
 #pragma unroll
@@ -909,7 +911,7 @@ decode_q8_value_kernel(KvView v, int64_t pos, int window,
 #pragma unroll
                 for (int y = 0; y < 4; ++y) val[4 * x + y] = (float) (int8_t) (vwords[x] >> (8 * y)) * vs[u];
 #pragma unroll
-            for (int r = 0; r < kGroup; ++r) {
+            for (int r = 0; r < queries; ++r) {
                 const float next = fmaxf(m[r], sc[r]);
                 // every score so far -inf (overflowed terms): the exponentials are 0, as attend_plain() gives them
                 const float base = next == -INFINITY ? 0.f : next;
@@ -917,13 +919,17 @@ decode_q8_value_kernel(KvView v, int64_t pos, int window,
                 m[r] = next;
                 l[r] = l[r] * keep + p;
 #pragma unroll
-                for (int j = 0; j < 16; ++j) acc[r][j] = acc[r][j] * keep + p * val[j];
+                for (int j = 0; j < 16; ++j) {
+                    // gfx906's grouped value kernel rounds the rescale before fusing the new term.
+                    if constexpr (PerHead) acc[r][j] = fmaf(p, val[j], acc[r][j] * keep);
+                    else acc[r][j] = acc[r][j] * keep + p * val[j];
+                }
             }
         }
     }
     // the wave's four groups of keys into one (lanes 8 and 16 apart hold the same dimensions)
 #pragma unroll
-    for (int r = 0; r < kGroup; ++r) {
+    for (int r = 0; r < queries; ++r) {
         float top = fmaxf(m[r], decode_xor<8, true>(m[r]));
         top = fmaxf(top, decode_xor<16, true>(top));
         const float base = top == -INFINITY ? 0.f : top;
@@ -942,9 +948,9 @@ decode_q8_value_kernel(KvView v, int64_t pos, int window,
         l[r] = sum;
     }
     if (quad != 0) return;
-    float* dst = part + (((size_t) row * KvStride + g) * gridDim.x + c) * kChunkFloats;
+    float* dst = part + (((size_t) row * KvStride + g) * gridDim.x + c) * kChunkFloats + first_query * (kHead + 2);
 #pragma unroll
-    for (int r = 0; r < kGroup; ++r) {
+    for (int r = 0; r < queries; ++r) {
 #pragma unroll
         for (int j = 0; j < 16; ++j) dst[r * (kHead + 2) + 2 + 16 * sub + j] = acc[r][j];
         if (sub == 0) {
@@ -1132,13 +1138,23 @@ void attend_decode(const Attend& a, float* scratch, cudaStream_t st, void* q8,
             const int chunk = factored_chunk(span), chunks = div_up(span, chunk);
             const int packet = a.n <= 2 ? 16 : chunk;
             const int batch = whole ? a.n : div_up(a.n, div_up(a.n, fit));
+            static const bool split_value = [] {
+                const char* v = std::getenv("STRATA_INKLING_SWA_VALUE_HEADS");
+                return v && v[0] == '1' && !v[1];
+            }();
             for (int row = 0; row < a.n; row += batch) {
                 const int n = std::min(batch, a.n - row);
                 decode_q8_score_kernel<4><<<dim3(div_up(span, packet), n), 128, 0, st>>>(
                     a.q + row * 12 * kHead, a.rel + row * 12 * kRelative, a.table, a.k, a.pos + row, a.window,
                     a.ring, packet, span, scores);
-                decode_q8_value_kernel<4><<<dim3(chunks, n), 128, 0, st>>>(a.v, a.pos + row, a.window, a.ring, chunk,
-                    scores, span, scratch + (size_t) row * 4 * chunks * kChunkFloats);
+                float* part = scratch + (size_t) row * 4 * chunks * kChunkFloats;
+                // Few SWA chunks at narrow widths: give each query its own wave without splitting a reduction.
+                if (split_value && a.window && a.n <= 2)
+                    decode_q8_value_kernel<4, true><<<dim3(chunks, n, kGroup), 128, 0, st>>>(
+                        a.v, a.pos + row, a.window, a.ring, chunk, scores, span, part);
+                else
+                    decode_q8_value_kernel<4><<<dim3(chunks, n), 128, 0, st>>>(
+                        a.v, a.pos + row, a.window, a.ring, chunk, scores, span, part);
             }
             decode_combine_kernel<4><<<dim3(12, a.n), kHead, 0, st>>>(scratch, chunks, a.sink, a.gate, a.out,
                                                                       static_cast<Q81*>(q8));
