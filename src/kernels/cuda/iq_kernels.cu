@@ -3628,6 +3628,45 @@ void iq_mmvq_ids(int t, const MmvqIds& ids, int count, int n_in, int n_out, void
     slots_of(t, ids, count, n_in, n_out, stream);
 }
 
+#if defined(STRATA_HIP_GFX906)
+namespace {
+// Keep the eight down partials on the producing CTA, not a [T,8,2304] VRAM plane.
+// One logical warp per pick, identical lane-to-K map and row_dot reduction to slots_of().
+template<int TY>
+__global__ void __launch_bounds__(256) inkling_down_sum_kernel(MmvqIds ids, const float* weights, float* fo) {
+    constexpr int rows = 4, blocks = 576 / 32;
+    constexpr int rb = blocks * (TY == 2 ? sizeof(block_q4_0) : sizeof(block_q4_1));
+    const int t = blockIdx.y, first = blockIdx.x * rows, pick = threadIdx.y, lane = threadIdx.x;
+    const int j = t * 8 + pick;
+    const auto* w = (const uint8_t*) ids.table[ids.ids[j]] + ids.offset;
+    const auto* x = (const block_q8_1*) ids.x + j * blocks;
+    __shared__ float down[8][rows];
+#pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        const float y = row_dot<TY>(w + (first + r) * rb, x, blocks, lane);
+        if (!lane) down[pick][r] = y;
+    }
+    __syncthreads();
+    if (pick == 0 && lane < rows) {
+        const int out = t * 2304 + first + lane;
+        float sum = fo[out];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) sum = sum + down[k][lane] * weights[t * 8 + k];
+        fo[out] = sum;
+    }
+}
+}  // namespace
+
+bool inkling_down_sum(int t, const MmvqIds& ids, const float* weights, float* fo, int n, void* stream) {
+    const dim3 grid(2304 / 4, n), block(32, 8);
+    if (t == 2) inkling_down_sum_kernel<2><<<grid, block, 0, (cudaStream_t)stream>>>(ids, weights, fo);
+    else if (t == 3) inkling_down_sum_kernel<3><<<grid, block, 0, (cudaStream_t)stream>>>(ids, weights, fo);
+    else return false;
+    check("Inkling routed down sum");
+    return true;
+}
+#endif
+
 void iq_dequant_f16(int t, const void* src, int64_t n, uint16_t* dst, void* stream, const float* scale) {
     if (n % 256 != 0 || !is_iq(t)) { std::fprintf(stderr, "iq_dequant_f16: bad arguments\n"); std::exit(1); }
     dequant_flat_kernel<__half><<<(unsigned) (n / 256), 32, 0, (cudaStream_t) stream>>>(t, src, (__half*) dst, scale);

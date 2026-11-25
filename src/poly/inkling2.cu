@@ -1090,6 +1090,12 @@ void Inkling2::gpu_route_moe(Layer& L, int il, int n) {
     situ_rows_q8_1(gpu_route_gu_, gpu_route_q8_, n_ff_exp_, rr, situ_.beta, situ_.linear_beta, st_, expert_scales(L, ids));
     const kernels::MmvqIds down{table, ids, L.gu2(), gpu_route_q8_, kernels::native_q8_1_bytes(n_ff_exp_),
                                1, d_, (size_t) n_embd_};
+    static const bool local_sum = [] {
+        const char* e = std::getenv("STRATA_INKLING_DOWN_SUM");
+        return e && e[0] == '1' && e[1] == '\0';
+    }();
+    if (local_sum && n_ff_exp_ == 576 && n_embd_ == 2304 &&
+        kernels::inkling_down_sum((int)L.d_type, down, d_wts_, fo_, n, st_)) return;
     if (!kernels::native_mmvq_ids((int) L.d_type, down, rr, n_ff_exp_, n_embd_, st_))
         throw std::logic_error("Inkling GPU route down MMVQ rejected a validated shape");
     gpu_route_sum<<<dim3(div_up(n_embd_, 256), n), 256, 0, cs(st_)>>>(d_, d_wts_, fo_, n_embd_);

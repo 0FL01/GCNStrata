@@ -711,6 +711,10 @@ score buffer, with no extra allocation. Calls that do not fit or do not meet the
 chunk can share one raw depth mix and its RMS between Q, K and V on the 20 sliding-window visits with messages.
 Each stream still runs its own message controller. Full-attention visits, other widths and verifier windows do not use it.
 
+`STRATA_INKLING_DOWN_SUM=1` lets the resident TP2 router's 576→2304 Q4_0/Q4_1 down projection sum its eight
+expert contributions on the producing CTA. It preserves the lane reduction, pick order and initial FO value;
+the ordinary TP2 collective still runs afterwards. Other model shapes, bulk prompt batches and host routing are unchanged.
+
 ## Tuning table
 
 A hipBLASLt table holds solution ids that are valid only for one GPU architecture and one hipBLASLt version, so it

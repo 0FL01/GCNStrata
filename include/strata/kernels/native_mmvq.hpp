@@ -221,6 +221,10 @@ struct MmvqIds {
 };
 bool native_mmvq_ids_supported(int ggml_type);
 bool native_mmvq_ids(int ggml_type, const MmvqIds& ids, int count, int n_in, int n_out, void* stream);
+#if defined(STRATA_HIP_GFX906)
+// Resident Inkling TP2 down projections (8 ordered Q4 picks, 576 -> 2304).
+bool inkling_down_sum(int ggml_type, const MmvqIds& ids, const float* weights, float* fo, int n, void* stream);
+#endif
 
 struct MmvqSegments {
     static constexpr int kMost = 8;
