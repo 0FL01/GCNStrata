@@ -49,6 +49,9 @@ protected:
     void output_rows(int first, int rows, float* h) override;
     void finish_logits(float* logits, int rows) override;
     void route(int il, const float* logits, int32_t, int* ids, float* w, float* tmp) const override;
+#if defined(STRATA_HIP_GFX906)
+    bool route_inkling_exact(int il, int n, int32_t* ids, float* w, int32_t* invalid) override;
+#endif
     void moe_shared(const Layer&, int, int n) override;
     void moe_add(int n) override;
     void load_drafter() override;
@@ -97,10 +100,10 @@ private:
     GpuRouteReport *gpu_route_dev_ = nullptr, *gpu_route_host_ = nullptr;
     float *gpu_route_bias_ = nullptr, *gpu_route_gu_ = nullptr;
     void* gpu_route_q8_ = nullptr;
-    bool gpu_route_failed_ = false;
+    bool gpu_route_failed_ = false, gpu_prefill_route_ = false;
     bool gpu_route_supported() const;
     bool gpu_decode_supported() const;
-    void init_gpu_route();
+    void init_gpu_route(bool decode, bool prefill);
     void gpu_route_moe(Layer& L, int il, int n);
     void count_gpu_route(int n);
 #endif

@@ -12,6 +12,7 @@
 #include <string>
 
 #if defined(STRATA_HIP_GFX906)
+#include "inkling_prefill_gfx906.cuh"
 #include "mmq_q4_down_gfx906.cuh"
 #endif
 
@@ -174,6 +175,26 @@ void Mmq::quantize_q4_scatter(const float* x, const int32_t* slot, void* xq, int
                                    (cudaStream_t) stream);
     ck("mmq quantize Q4 scatter");
 }
+
+namespace inkling_prefill {
+
+void plan(Scratch* s, const int32_t* ids, int tokens, SlotOrder order, int32_t* cb, void* stream) {
+    const int r = tokens * picks, parts = ceil_div(r, slice);
+    auto st = (cudaStream_t) stream;
+    mask_picks<<<dim3(experts, parts), threads, 0, st>>>(s, ids, r, order);
+    make_plan<<<1, experts, 0, st>>>(s, cb, parts, tokens);
+    ck("Inkling prefill plan");
+}
+
+void scatter(const Scratch* s, int tokens, bool inverse, int32_t* tok, int32_t* place, void* stream) {
+    scatter_picks<<<dim3(experts, ceil_div(tokens * picks, slice)), threads, 0, (cudaStream_t) stream>>>(s, inverse,
+                                                                                                   tok, place);
+    ck("Inkling prefill scatter");
+}
+
+}  // namespace inkling_prefill
+
+
 #endif
 
 void Mmq::mul(const void* w, int type, int64_t w_rows, int64_t w_cols, size_t stride, int n, const void* xq,

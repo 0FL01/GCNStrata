@@ -200,6 +200,9 @@ struct Stats {
 int most_likely(const float* logits, int n);
 
 class Mmq;
+#if defined(STRATA_HIP_GFX906)
+namespace inkling_prefill { struct Scratch; struct Summary; }
+#endif
 
 /// A picture in a sequence: n rows that stand where n tokens would, each the vision encoder's output for a patch,
 /// as wide as a token's embedding.  The patches come line after line, nx to a line.
@@ -481,6 +484,14 @@ protected:
         (void) il, (void) n, (void) ids, (void) w;
         return false;
     }
+#if defined(STRATA_HIP_GFX906)
+    /// Exact Inkling selector from rl_, on st_. The caller clears `invalid` on the device. A launch sets it
+    /// nonzero for any unsupported numeric row; outputs from an invalid visit must not be used. False: no launch.
+    virtual bool route_inkling_exact(int il, int n, int32_t* ids, float* w, int32_t* invalid) {
+        (void) il, (void) n, (void) ids, (void) w, (void) invalid;
+        return false;
+    }
+#endif
     /// The shared expert, into fo_.  It runs on the GPU while the host routes.
     virtual void moe_shared(const Layer& L, int il, int n) = 0;
     /// The scores of a layer's router for n tokens, into rl_.  The engine's own: the router's matrix times the
@@ -608,6 +619,9 @@ protected:
     template <class F>
     void* record(F&& work);
     void moe_rows(Layer& L, int il, int n);
+#if defined(STRATA_HIP_GFX906)
+    bool moe_rows_inkling_gpu(Layer& L, int il, int n);
+#endif
     void stage(const Layer& L, const int32_t* experts, int m, void* stream, bool alone = false);
     void mind_memory();
     void follow(int written);
@@ -900,6 +914,11 @@ protected:
 
     // A prompt batch's MoE (moe_rows).  A row is a token and one of the experts it routes to.
     std::unique_ptr<Mmq> mmq_;   ///< null when the card has no MMQ tile for the experts' types
+#if defined(STRATA_HIP_GFX906)
+    inkling_prefill::Scratch* inkling_prefill_ = nullptr;
+    inkling_prefill::Summary* h_inkling_prefill_ = nullptr;
+    bool inkling_prefill_logged_ = false;
+#endif
     float *gu_ = nullptr, *hx_ = nullptr, *dx_ = nullptr;   ///< the rows' gate|up, hidden and down values
     float* hf_ = nullptr;   ///< the power of two a row was divided by for its half sums (guard_half_sums())
     void *mq_ = nullptr, *mq2_ = nullptr;                   ///< the rows quantized for the two products

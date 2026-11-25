@@ -829,20 +829,29 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
     ck(cudaSetDevice(1), "tp2 setDevice 1");
     r1->load(o1);
 #if defined(STRATA_HIP_GFX906)
-    const char* want = std::getenv("STRATA_INKLING_GPU_ROUTE");
-    if (want && !std::strcmp(want, "1")) {
-        const bool decode = Tp2Comm::small_push_enabled() && gpu_route_host_expf() &&
-                            r0->gpu_route_supported() && r1->gpu_route_supported() &&
+    const auto enabled = [](const char* name) {
+        const char* v = std::getenv(name);
+        return v && !std::strcmp(v, "1");
+    };
+    const bool want_decode = enabled("STRATA_INKLING_GPU_ROUTE"), want_prefill = enabled("STRATA_INKLING_GPU_PREFILL");
+    if (want_decode || want_prefill) {
+        const bool shared = gpu_route_host_expf() && r0->gpu_route_supported() && r1->gpu_route_supported();
+        const bool decode = shared && want_decode && Tp2Comm::small_push_enabled() &&
                             r0->gpu_decode_supported() && r1->gpu_decode_supported();
-        if (decode) {
-            r1->init_gpu_route();
+        const bool prefill = shared && want_prefill && r0->rows_ >= 2047 && r1->rows_ >= 2047;
+        if (decode || prefill) {
+            r1->init_gpu_route(decode, prefill);
             ck(cudaSetDevice(0), "tp2 setDevice 0");
-            r0->init_gpu_route();
+            r0->init_gpu_route(decode, prefill);
+        }
+        if (decode) {
             std::fputs("strata-poly: STRATA_INKLING_GPU_ROUTE=1: exact GPU routing for TP2 T=1..4\n", stderr);
-        } else {
+        } else if (want_decode) {
             std::fputs("strata-poly: STRATA_INKLING_GPU_ROUTE=1 unavailable (needs FP32 small push, fully resident "
                        "Q4 TP2 decode and default x86 glibc FMA FP mode)\n", stderr);
         }
+        if (want_prefill && !prefill)
+            std::fputs("strata-poly: STRATA_INKLING_GPU_PREFILL=1 exact selector unavailable; using host routing\n", stderr);
     }
 #endif
     ck(cudaSetDevice(0), "tp2 setDevice 0");
@@ -1012,7 +1021,7 @@ bool Inkling2::gpu_decode_supported() const {
     return true;
 }
 
-void Inkling2::init_gpu_route() {
+void Inkling2::init_gpu_route(bool decode, bool prefill) {
     using namespace inkling_route;
     std::vector<float> bias;
     bias.reserve((size_t) kPhysical * kExperts);
@@ -1020,6 +1029,8 @@ void Inkling2::init_gpu_route() {
     gpu_route_bias_ = (float*) dmalloc(bias.size() * sizeof(float), "Inkling GPU route bias");
     ck(cudaMemcpy(gpu_route_bias_, bias.data(), bias.size() * sizeof(float), cudaMemcpyHostToDevice),
        "Inkling GPU route bias");
+    gpu_prefill_route_ = prefill;
+    if (!decode) return;
     static_assert(kPicks == 8 && kGpuRouteRows * kPicks <= kSumRows);
     const int rr = std::min(rows_, kGpuRouteRows) * kPicks;
     if (!d_slots_)
@@ -1030,6 +1041,14 @@ void Inkling2::init_gpu_route() {
     gpu_route_gu_ = (float*) dmalloc((size_t) rr * 2 * n_ff_exp_ * sizeof(float), "Inkling GPU route gate/up");
     gpu_route_q8_ = dmalloc((size_t) rr * kernels::native_q8_1_bytes(n_ff_exp_), "Inkling GPU route activation Q8_1");
     if (!card_moe(1)) throw std::logic_error("Inkling GPU route could not initialize resident slots");
+}
+
+bool Inkling2::route_inkling_exact(int il, int n, int32_t* ids, float* w, int32_t* invalid) {
+    if (!gpu_prefill_route_ || !all_cached() || il < 0 || il >= kPhysical || n < kStageRows || n > rows_ ||
+        block_pass_ || !gpu_route_host_fp())
+        return false;
+    inkling_route::select(rl_, gpu_route_bias_ + il * inkling_route::kExperts, expert_scale_, ids, w, n, invalid, st_);
+    return true;
 }
 
 void Inkling2::gpu_route_moe(Layer& L, int il, int n) {

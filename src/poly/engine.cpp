@@ -12,6 +12,9 @@
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
 #include "inkling2.hpp"
 #endif
+#if defined(STRATA_HIP_GFX906)
+#include "inkling_prefill.hpp"
+#endif
 #include "mmq.hpp"
 #include "qwen35.hpp"
 #include "runtime.hpp"
@@ -91,6 +94,27 @@ int tile_class(int rows) {
     while (c < kClasses - 1 && rows > kTile[c]) ++c;
     return c;
 }
+
+#if defined(STRATA_HIP_GFX906)
+static_assert(kClasses == inkling_prefill::classes && kTile[0] == inkling_prefill::cutoffs[0] &&
+              kTile[1] == inkling_prefill::cutoffs[1]);
+
+bool inkling_gpu_prefill() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_INKLING_GPU_PREFILL");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+
+bool tp2_q4_scatter() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_TP2_PREFILL_Q4_SCATTER");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+#endif
 
 // A container's CPU quota is not in the affinity mask: a 25-CPU pod on a 208-thread host shows 208.
 // `quota` is set when there is one.
@@ -3331,6 +3355,14 @@ void Engine::alloc() {
         iota_ = (int32_t*) dmalloc((rr + id_tail) * sizeof(int32_t), "scratch");
         d_ex_ = (int32_t*) dmalloc(rr * sizeof(int32_t), "scratch");
         h_ex_ = (int32_t*) hmalloc(rr * sizeof(int32_t), "pinned memory");
+#if defined(STRATA_HIP_GFX906)
+        if (inkling_gpu_prefill() && looped_ && opt_.tp == 2 && rows_ >= inkling_prefill::max_tokens - 1 &&
+            n_expert_ == inkling_prefill::experts && n_used_ == inkling_prefill::picks &&
+            n_embd_ == inkling_prefill::width && n_ff_exp_ == inkling_prefill::ff) {
+            inkling_prefill_ = (inkling_prefill::Scratch*) dmalloc(sizeof(inkling_prefill::Scratch), "prefill plan");
+            h_inkling_prefill_ = (inkling_prefill::Summary*) hmalloc(sizeof(inkling_prefill::Summary), "prefill plan");
+        }
+#endif
         std::vector<int32_t> ramp(rr + id_tail);
         std::iota(ramp.begin(), ramp.begin() + (ptrdiff_t) rr, 0);
         ck(cudaMemcpy(iota_, ramp.data(), ramp.size() * sizeof(int32_t), cudaMemcpyHostToDevice), "scratch");
@@ -4688,6 +4720,93 @@ void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, 
     ck(cudaMemsetAsync(stage_ + down_at + (size_t) m * L.d_bytes, 0, kTail, cs(stream)), "expert staging");
 }
 
+#if defined(STRATA_HIP_GFX906)
+// No staging or pointer table publication here. Accept one full contiguous run, with its actual slot order
+// (not necessarily expert ID order). Checking the live slots also keeps trim/refill out of this path.
+bool Engine::moe_rows_inkling_gpu(Layer& L, int il, int n) {
+    using namespace inkling_prefill;
+    if (!inkling_prefill_ || n < max_tokens - 1 || n > max_tokens || recording_ || opt_.dump || !all_cached() ||
+        L.gu_type != GGML_TYPE_Q4_0 || L.mixed() ||
+        (L.d_type != GGML_TYPE_Q4_0 && L.d_type != GGML_TYPE_Q4_1) ||
+        !L.h_s_gate.empty() || !L.h_s_up.empty() || !L.h_s_down.empty() ||
+        (half_sum_guard_ && Mmq::half_sums((int) L.d_type)) ||
+        L.slot.size() != experts || !L.slot_bytes) return false;
+    uintptr_t base = UINTPTR_MAX;
+    for (const uint8_t* slot : L.slot) {
+        if (!slot) return false;
+        base = std::min(base, (uintptr_t) slot);
+    }
+    SlotOrder order;
+    std::fill_n(order.expert, experts, -1);
+    for (int e = 0; e < experts; ++e) {
+        const uintptr_t offset = (uintptr_t) L.slot[(size_t) e] - base;
+        const size_t j = offset / L.slot_bytes;
+        if (j >= experts || offset % L.slot_bytes || order.expert[j] != -1) return false;
+        order.expert[j] = e;
+    }
+
+    auto* s = inkling_prefill_;
+    ck(cudaMemsetAsync(&s->summary.invalid, 0, sizeof(s->summary.invalid), cs(st_)), "Inkling prefill status");
+    if (!route_inkling_exact(il, n, d_ids_, d_wts_, &s->summary.invalid)) return false;
+    const int rr = n * picks;
+    const size_t cap = (size_t) rows_ * picks;
+    int32_t* tok = tab_;
+    int32_t* place = tok + cap;
+    int32_t* cb = tab_ + 3 * cap + 3 * (experts + 1);
+    const bool inverse = tp2_q4_scatter();
+    plan(s, d_ids_, n, order, cb, st_);
+    ck(cudaMemcpyAsync(h_inkling_prefill_, &s->summary, sizeof(s->summary), cudaMemcpyDeviceToHost, cs(st_)),
+       "Inkling prefill summary");
+    ck(cudaEventRecord((cudaEvent_t) ev_, cs(st_)), "Inkling prefill summary");
+    scatter(s, n, inverse, tok, place, st_);
+    // Keep the visit-level fallback exact: nothing has consumed the picks or touched its expert results yet.
+    const auto start = Clock::now();
+    ck(cudaEventSynchronize((cudaEvent_t) ev_), "Inkling prefill summary");
+    const double waited = ms_since(start);
+    stats_.route_wait_ms += waited;
+    const Summary& summary = *h_inkling_prefill_;
+    if (summary.invalid) return false;
+
+    if (opt_.stage_ahead > 0 && (n >= opt_.stage_ahead || shared_ahead_) && !freeze_experts_) route_ms_ = waited;
+    const size_t use_base = (size_t) il * experts;
+    for (int j = 0; j < experts; ++j) {
+        const size_t idx = use_base + order.expert[j];
+        use_[idx] += summary.count[j];
+        if (pool_) for (int k = 0; k < summary.count[j]; ++k) prompt_use_[idx] += 1.f;
+    }
+    if (pool_ && il == first_moe_layer()) prompt_rows_ += n;
+    stats_.batch_cached += rr;
+
+    moe_shared(L, il, n);
+    if (inverse) Mmq::quantize_q4_scatter(xn_, tok, mq_, width, n, picks, st_);
+    else Mmq::quantize(xn_, tok, mq_, GGML_TYPE_Q4_0, width, width, rr, st_);
+    const uint8_t* w = L.slot[(size_t) order.expert[0]];
+    const auto mul = [&](bool down, int c) {
+        if (summary.most[c] == 0) return;
+        const int type = down ? (int) L.d_type : GGML_TYPE_Q4_0;
+        const uint8_t* a = down ? w + L.gu2() : w;
+        const void* xq = down ? mq2_ : mq_;
+        const int32_t* ids = down ? place : iota_;
+        float* out = down ? dx_ : gu_;
+        const int m = down ? width : 2 * ff, k = down ? ff : width;
+        mmq_->mul(a, type, m, k, L.slot_bytes, experts, xq, cb + (size_t) c * (experts + 1), ids, rr, summary.most[c],
+                  out, m, st_);
+    };
+    for (int c = 0; c < classes; ++c) mul(false, c);
+    expert_activation(gu_, hx_, rr, clamp_exp_[(size_t) il], ExpertScales{});
+    Mmq::quantize(hx_, nullptr, mq2_, (int) L.d_type, ff, ff, rr, st_);
+    for (int c = 0; c < classes; ++c) mul(true, c);
+    ck(cudaEventRecord((cudaEvent_t) ev_free_, cs(st_)), "expert staging");
+    moe_sum(dx_, d_wts_, fo_, width, picks, n, st_);
+    if (!inkling_prefill_logged_) {
+        std::fprintf(stderr, "strata-poly: Inkling GPU prefill on device %d, T=%d, stable device tables\n",
+                     device_, n);
+        inkling_prefill_logged_ = true;
+    }
+    return true;
+}
+#endif
+
 // A MoE layer for a prompt batch: the experts on the GPU, by llama.cpp's MMQ.  A row is a token and one
 // of the experts it routes to.  The rows are sorted by expert, the experts of the VRAM cache first; the other
 // experts pass through the staging buffer, as many at a time as it holds.  A full batch starts the copy of
@@ -4737,6 +4856,9 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     // without overlap. Queue them first, while this visit's attention is still pending. Only Inkling opts in.
     if (prefetch_early_) prefetch();
     router_scores(L, n);
+#if defined(STRATA_HIP_GFX906)
+    if (!early && n_ahead == 0 && moe_rows_inkling_gpu(L, il, n)) return;
+#endif
     // Routed on the card, a batch hands the host its picks: the host took longer to route a batch of 1,024 tokens
     // than the card took for its experts.
     const bool on_card = route_card(il, n, d_ids_, d_wts_);
@@ -4900,12 +5022,8 @@ void Engine::moe_rows(Layer& L, int il, int n) {
     }
     const int rg = at;   // the card's rows
 #if defined(STRATA_HIP_GFX906)
-    static const bool want_scatter = [] {
-        const char* v = std::getenv("STRATA_TP2_PREFILL_Q4_SCATTER");
-        return v && v[0] == '1' && v[1] == '\0';
-    }();
     // Every pick has a GPU row: the tok segment can hold the inverse map with no extra transfer.
-    const bool scatter_pack = want_scatter && opt_.tp == 2 && n >= 2047 && n <= 2048 && n_used_ == 8 &&
+    const bool scatter_pack = tp2_q4_scatter() && opt_.tp == 2 && n >= 2047 && n <= 2048 && n_used_ == 8 &&
                               n_embd_ == 2304 && n_ff_exp_ == 576 && L.gu_type == GGML_TYPE_Q4_0 && !L.mixed() &&
                               n_round == 0 && n_cpu == 0 && rg == rr;
 #else
