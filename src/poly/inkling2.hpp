@@ -9,6 +9,7 @@
 #include <array>
 #include <condition_variable>
 #include <exception>
+#include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -237,33 +238,37 @@ private:
     static constexpr int kDfLayers = 5, kDfFfn = 6912, kDfSub = 256, kDfMask = 200056, kDfVocab = 200058;
     struct DfLayer {
         Dev attn_norm, ffn_norm, q, k, v, o, q_norm, k_norm, gate, up, down, abase, aproj, fbase, fproj;
-        // STRATA_DFLASH2_GEMV8: repacked int8 rows; q|k|v and gate|up fused (one launch each)
-        dflash2::Mat8 qkv8, gu8, o8, down8, aproj8, fproj8;
+        // Planar Q8/Q4 weights; q|k|v and gate|up fused (one launch each).
+        dflash2::Mat qkv, gu, wo, wdown, waproj, wfproj;
     };
-    bool df_gemv8_ = false;            // STRATA_DFLASH2_GEMV8=1: the block's products with dflash2::gemv8()
+    bool df_planar_ = false;           // GEMV8 or MIXED: use packed weights in the drafter block
+    bool df_kept_opt_ = false;         // KEPT_OPT: quantize a short kept batch once and reuse the QKV slices
+    bool df_q4_f32_ = false;           // Q4_F32: expand backbone Q4_0 scales for comparison
     bool df_attend3_ = false;          // STRATA_DFLASH2_ATTEND3=1: dflash2::attend3()
-    dflash2::Mat8 df_sel8_;
-    // STRATA_DFLASH2_HEAD8=1: a drafter-private int8 copy of this rank's head rows (of the 200,058 real ones), its
-    // logits [7][rows] and top 16 on this card; rank 1's top 16 cross as 7 x 32 floats (on both ranks' objects)
-    bool df_head8_ = false;
-    dflash2::Mat8 df_h8_;
-    int df_h8_lo_ = 0;
+    dflash2::Mat df_sel_;
+    // Private planar head weights on both ranks. Rank 1's top 16 cross as 7 x 32 floats.
+    bool df_private_head_ = false;    // HEAD8, HEAD_Q4 or HEAD_FUSE on TP2
+    bool df_head_q4_ = false, df_head_fuse_ = false;
+    dflash2::Mat df_head_;
+    int df_head_lo_ = 0;
+    void* df_head_parts_ = nullptr;
     float *df_hlog_ = nullptr, *df_htop_ = nullptr, *df_hvals_ = nullptr, *df_hpack_ = nullptr, *df_hx_ = nullptr;
     int32_t *df_hids_ = nullptr, *df_hids1_ = nullptr;
     float* df_hvals1_ = nullptr;
     float* df_hxd_ = nullptr;
+    int32_t* df_hxsum_ = nullptr;
     int8_t* df_hxq_ = nullptr;
     void df_head_load(int lo, int n);   // on this object's card
-    void df_head_run(const float* h);   // h: [7][2304] on this card; leaves df_hids_/df_hvals_ (absolute ids)
-    int8_t* df_xq_ = nullptr;          // gemv8's activations: [8][9216] codes
-    float* df_xd_ = nullptr;           // and [8][288] scales
-    dflash2::Mat8 df_pack(const std::string& name, int n_in, int n_out);
-    dflash2::Mat8 df_pack_rows(const std::vector<std::string>& names, int n_in, const std::vector<int>& n_out);
-    void df_lin(const Dev& w, const dflash2::Mat8& w8, const float* x, float* y, int rows);
+    void df_head_run(const float* h);   // h: [7][2304] on this card; leaves df_hids_/df_hvals_ (rank-local ids)
+    int8_t* df_xq_ = nullptr;          // planar activations: [8][9216] codes
+    float* df_xd_ = nullptr;           // [8][288] scales
+    int32_t* df_xsum_ = nullptr;       // [8][288] unscaled code sums (Q4 only)
+    dflash2::Mat df_pack_rows(std::initializer_list<Dev> weights);
+    void df_lin(const Dev& w, const dflash2::Mat& packed, const float* x, float* y, int rows);
     bool df2_ = false;
     std::array<DfLayer, kDfLayers> df_;
     Dev df_fc_, df_hnorm_, df_onorm_, df_selw_;
-    __half *df_pred_ = nullptr, *df_succ_ = nullptr;   // selector codebooks, half [kDfVocab][256]
+    dflash2::Book df_pred_, df_succ_;   // selector codebooks [kDfVocab][256]
     __half *df_kc_ = nullptr, *df_vc_ = nullptr;       // [kDfLayers][2048][1024] K (normed, rotated) and V rings
     float df_eps_ = 0, df_cap_ = 0, df_theta_ = 0;
     int64_t df_lo_ = 0, df_hi_ = 0;   // ring rows of positions [df_lo_, df_hi_) are this sequence's

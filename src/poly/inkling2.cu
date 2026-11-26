@@ -1104,13 +1104,15 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
     r0->load(o0);
     ck(cudaSetDevice(1), "tp2 setDevice 1");
     r1->load(o1);
-    if (r0->df2_ && r0->df_head8_) {   // the DFlash2 head's int8 halves, each on the owner of that half of the head
+    if (r0->df2_ && r0->df_private_head_) {   // each owner loads its private half; rank 1 has no drafter GGUF
         const int lo1 = r1->tp2_vocab_lo_;
+        r1->df_head_q4_ = r0->df_head_q4_;
+        r1->df_head_fuse_ = r0->df_head_fuse_;
         r1->df_head_load(lo1, kDfVocab - lo1);
         ck(cudaSetDevice(0), "tp2 setDevice 0");
         r0->df_head_load(0, lo1);
-        std::fprintf(stderr, "strata-poly: STRATA_DFLASH2_HEAD8=1: DFlash2 head rows [0, %d) and [%d, %d) as int8 on "
-                     "the two owners\n", lo1, lo1, kDfVocab);
+        std::fprintf(stderr, "strata-poly: DFlash2 private head rows [0, %d) and [%d, %d) as %s%s\n",
+                     lo1, lo1, kDfVocab, r0->df_head_q4_ ? "Q4_0" : "int8", r0->df_head_fuse_ ? " with fused top-16" : "");
         ck(cudaSetDevice(1), "tp2 setDevice 1");
     }
 #if defined(STRATA_HIP_GFX906)
@@ -1246,7 +1248,7 @@ void Inkling2::start_peer_thread() {
                 } else if (cmd == PeerCmd::kDraftHead) {
                     tp2_->broadcast_from_0(1, peer_->df_hx_, n * kWidth, peer_->st_);
                     peer_->df_head_run(peer_->df_hx_);
-                    dflash2::pack_top(peer_->df_hids_, peer_->df_hvals_, n, peer_->df_h8_lo_, peer_->df_hpack_,
+                    dflash2::pack_top(peer_->df_hids_, peer_->df_hvals_, n, peer_->df_head_lo_, peer_->df_hpack_,
                                       cs(peer_->st_));
                     tp2_->gather_from_1(1, nullptr, peer_->df_hpack_, n * 2 * dflash2::kTop, peer_->st_);
                 } else if (cmd == PeerCmd::kKeepSnap) {
@@ -2209,13 +2211,13 @@ void Inkling2::assign_scratch() {
         df_u_ = fbuf(b * kDfFfn);
         df_m_ = fbuf(b * kDfFfn);
         df_fin_ = fbuf(b * kWidth);
-        df_logits_ = fbuf((b - 1) * (size_t) n_vocab_);
+        if (!df_head_fuse_) df_logits_ = fbuf((b - 1) * (size_t) n_vocab_);
         df_selh_ = fbuf((b - 1) * d2::kRank);
         df_vals_ = fbuf((b - 1) * d2::kTop);
         df_ids_ = (int32_t*) fbuf((b - 1) * d2::kTop);
         df_edges_ = fbuf((b - 1) * d2::kTop * d2::kTop);
         df_att_ = fbuf(d2::attend_floats());
-        df_top_ = fbuf(d2::topk_floats((int) b - 1));
+        if (!df_head_fuse_) df_top_ = fbuf(d2::topk_floats((int) b - 1));
         df_ctx_ = fbuf(c * 4 * kWidth);
         df_c_ = fbuf(c * kWidth);
         df_cn_ = fbuf(c * kWidth);
@@ -3172,6 +3174,13 @@ void Inkling2::draft_step(int32_t token, int i) {
 }
 
 // ---- DFlash2 ----------------------------------------------------------------------------------------------------
+namespace {
+const TensorInfo* df_enc_norm(const Shards& g) {
+    if (const auto* t = g.find("enc.output_norm.weight")) return t;
+    return g.find("enc_output_norm.weight");
+}
+}  // namespace
+
 void Inkling2::df_shape(const Shards& g) {
     namespace d2 = dflash2;
     const std::string file = opt_.draft_model;
@@ -3199,7 +3208,9 @@ void Inkling2::df_shape(const Shards& g) {
     is("selector_rank", d2::kRank);
     is("conv_kernel_size", 2);
     is("conv_group_size", 16);
-    is("mask_token_id", kDfMask);
+    const MetaValue* mask_v = meta_in(g, "mask_token_id");
+    if (!mask_v) mask_v = g.get("tokenizer.ggml.mask_token_id");
+    need(mask_v && mask_v->u == kDfMask, "dflash.mask_token_id / tokenizer.ggml.mask_token_id");
     need(must("selector_softcap_after_correction").u != 0, "its softcap is not after the correction");
     if (const MetaValue* ca = meta_in(g, "attention.causal")) need(ca->u == 0, "it is causal");
     const MetaValue& taps = must("target_visits");
@@ -3212,11 +3223,14 @@ void Inkling2::df_shape(const Shards& g) {
     df_theta_ = std::pow((float) must("rope.freq_base").f, -2.f / kHead);
     need(std::isfinite(df_eps_) && df_eps_ > 0.f && std::isfinite(df_cap_) && df_cap_ > 0.f && df_theta_ > 0.f,
          "its epsilon, logit cap or rope base");
+    const TensorInfo* enc = df_enc_norm(g);
+    need(enc && !enc->shape.empty() && enc->shape[0] == kWidth && enc->elements() == kWidth,
+         "missing or invalid enc.output_norm.weight / enc_output_norm.weight");
     for (const char* name : {"selector_predecessor.weight", "selector_successor.weight"}) {
         const TensorInfo* t = g.find(name);
-        need(t && t->type == GGML_TYPE_F16 && t->shape.size() == 2 && t->shape[0] == (uint64_t) d2::kRank &&
-                 t->shape[1] == (uint64_t) kDfVocab,
-             std::string(name) + " is not F16 [256, 200058]");
+        need(t && (t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q4_0) &&
+                 t->shape.size() == 2 && t->shape[0] == d2::kRank && t->shape[1] == kDfVocab,
+             std::string(name) + " is not F16, Q8_0 or Q4_0 [256, 200058]");
     }
     df2_ = true;
 }
@@ -3249,119 +3263,151 @@ void Inkling2::df_load() {
         L.fproj = up(name("ffn_conv_proj.weight"), kWidth, d2::kDyn, kAnyMat);
     }
     df_fc_ = up("fc.weight", 4 * kWidth, kWidth, kAnyMat);
-    df_hnorm_ = up("enc.output_norm.weight", kWidth, 1, kF32);
+    const TensorInfo* enc = df_enc_norm(g);
+    df_hnorm_ = upload(enc, enc->name, kWidth, 1, kF32);
     df_onorm_ = up("output_norm.weight", kWidth, 1, kF32);
     df_selw_ = up("selector_hidden.weight", kWidth, d2::kRank, kAnyMat);
     // Engine::load() runs this twice: the first pass only sizes the dense arena (dense_ not yet allocated).  The
     // drafter's own buffers below are allocated once, in the second.
     if (!dense_) return;
     const auto book = [&](const char* name) {
-        const TensorInfo* t = g.find(name);
-        g.payload(*t);
-        const size_t bytes = (size_t) kDfVocab * d2::kRank * sizeof(__half);
-        auto* d = (__half*) dmalloc(bytes, "DFlash2 selector codebook");
-        ck(cudaMemcpy(d, g.data(*t), bytes, cudaMemcpyHostToDevice), "DFlash2 selector codebook");
-        return d;
+        const TensorInfo& t = *g.find(name);   // validated by df_shape()
+        const size_t bytes = g.payload(t);
+        void* d = dmalloc(bytes, "DFlash2 selector codebook");
+        ck(cudaMemcpy(d, g.data(t), bytes, cudaMemcpyHostToDevice), "DFlash2 selector codebook");
+        const auto kind = t.type == GGML_TYPE_F16 ? d2::BookKind::kF16 :
+                          t.type == GGML_TYPE_Q8_0 ? d2::BookKind::kQ8 : d2::BookKind::kQ4;
+        return d2::Book{d, kind};
     };
     df_pred_ = book("selector_predecessor.weight");
     df_succ_ = book("selector_successor.weight");
     const auto on = [](const char* k) { const char* v = std::getenv(k); return v && v[0] == '1' && !v[1]; };
-    df_gemv8_ = on("STRATA_DFLASH2_GEMV8");
+    const bool mixed = on("STRATA_DFLASH2_MIXED");
+    df_planar_ = mixed || on("STRATA_DFLASH2_GEMV8");
+    df_kept_opt_ = on("STRATA_DFLASH2_KEPT_OPT");
+    df_q4_f32_ = on("STRATA_DFLASH2_Q4_F32");
     df_attend3_ = on("STRATA_DFLASH2_ATTEND3");
-    if (df_gemv8_) {
-        for (int l = 0; l < kDfLayers; ++l) {
-            DfLayer& L = df_[(size_t) l];
-            const auto name = [&](const char* n) { return "blk." + std::to_string(l) + "." + n; };
-            L.o8 = df_pack(name("attn_output.weight"), d2::kQuery, kWidth);
-            L.down8 = df_pack(name("ffn_down.weight"), kDfFfn, kWidth);
-            L.aproj8 = df_pack(name("attn_conv_proj.weight"), kWidth, d2::kDyn);
-            L.fproj8 = df_pack(name("ffn_conv_proj.weight"), kWidth, d2::kDyn);
-            L.qkv8 = df_pack_rows({name("attn_q.weight"), name("attn_k.weight"), name("attn_v.weight")}, kWidth,
-                                  {d2::kQuery, d2::kKey, d2::kKey});
-            L.gu8 = df_pack_rows({name("ffn_gate.weight"), name("ffn_up.weight")}, kWidth, {kDfFfn, kDfFfn});
+    bool need_xsum = false;
+    if (df_planar_ || df_kept_opt_) {
+        for (auto& L : df_) {
+            L.qkv = df_pack_rows({L.q, L.k, L.v});
+            need_xsum |= L.qkv.q4();
+            if (!df_planar_) continue;
+            L.gu = df_pack_rows({L.gate, L.up});
+            L.wo = df_pack_rows({L.o});
+            L.wdown = df_pack_rows({L.down});
+            L.waproj = df_pack_rows({L.aproj});
+            L.wfproj = df_pack_rows({L.fproj});
+            need_xsum |= L.gu.q4() || L.wo.q4() || L.wdown.q4() || L.waproj.q4() || L.wfproj.q4();
         }
-        df_sel8_ = df_pack("selector_hidden.weight", kWidth, d2::kRank);
-        std::fputs("strata-poly: STRATA_DFLASH2_GEMV8=1: the DFlash2 block's products from repacked int8 rows\n", stderr);
+        if (df_planar_) {
+            df_sel_ = df_pack_rows({df_selw_});
+            need_xsum |= df_sel_.q4();
+        }
+        ck(cudaStreamSynchronize(cs(st_)), "DFlash2 planar pack");
     }
-    df_head8_ = df_gemv8_ && tp_size_ == 2 && on("STRATA_DFLASH2_HEAD8");   // open_tp2() loads it, both ranks loaded
+    if (need_xsum)
+        df_xsum_ = (int32_t*) dmalloc(d2::kBlock * 4 * kWidth / 32 * sizeof(int32_t), "DFlash2 activation sums");
+    df_head_q4_ = tp_size_ == 2 && on("STRATA_DFLASH2_HEAD_Q4");
+    df_head_fuse_ = tp_size_ == 2 && on("STRATA_DFLASH2_HEAD_FUSE");
+    df_private_head_ = tp_size_ == 2 && (on("STRATA_DFLASH2_HEAD8") || df_head_q4_ || df_head_fuse_);
 }
 
-dflash2::Mat8 Inkling2::df_pack(const std::string& name, int n_in, int n_out) {
-    return df_pack_rows({name}, n_in, {n_out});
-}
-
-// Q8_0 matrices of the drafter file, one after another, as one repacked matrix (Mat8): rows of int8 codes, a float
-// scale a 32-value block.  Through a temporary card copy of each ggml matrix.
-dflash2::Mat8 Inkling2::df_pack_rows(const std::vector<std::string>& names, int n_in, const std::vector<int>& n_out) {
-    const Shards& g = *dg_;
-    int total = 0;
-    for (int n : n_out) total += n;
-    auto* q = (int8_t*) dmalloc((size_t) total * n_in, "DFlash2 int8 rows");
-    auto* d = (float*) dmalloc((size_t) total * (n_in / 32) * sizeof(float), "DFlash2 row scales");
-    int at = 0;
-    for (size_t i = 0; i < names.size(); ++i) {
-        const TensorInfo* t = g.find(names[i]);
-        if (!t || t->type != GGML_TYPE_Q8_0 || t->elements() != (uint64_t) n_in * n_out[i])
-            throw std::runtime_error(opt_.draft_model + ": " + names[i] + " is not the expected Q8_0 matrix");
-        g.payload(*t);
-        const size_t bytes = (size_t) n_out[i] * (n_in / 32) * 34;
-        void* tmp = nullptr;
-        ck(cudaMalloc(&tmp, bytes), "DFlash2 pack");
-        ck(cudaMemcpy(tmp, g.data(*t), bytes, cudaMemcpyHostToDevice), "DFlash2 pack");
-        dflash2::pack_q8_0(tmp, n_in, n_out[i], q + (size_t) at * n_in, d + (size_t) at * (n_in / 32), nullptr);
-        ck(cudaDeviceSynchronize(), "DFlash2 pack");
-        ck(cudaFree(tmp), "DFlash2 pack");
-        at += n_out[i];
+// Homogeneous groups pack from the resident GGML matrices. Mixed/other types retain their ordinary lin() path.
+dflash2::Mat Inkling2::df_pack_rows(std::initializer_list<Dev> weights) {
+    namespace d2 = dflash2;
+    const auto& first = *weights.begin();
+    const bool q4 = first.type == GGML_TYPE_Q4_0;
+    if (!q4 && first.type != GGML_TYPE_Q8_0) return {};
+    int n_out = 0;
+    for (const Dev& w : weights) {
+        if (w.type != first.type || w.n_in != first.n_in) return {};
+        n_out += w.n_out;
     }
-    return {q, d, n_in, total};
+    const int n_in = first.n_in;
+    const size_t blocks = (size_t) n_out * (n_in / 32);
+    d2::Mat mat{nullptr, nullptr, n_in, n_out, q4 ? d2::MatKind::kQ4 : d2::MatKind::kQ8, !q4 || df_q4_f32_};
+    auto* q = (uint8_t*) dmalloc(blocks * mat.code_bytes(), "DFlash2 planar codes");
+    auto* d = (uint8_t*) dmalloc(blocks * mat.scale_bytes(), "DFlash2 planar scales");
+    mat.q = q;
+    mat.d = d;
+    size_t at = 0;
+    for (const Dev& w : weights) {
+        if (q4)
+            d2::pack_q4_0(w.p, n_in, w.n_out, q + at * mat.code_bytes(), d + at * mat.scale_bytes(),
+                           mat.scale_f32, cs(st_));
+        else
+            d2::pack_q8_0(w.p, n_in, w.n_out, q + at * mat.code_bytes(), reinterpret_cast<float*>(d) + at, cs(st_));
+        at += (size_t) w.n_out * (n_in / 32);
+    }
+    return mat;
 }
 
-void Inkling2::df_lin(const Dev& w, const dflash2::Mat8& w8, const float* x, float* y, int rows) {
-    if (!df_gemv8_ || !w8.q || rows > 8) return lin(w, x, y, rows);
-    dflash2::quantize(x, w8.n_in, rows, df_xq_, df_xd_, cs(st_));
-    dflash2::gemv8(w8, df_xq_, df_xd_, y, rows, cs(st_));
+void Inkling2::df_lin(const Dev& w, const dflash2::Mat& packed, const float* x, float* y, int rows) {
+    if (!packed || rows > dflash2::kBlock) return lin(w, x, y, rows);
+    dflash2::quantize(x, packed.n_in, rows, df_xq_, df_xd_, packed.q4() ? df_xsum_ : nullptr, cs(st_));
+    dflash2::gemv(packed, df_xq_, df_xd_, df_xsum_, y, rows, cs(st_));
 }
 
-// The target's head rows [lo, lo + n) (Q6_K) as the drafter's own int8 rows: dequantized and requantized a 32-value
-// block at a time on the host (amax / 127), on this object's card.  Drafter numerics only: guesses, not outputs.
+// Requantize this rank's target head rows on the host, one row at a time. These weights affect guesses only.
 void Inkling2::df_head_load(int lo, int n) {
     namespace d2 = dflash2;
     const TensorInfo* t = gg_->find("output.weight");
-    if (!t) throw std::runtime_error("STRATA_DFLASH2_HEAD8: the target has no output.weight");
+    if (!t) throw std::runtime_error("DFlash2 private head: the target has no output.weight");
     const size_t rb = ggml_row_size((ggml_type) t->type, kWidth);
     gg_->payload(*t);
     const uint8_t* src = gg_->data(*t) + (size_t) lo * rb;
-    std::vector<int8_t> q((size_t) n * kWidth);
-    std::vector<float> d((size_t) n * (kWidth / 32));
+    d2::Mat mat{nullptr, nullptr, kWidth, n, df_head_q4_ ? d2::MatKind::kQ4 : d2::MatKind::kQ8, !df_head_q4_};
+    constexpr int blocks_per_row = kWidth / 32;
+    const size_t blocks = (size_t) n * blocks_per_row;
+    std::vector<uint8_t> q(blocks * mat.code_bytes()), d(blocks * mat.scale_bytes());
     const auto* traits = ggml_get_type_traits((ggml_type) t->type);
-    if (!traits || !traits->to_float) throw std::runtime_error("STRATA_DFLASH2_HEAD8: no dequantizer for the head");
+    if (!traits || !traits->to_float) throw std::runtime_error("DFlash2 private head: no dequantizer for the head");
+    const auto q4_ref = ggml_get_type_traits(GGML_TYPE_Q4_0)->from_float_ref;
     const int workers = 8;
     std::vector<std::thread> pool;
     for (int w = 0; w < workers; ++w)
         pool.emplace_back([&, w] {
             std::vector<float> row(kWidth);
+            std::array<uint16_t, blocks_per_row * 9> q4_row;   // aligned GGML Q4_0 blocks: scale then 16 code bytes
             for (int r = w; r < n; r += workers) {
                 traits->to_float(src + (size_t) r * rb, row.data(), kWidth);
-                for (int b = 0; b < kWidth / 32; ++b) {
-                    float a = 0.f;
-                    for (int i = 0; i < 32; ++i) a = std::max(a, std::fabs(row[b * 32 + i]));
-                    const float s = a / 127.f;
-                    d[(size_t) r * (kWidth / 32) + b] = s;
-                    for (int i = 0; i < 32; ++i)
-                        q[(size_t) r * kWidth + b * 32 + i] = (int8_t) (s > 0.f ? std::lrint(row[b * 32 + i] / s) : 0);
+                if (mat.q4()) {
+                    q4_ref(row.data(), q4_row.data(), kWidth);
+                    const auto* bytes = reinterpret_cast<const uint8_t*>(q4_row.data());
+                    for (int b = 0; b < blocks_per_row; ++b) {
+                        const size_t at = (size_t) r * blocks_per_row + b;
+                        std::memcpy(q.data() + at * 16, bytes + b * 18 + 2, 16);
+                        std::memcpy(d.data() + at * 2, bytes + b * 18, 2);
+                    }
+                } else {
+                    for (int b = 0; b < blocks_per_row; ++b) {
+                        float a = 0.f;
+                        for (int i = 0; i < 32; ++i) a = std::max(a, std::fabs(row[b * 32 + i]));
+                        const float s = a / 127.f;
+                        std::memcpy(d.data() + ((size_t) r * blocks_per_row + b) * sizeof(float), &s, sizeof(float));
+                        for (int i = 0; i < 32; ++i)
+                            q[(size_t) r * kWidth + b * 32 + i] =
+                                (int8_t) (s > 0.f ? std::lrint(row[b * 32 + i] / s) : 0);
+                    }
                 }
             }
         });
     for (auto& th : pool) th.join();
-    auto* dq = (int8_t*) dmalloc(q.size(), "DFlash2 int8 head");
-    auto* dd = (float*) dmalloc(d.size() * sizeof(float), "DFlash2 int8 head scales");
-    ck(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice), "DFlash2 int8 head");
-    ck(cudaMemcpy(dd, d.data(), d.size() * sizeof(float), cudaMemcpyHostToDevice), "DFlash2 int8 head");
-    df_h8_ = {dq, dd, kWidth, n};
-    df_h8_lo_ = lo;
+    auto* dq = (uint8_t*) dmalloc(q.size(), "DFlash2 private head codes");
+    void* dd = dmalloc(d.size(), "DFlash2 private head scales");
+    ck(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice), "DFlash2 private head codes");
+    ck(cudaMemcpy(dd, d.data(), d.size(), cudaMemcpyHostToDevice), "DFlash2 private head scales");
+    mat.q = dq;
+    mat.d = dd;
+    df_head_ = mat;
+    df_head_lo_ = lo;
     const auto f = [&](size_t count, const char* what) { return (float*) dmalloc(count * sizeof(float), what); };
-    df_hlog_ = f((size_t) d2::kGuess * n, "DFlash2 head logits");
-    df_htop_ = f(d2::topk_floats(d2::kGuess), "DFlash2 head top");
+    if (df_head_fuse_) df_head_parts_ = dmalloc(d2::head_top_bytes(n), "DFlash2 fused head top");
+    else {
+        df_hlog_ = f((size_t) d2::kGuess * n, "DFlash2 head logits");
+        df_htop_ = f(d2::topk_floats(d2::kGuess), "DFlash2 head top");
+    }
     df_hids_ = (int32_t*) f(d2::kGuess * d2::kTop, "DFlash2 head ids");
     df_hvals_ = f(d2::kGuess * d2::kTop, "DFlash2 head values");
     df_hids1_ = (int32_t*) f(d2::kGuess * d2::kTop, "DFlash2 head ids");
@@ -3370,13 +3416,19 @@ void Inkling2::df_head_load(int lo, int n) {
     df_hx_ = f(d2::kGuess * kWidth, "DFlash2 head rows");
     df_hxq_ = (int8_t*) f(d2::kGuess * kWidth / 4, "DFlash2 head codes");
     df_hxd_ = f(d2::kGuess * kWidth / 32, "DFlash2 head scales");
+    if (df_head_q4_ || df_sel_.q4())
+        df_hxsum_ = (int32_t*) dmalloc(d2::kGuess * kWidth / 32 * sizeof(int32_t), "DFlash2 head activation sums");
 }
 
 void Inkling2::df_head_run(const float* h) {
     namespace d2 = dflash2;
-    d2::quantize(h, kWidth, d2::kGuess, df_hxq_, df_hxd_, cs(st_));
-    d2::gemv8(df_h8_, df_hxq_, df_hxd_, df_hlog_, d2::kGuess, cs(st_));
-    d2::topk(df_hlog_, d2::kGuess, df_h8_.n_out, df_h8_.n_out, df_htop_, df_hids_, df_hvals_, cs(st_));
+    d2::quantize(h, kWidth, d2::kGuess, df_hxq_, df_hxd_, df_hxsum_, cs(st_));
+    if (df_head_fuse_) {
+        d2::head_top(df_head_, df_hxq_, df_hxd_, df_hxsum_, df_head_parts_, df_hids_, df_hvals_, cs(st_));
+    } else {
+        d2::gemv(df_head_, df_hxq_, df_hxd_, df_hxsum_, df_hlog_, d2::kGuess, cs(st_));
+        d2::topk(df_hlog_, d2::kGuess, df_head_.n_out, df_head_.n_out, df_htop_, df_hids_, df_hvals_, cs(st_));
+    }
 }
 
 // The kept rows' context: [tap 5, tap 23, tap 41, final norm] -> fc -> hidden_norm, and each layer's K (k_norm, RoPE at
@@ -3396,10 +3448,22 @@ void Inkling2::df_kept(int n) {
         d2::gather_taps(taps, done, m, df_ctx_, cs(st_));
         lin(df_fc_, df_ctx_, df_c_, m);
         rms_norm(df_c_, fp(df_hnorm_), df_cn_, kWidth, m, df_eps_, st_);
+        // Use the same planar activation format as the draft block (not lin()'s half-scale Q8_1).
+        const bool planar = df_kept_opt_ && m <= d2::kBlock;
+        bool quantized = false;
         for (int l = 0; l < kDfLayers; ++l) {
             const DfLayer& L = df_[(size_t) l];
-            lin(L.k, df_cn_, df_ck_, m);
-            lin(L.v, df_cn_, df_cv_, m);
+            if (planar && L.qkv) {
+                if (!quantized) {
+                    d2::quantize(df_cn_, kWidth, m, df_xq_, df_xd_, df_xsum_, cs(st_));
+                    quantized = true;
+                }
+                const auto kv = L.qkv.slice(d2::kQuery, 2 * d2::kKey);
+                d2::gemv_split(kv, df_xq_, df_xd_, df_xsum_, df_ck_, d2::kKey, df_cv_, d2::kKey, nullptr, 0, m, cs(st_));
+            } else {
+                lin(L.k, df_cn_, df_ck_, m);
+                lin(L.v, df_cn_, df_cv_, m);
+            }
             head_norm_rope(df_ck_, kHead, fp(L.k_norm), df_ckr_, kHead, d2::kKv, kHead, df_theta_, pos_ + done, m,
                            df_eps_, st_);
             d2::store(df_ckr_, df_cv_, df_kc_ + l * ring, df_vc_ + l * ring, pos_ + done, m, cs(st_));
@@ -3425,18 +3489,21 @@ void Inkling2::drafter_guesses(int32_t token) {
     constexpr int b = d2::kBlock;
     for (int l = 0; l < kDfLayers; ++l) {
         const DfLayer& L = df_[(size_t) l];
-        if (df_fast_ && df_gemv8_) {
-            d2::rms_norm_quantize(df_x_, fp(L.attn_norm), df_h_, df_xq_, df_xd_, kWidth, b, df_eps_, cs(st_));
-            d2::gemv8(L.aproj8, df_xq_, df_xd_, df_dyn_, b, cs(st_));
-            d2::conv_quantize(df_h_, df_dyn_, fp(L.abase), 0, b, df_xq_, df_xd_, cs(st_));
-            d2::gemv8_split(L.qkv8, df_xq_, df_xd_, df_q_, d2::kQuery, df_k_, d2::kKey, df_v_, d2::kKey, b, cs(st_));
+        if (df_fast_ && df_planar_ && L.waproj && L.qkv) {
+            d2::rms_norm_quantize(df_x_, fp(L.attn_norm), df_h_, df_xq_, df_xd_, L.waproj.q4() ? df_xsum_ : nullptr,
+                                  kWidth, b, df_eps_, cs(st_));
+            d2::gemv(L.waproj, df_xq_, df_xd_, df_xsum_, df_dyn_, b, cs(st_));
+            d2::conv_quantize(df_h_, df_dyn_, fp(L.abase), 0, b, df_xq_, df_xd_, L.qkv.q4() ? df_xsum_ : nullptr, cs(st_));
+            d2::gemv_split(L.qkv, df_xq_, df_xd_, df_xsum_, df_q_, d2::kQuery, df_k_, d2::kKey, df_v_, d2::kKey,
+                           b, cs(st_));
         } else {
             rms_norm(df_x_, fp(L.attn_norm), df_h_, kWidth, b, df_eps_, st_);
-            df_lin(L.aproj, L.aproj8, df_h_, df_dyn_, b);
+            df_lin(L.aproj, L.waproj, df_h_, df_dyn_, b);
             d2::conv(df_h_, df_dyn_, fp(L.abase), 0, df_hp_, b, false, cs(st_));
-            if (df_gemv8_) {   // one launch for q, k and v
-                d2::quantize(df_hp_, kWidth, b, df_xq_, df_xd_, cs(st_));
-                d2::gemv8_split(L.qkv8, df_xq_, df_xd_, df_q_, d2::kQuery, df_k_, d2::kKey, df_v_, d2::kKey, b, cs(st_));
+            if (df_planar_ && L.qkv) {   // one launch for q, k and v
+                d2::quantize(df_hp_, kWidth, b, df_xq_, df_xd_, L.qkv.q4() ? df_xsum_ : nullptr, cs(st_));
+                d2::gemv_split(L.qkv, df_xq_, df_xd_, df_xsum_, df_q_, d2::kQuery, df_k_, d2::kKey, df_v_, d2::kKey,
+                               b, cs(st_));
             } else {
                 lin(L.q, df_hp_, df_q_, b);
                 lin(L.k, df_hp_, df_k_, b);
@@ -3447,39 +3514,42 @@ void Inkling2::drafter_guesses(int32_t token) {
         head_norm_rope(df_k_, kHead, fp(L.k_norm), df_kr_, kHead, d2::kKv, kHead, df_theta_, a, b, df_eps_, st_);
         (df_attend3_ ? d2::attend3 : d2::attend)(
             df_qr_, df_kr_, df_v_, df_kc_ + l * ring, df_vc_ + l * ring, lo, a, df_att_, df_ao_, cs(st_));
-        df_lin(L.o, L.o8, df_ao_, df_o_, b);
+        df_lin(L.o, L.wo, df_ao_, df_o_, b);
         d2::conv(df_o_, df_dyn_, fp(L.abase), 1, df_x_, b, true, cs(st_));
-        if (df_fast_ && df_gemv8_) {
-            d2::rms_norm_quantize(df_x_, fp(L.ffn_norm), df_h_, df_xq_, df_xd_, kWidth, b, df_eps_, cs(st_));
-            d2::gemv8(L.fproj8, df_xq_, df_xd_, df_dyn_, b, cs(st_));
-            d2::conv_quantize(df_h_, df_dyn_, fp(L.fbase), 0, b, df_xq_, df_xd_, cs(st_));
-            d2::gemv8_split(L.gu8, df_xq_, df_xd_, df_g_, kDfFfn, df_u_, kDfFfn, nullptr, 0, b, cs(st_));
-            d2::swiglu_quantize(df_g_, df_u_, kDfFfn, b, df_xq_, df_xd_, cs(st_));
-            d2::gemv8(L.down8, df_xq_, df_xd_, df_o_, b, cs(st_));
+        if (df_fast_ && df_planar_ && L.wfproj && L.gu && L.wdown) {
+            d2::rms_norm_quantize(df_x_, fp(L.ffn_norm), df_h_, df_xq_, df_xd_, L.wfproj.q4() ? df_xsum_ : nullptr,
+                                  kWidth, b, df_eps_, cs(st_));
+            d2::gemv(L.wfproj, df_xq_, df_xd_, df_xsum_, df_dyn_, b, cs(st_));
+            d2::conv_quantize(df_h_, df_dyn_, fp(L.fbase), 0, b, df_xq_, df_xd_, L.gu.q4() ? df_xsum_ : nullptr, cs(st_));
+            d2::gemv_split(L.gu, df_xq_, df_xd_, df_xsum_, df_g_, kDfFfn, df_u_, kDfFfn, nullptr, 0, b, cs(st_));
+            d2::swiglu_quantize(df_g_, df_u_, kDfFfn, b, df_xq_, df_xd_, L.wdown.q4() ? df_xsum_ : nullptr, cs(st_));
+            d2::gemv(L.wdown, df_xq_, df_xd_, df_xsum_, df_o_, b, cs(st_));
         } else {
             rms_norm(df_x_, fp(L.ffn_norm), df_h_, kWidth, b, df_eps_, st_);
-            df_lin(L.fproj, L.fproj8, df_h_, df_dyn_, b);
+            df_lin(L.fproj, L.wfproj, df_h_, df_dyn_, b);
             d2::conv(df_h_, df_dyn_, fp(L.fbase), 0, df_hp_, b, false, cs(st_));
-            if (df_gemv8_) {
-                d2::quantize(df_hp_, kWidth, b, df_xq_, df_xd_, cs(st_));
-                d2::gemv8_split(L.gu8, df_xq_, df_xd_, df_g_, kDfFfn, df_u_, kDfFfn, nullptr, 0, b, cs(st_));
+            if (df_planar_ && L.gu) {
+                d2::quantize(df_hp_, kWidth, b, df_xq_, df_xd_, L.gu.q4() ? df_xsum_ : nullptr, cs(st_));
+                d2::gemv_split(L.gu, df_xq_, df_xd_, df_xsum_, df_g_, kDfFfn, df_u_, kDfFfn, nullptr, 0, b, cs(st_));
             } else {
                 lin(L.gate, df_hp_, df_g_, b);
                 lin(L.up, df_hp_, df_u_, b);
             }
             swiglu_clamp(df_g_, df_u_, df_m_, b * kDfFfn, INFINITY, st_);
-            df_lin(L.down, L.down8, df_m_, df_o_, b);
+            df_lin(L.down, L.wdown, df_m_, df_o_, b);
         }
         d2::conv(df_o_, df_dyn_, fp(L.fbase), 1, df_x_, b, true, cs(st_));
     }
     rms_norm(df_x_, fp(df_onorm_), df_fin_, kWidth, b, df_eps_, st_);
     const int guesses = std::min(d2::kGuess, opt_.window - 1);
-    if (df_head8_) {   // both owners' int8 halves of the head at once; rank 1 returns its top 16 only
+    const bool reuse_selector_quant = df_fast_ && df_private_head_ && df_sel_;
+    if (df_private_head_) {   // both owners' private halves run at once; rank 1 returns its top 16 only
         peer_dispatch(PeerCmd::kDraftHead, d2::kGuess);
         try {
             tp2_->broadcast_from_0(0, df_fin_ + kWidth, d2::kGuess * kWidth, st_);
             df_head_run(df_fin_ + kWidth);
-            if (df_fast_ && df_sel8_.q) d2::gemv8(df_sel8_, df_hxq_, df_hxd_, df_selh_, d2::kGuess, cs(st_));
+            if (reuse_selector_quant)
+                d2::gemv(df_sel_, df_hxq_, df_hxd_, df_hxsum_, df_selh_, d2::kGuess, cs(st_));
             tp2_->gather_from_1(0, df_hpack_, nullptr, d2::kGuess * 2 * d2::kTop, st_);
             d2::unpack_top(df_hpack_, d2::kGuess, df_hids1_, df_hvals1_, cs(st_));
             d2::merge2(df_hids_, df_hvals_, df_hids1_, df_hvals1_, d2::kGuess, df_ids_, df_vals_, cs(st_));
@@ -3493,8 +3563,8 @@ void Inkling2::drafter_guesses(int32_t token) {
         project_logits(df_fin_ + kWidth, df_logits_, d2::kGuess);
         d2::topk(df_logits_, d2::kGuess, n_vocab_, kDfVocab, df_top_, df_ids_, df_vals_, cs(st_));
     }
-    if (!df_fast_ || !df_head8_ || !df_sel8_.q)
-        df_lin(df_selw_, df_sel8_, df_fin_ + kWidth, df_selh_, d2::kGuess);
+    if (!reuse_selector_quant)
+        df_lin(df_selw_, df_sel_, df_fin_ + kWidth, df_selh_, d2::kGuess);
     static_assert(sizeof(d2::Guess) == sizeof(Likeliest));
     d2::select(df_ids_, df_vals_, df_selh_, df_pred_, df_succ_, token, df_cap_, df_edges_,
                reinterpret_cast<d2::Guess*>(h_block_), cs(st_));

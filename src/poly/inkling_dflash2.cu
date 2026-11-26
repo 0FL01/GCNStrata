@@ -235,9 +235,19 @@ __global__ void __launch_bounds__(256) topk_merge_kernel(const float* __restrict
 }
 
 // ---- selector: edges a position, then the walk ----
+__device__ __forceinline__ float book_at(Book book, size_t i) {
+    if (book.kind == BookKind::kF16) return __half2float(static_cast<const __half*>(book.data)[i]);
+    const int lane = i % 32;
+    const bool q4 = book.kind == BookKind::kQ4;
+    const auto* blk = static_cast<const uint8_t*>(book.data) + i / 32 * (q4 ? 18 : 34);
+    const float d = __half2float(*reinterpret_cast<const __half*>(blk));
+    const int q = q4 ? ((blk[2 + lane % 16] >> (lane / 16 * 4)) & 15) - 8 : (int8_t) blk[2 + lane];
+    return d * q;
+}
+
+template <bool HalfBooks>
 __global__ void __launch_bounds__(256) edges_kernel(const int32_t* __restrict__ ids, const float* __restrict__ vals,
-                                                     const float* __restrict__ h, const __half* __restrict__ pred,
-                                                     const __half* __restrict__ succ, int32_t anchor, float cap,
+                                                     const float* __restrict__ h, Book pred, Book succ, int32_t anchor, float cap,
                                                      float* edges) {
     __shared__ float ps[kTop][kRank + 1];
     __shared__ float qs[kTop][kRank + 1];
@@ -248,9 +258,12 @@ __global__ void __launch_bounds__(256) edges_kernel(const int32_t* __restrict__ 
         const int a = i / kRank, r = i % kRank;
         if (a < n_pred) {
             const int32_t tok = t == 0 ? anchor : ids[(t - 1) * kTop + a];
-            ps[a][r] = __half2float(pred[(size_t) tok * kRank + r]) * ht[r];
+            const size_t i = (size_t) tok * kRank + r;
+            const float p = HalfBooks ? __half2float(static_cast<const __half*>(pred.data)[i]) : book_at(pred, i);
+            ps[a][r] = p * ht[r];
         }
-        qs[a][r] = __half2float(succ[(size_t) ids[t * kTop + a] * kRank + r]);
+        const size_t at = (size_t) ids[t * kTop + a] * kRank + r;
+        qs[a][r] = HalfBooks ? __half2float(static_cast<const __half*>(succ.data)[at]) : book_at(succ, at);
     }
     __syncthreads();
     const int a = tid / kTop, b = tid % kTop;
@@ -278,24 +291,50 @@ __global__ void walk_kernel(const int32_t* __restrict__ ids, const float* __rest
 
 
 // ---- the drafter's dense products: aligned int8 codes, 16 lanes a row, 8 activation rows from LDS ----
-__global__ void pack_kernel(const uint8_t* __restrict__ src, int blocks, int8_t* q, float* d, size_t total) {
+__global__ void pack_kernel(const uint8_t* __restrict__ src, uint8_t* q, float* d, size_t total) {
     const size_t b = (size_t) blockIdx.x * 8 + threadIdx.x / 32;   // a block of 32 values a 32-thread group
     if (b >= total) return;
     const int j = threadIdx.x % 32;
     const uint8_t* blk = src + b * 34;
-    q[b * 32 + j] = (int8_t) blk[2 + j];
+    q[b * 32 + j] = blk[2 + j];
     if (j == 0) d[b] = __half2float(*reinterpret_cast<const __half*>(blk));
 }
-__global__ void quantize_kernel(const float* __restrict__ x, int n_in, int8_t* q, float* d) {
-    // a 32-value block a 32-lane group: d = amax / 127, q = round(x / d)
-    const int r = blockIdx.y, b = blockIdx.x * 8 + threadIdx.x / 32, j = threadIdx.x % 32;
-    if (b * 32 >= n_in) return;
-    const float v = x[(size_t) r * n_in + b * 32 + j];
+template <typename Scale>
+__global__ void pack4_kernel(const uint8_t* __restrict__ src, uint8_t* q, Scale* d, size_t total) {
+    const size_t b = (size_t) blockIdx.x * 16 + threadIdx.x / 16;
+    if (b >= total) return;
+    const int j = threadIdx.x % 16;
+    const uint8_t* blk = src + b * 18;
+    q[b * 16 + j] = blk[2 + j];
+    if (j == 0) {
+        const __half scale = *reinterpret_cast<const __half*>(blk);
+        if constexpr (sizeof(Scale) == 2) d[b] = scale;
+        else d[b] = __half2float(scale);
+    }
+}
+
+template <bool Sum>
+__device__ __forceinline__ void quant_block(float v, int lane, int8_t* q, float* d, int32_t* xsum, size_t b) {
     float a = fabsf(v);
     for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
     const float s = a / 127.f;
-    q[(size_t) r * n_in + b * 32 + j] = (int8_t) (s > 0.f ? __float2int_rn(v / s) : 0);
-    if (j == 0) d[(size_t) r * (n_in / 32) + b] = s;
+    const auto code = (int8_t) (s > 0.f ? __float2int_rn(v / s) : 0);
+    *q = code;
+    if (lane == 0) d[b] = s;
+    if constexpr (Sum) {
+        int sum = code;
+        for (int o = 16; o > 0; o >>= 1) sum += __shfl_xor(sum, o, 32);
+        if (lane == 0) xsum[b] = sum;
+    }
+}
+
+template <bool Sum>
+__global__ void quantize_kernel(const float* __restrict__ x, int n_in, int8_t* q, float* d, int32_t* xsum) {
+    // a 32-value block a 32-lane group: d = amax / 127, q = round(x / d)
+    const int r = blockIdx.y, b = blockIdx.x * 8 + threadIdx.x / 32, j = threadIdx.x % 32;
+    if (b * 32 >= n_in) return;
+    const size_t at = (size_t) r * n_in + b * 32 + j;
+    quant_block<Sum>(x[at], j, q + at, d, xsum, (size_t) r * (n_in / 32) + b);
 }
 struct Outs {
     float* y[3];
@@ -441,9 +480,186 @@ __global__ void __launch_bounds__(256) gemv8_l8_r2_kernel(const int8_t* __restri
     }
 }
 
+// GGML split-half nibbles: byte j holds w[j] and w[16+j], each biased by 8.
+// Code plane: one aligned int4/block. Separate d plane: FP32 (20 B/block total)
+// or FP16 (18 B/block, no padding). Activation codes stay in V5-R3 order.
+struct Pair { float v; int32_t id; };
+static_assert(sizeof(Pair) == 8);
+constexpr Pair invalid{-INFINITY, INT32_MAX};
+
+// Run the bitonic network on one full wave per position, and keep its first 16.
+// Four waves per CTA produce seven lists in two passes.
+template <int Rows>
+__device__ __forceinline__ void local_top16(const float* stage, Pair* parts, int n) {
+    static_assert(Rows <= 64);
+    const int t = threadIdx.x, wave = t / 64, lane = t % 64;
+    const int out = int(blockIdx.x) * Rows + lane;
+    for (int m = wave; m < kGuess; m += 4) {
+        Pair a = invalid;
+        if (lane < Rows && out < n) {
+            a = {stage[m * Rows + lane], out};
+            if (isnan(a.v)) a.v = -INFINITY;   // keep a valid id even if all scores are NaN
+        }
+#pragma unroll
+        for (int len = 2; len <= Rows; len *= 2) {
+#pragma unroll
+            for (int hop = len / 2; hop > 0; hop /= 2) {
+                const Pair b{__shfl_xor(a.v, hop, 64), __shfl_xor(a.id, hop, 64)};
+                const bool want_better = ((lane & len) == 0) == ((lane & hop) == 0);
+                if (want_better ? better(b.v, b.id, a.v, a.id) : better(a.v, a.id, b.v, b.id)) a = b;
+            }
+        }
+        if (lane < kTop) {
+            // Make rank 0 contiguous across CTAs for the merge; the remaining
+            // 15 are contiguous within a CTA's list. Exactly 16 pairs/CTA/pos.
+            const size_t i = lane == 0 ? blockIdx.x : gridDim.x + size_t(blockIdx.x) * (kTop - 1) + lane - 1;
+            parts[size_t(m) * gridDim.x * kTop + i] = a;
+        }
+    }
+}
+
+template <int M, int L, int R, bool Q4, typename Scale, bool Fused = false>
+__global__ void __launch_bounds__(256) planar_kernel(
+        const int4* __restrict__ wq, const Scale* __restrict__ wd,
+        const int8_t* __restrict__ xq, const float* __restrict__ xd, const int32_t* __restrict__ xsum,
+        Outs out, Pair* __restrict__ parts, int k, int n) {
+    constexpr int rows = (256 / L) * R, kb_tile = kTileK / 32;
+    static_assert(!Fused || (M == kGuess && rows <= 64));
+    static_assert(Q4 || (L == 8 && R == 2));
+    __shared__ int4 xs[M * (kTileK / 16)];
+    __shared__ float xds[M * kb_tile];
+    __shared__ int xcs[Q4 ? M * kb_tile : 1];
+    static_assert(!Fused || rows <= kb_tile);
+    const int t = threadIdx.x, lane = t % L, local = (t / L) * R;
+    const int first = int(blockIdx.x) * rows + local, kb = k / 32;
+    float acc[R][M] = {};
+    for (int k0 = 0; k0 < kb; k0 += kb_tile) {
+        const int blks = min(kb_tile, kb - k0), chunks = 2 * blks;
+        __syncthreads();
+        for (int i = t; i < M * chunks; i += 256) {
+            const int m = i / chunks, c = i % chunks;
+            xs[m * (kTileK / 16) + c] = reinterpret_cast<const int4*>(xq)[size_t(m) * 2 * kb + 2 * k0 + c];
+        }
+        for (int i = t; i < M * blks; i += 256) {
+            const int m = i / blks, b = i % blks;
+            const size_t xi = size_t(m) * kb + k0 + b;
+            xds[m * kb_tile + b] = xd[xi];
+            if constexpr (Q4) xcs[m * kb_tile + b] = -8 * xsum[xi];
+        }
+        __syncthreads();
+        if (first >= n) continue;
+        for (int b = lane; b < blks; b += L) {
+            int4 a0[R], a1[R];
+            float ws[R];
+            constexpr int mask = 0x0f0f0f0f;
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                a0[r] = a1[r] = make_int4(0, 0, 0, 0);
+                ws[r] = 0.f;
+                if (first + r < n) {
+                    const size_t wi = size_t(first + r) * kb + k0 + b;
+                    if constexpr (Q4) {
+                        const int4 a = wq[wi];
+                        a0[r] = make_int4(a.x & mask, a.y & mask, a.z & mask, a.w & mask);
+                        a1[r] = make_int4((a.x >> 4) & mask, (a.y >> 4) & mask, (a.z >> 4) & mask, (a.w >> 4) & mask);
+                    } else {
+                        a0[r] = wq[2 * wi];
+                        a1[r] = wq[2 * wi + 1];
+                    }
+                    if constexpr (sizeof(Scale) == 2) ws[r] = __half2float(wd[wi]);
+                    else ws[r] = wd[wi];
+                }
+            }
+#pragma unroll
+            for (int m = 0; m < M; ++m) {
+                const int4 x0 = xs[m * (kTileK / 16) + 2 * b], x1 = xs[m * (kTileK / 16) + 2 * b + 1];
+                const float xd0 = xds[m * kb_tile + b];
+                const int init = Q4 ? xcs[m * kb_tile + b] : 0;   // -8 * sum(xq) for biased nibbles
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    int dot = __builtin_amdgcn_sdot4(a0[r].x, x0.x, init, false);
+                    dot = __builtin_amdgcn_sdot4(a0[r].y, x0.y, dot, false);
+                    dot = __builtin_amdgcn_sdot4(a0[r].z, x0.z, dot, false);
+                    dot = __builtin_amdgcn_sdot4(a0[r].w, x0.w, dot, false);
+                    dot = __builtin_amdgcn_sdot4(a1[r].x, x1.x, dot, false);
+                    dot = __builtin_amdgcn_sdot4(a1[r].y, x1.y, dot, false);
+                    dot = __builtin_amdgcn_sdot4(a1[r].z, x1.z, dot, false);
+                    dot = __builtin_amdgcn_sdot4(a1[r].w, x1.w, dot, false);
+                    acc[r][m] += float(dot) * (ws[r] * xd0);
+                }
+            }
+        }
+    }
+    // Reuse the activation-scale tile after all its readers are done. A
+    // separate M*64-float scratch tile would reduce Q4 head CTA residency
+    // from three to two on gfx906 (64 KiB LDS/CU).
+    if constexpr (Fused) __syncthreads();
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+        if (first + r >= n) break;
+        int seg = 0, at = first + r;
+        if constexpr (!Fused) {
+            while (seg < 2 && at >= out.n[seg]) at -= out.n[seg++];
+        }
+#pragma unroll
+        for (int m = 0; m < M; ++m) {
+            float v = acc[r][m];
+            for (int o = L / 2; o > 0; o >>= 1) v += __shfl_xor(v, o, L);
+            if (lane == 0) {
+                if constexpr (Fused) xds[m * rows + local + r] = v;
+                else out.y[seg][size_t(m) * out.n[seg] + at] = v;
+            }
+        }
+    }
+    if constexpr (Fused) {
+        __syncthreads();
+        local_top16<rows>(xds, parts, n);
+    }
+}
+
+// One CTA per position. Hold up to four sorted-list heads per thread, loading
+// only rank zero initially and advancing only the list that wins each round.
+constexpr int kMergeThreads = 1024, kListsPerThread = 4;
+__global__ void __launch_bounds__(kMergeThreads) fused_merge_kernel(
+        const Pair* __restrict__ parts, int lists, int32_t* __restrict__ ids, float* __restrict__ vals) {
+    __shared__ float sv[kMergeThreads / 64];
+    __shared__ int si[kMergeThreads / 64];
+    const int m = blockIdx.x, t = threadIdx.x;
+    const Pair* p = parts + size_t(m) * lists * kTop;
+    Pair heads[kListsPerThread];
+    int next[kListsPerThread];
+#pragma unroll
+    for (int j = 0; j < kListsPerThread; ++j) {
+        const int list = t + j * kMergeThreads;
+        heads[j] = list < lists ? p[list] : invalid;
+        next[j] = 1;
+    }
+    for (int rank = 0; rank < kTop; ++rank) {
+        Pair best = invalid;
+#pragma unroll
+        for (int j = 0; j < kListsPerThread; ++j)
+            if (better(heads[j].v, heads[j].id, best.v, best.id)) best = heads[j];
+        block_best(best.v, best.id, sv, si);
+        if (t == 0) {
+            ids[m * kTop + rank] = best.id;
+            vals[m * kTop + rank] = best.v;
+        }
+#pragma unroll
+        for (int j = 0; j < kListsPerThread; ++j) {
+            if (best.id != INT32_MAX && heads[j].id == best.id) {
+                const int list = t + j * kMergeThreads;
+                heads[j] = next[j] < kTop ? p[lists + size_t(list) * (kTop - 1) + next[j] - 1] : invalid;
+                ++next[j];
+            }
+        }
+    }
+}
+
+template <bool Sum>
 __global__ void __launch_bounds__(256) rms_norm_quantize_kernel(const float* __restrict__ x, const float* __restrict__ w,
                                                                 float* __restrict__ y_out, int8_t* __restrict__ q,
-                                                                float* __restrict__ d, int n_in, float eps) {
+                                                                float* __restrict__ d, int32_t* xsum, int n_in,
+                                                                float eps) {
     __shared__ float sw[4];
     const int r = int(blockIdx.x), tid = int(threadIdx.x);
     const float* xr = x + (size_t) r * n_in;
@@ -460,22 +676,18 @@ __global__ void __launch_bounds__(256) rms_norm_quantize_kernel(const float* __r
     const int sub = tid >> 5, lane = tid & 31, blocks = n_in / 32;
     float* yr = y_out ? y_out + (size_t) r * n_in : nullptr;
     int8_t* qr = q + (size_t) r * n_in;
-    float* dr = d + (size_t) r * blocks;
     for (int b = sub; b < blocks; b += 8) {
         const int c = b * 32 + lane;
         const float val = xr[c] * scale * w[c];
         if (yr) yr[c] = val;
-        float a = fabsf(val);
-        for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
-        const float s = a / 127.f;
-        qr[c] = (int8_t) (s > 0.f ? __float2int_rn(val / s) : 0);
-        if (lane == 0) dr[b] = s;
+        quant_block<Sum>(val, lane, qr + c, d, xsum, (size_t) r * blocks + b);
     }
 }
 
+template <bool Sum>
 __global__ void __launch_bounds__(256) conv_quantize_kernel(const float* __restrict__ x, const float* __restrict__ dyn,
                                                             const float* __restrict__ base, int stage,
-                                                            int8_t* __restrict__ q, float* __restrict__ d) {
+                                                            int8_t* __restrict__ q, float* __restrict__ d, int32_t* xsum) {
     const int r = int(blockIdx.y), b = int(blockIdx.x) * 8 + (int(threadIdx.x) >> 5), j = int(threadIdx.x) & 31;
     const int c = b * 32 + j;
     if (c >= kWidth) return;
@@ -483,26 +695,20 @@ __global__ void __launch_bounds__(256) conv_quantize_kernel(const float* __restr
     const float* dn = dyn + (size_t) r * kDyn + stage * 2 * kGroups;
     float val = (base[(stage * 2 + 0) * kWidth + c] + dn[g]) * x[(size_t) r * kWidth + c];
     if (r) val += (base[(stage * 2 + 1) * kWidth + c] + dn[kGroups + g]) * x[(size_t) (r - 1) * kWidth + c];
-    float a = fabsf(val);
-    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
-    const float s = a / 127.f;
-    q[(size_t) r * kWidth + c] = (int8_t) (s > 0.f ? __float2int_rn(val / s) : 0);
-    if (j == 0) d[(size_t) r * (kWidth / 32) + b] = s;
+    quant_block<Sum>(val, j, q + (size_t) r * kWidth + c, d, xsum, (size_t) r * (kWidth / 32) + b);
 }
 
+template <bool Sum>
 __global__ void __launch_bounds__(256) swiglu_quantize_kernel(const float* __restrict__ g, const float* __restrict__ u,
-                                                              int n_in, int8_t* __restrict__ q, float* __restrict__ d) {
+                                                              int n_in, int8_t* __restrict__ q, float* __restrict__ d,
+                                                              int32_t* xsum) {
     const int r = int(blockIdx.y), b = int(blockIdx.x) * 8 + (int(threadIdx.x) >> 5), j = int(threadIdx.x) & 31;
     const int c = b * 32 + j;
     if (c >= n_in) return;
     const size_t at = (size_t) r * n_in + c;
     const float gv = g[at];
     const float val = (gv / (1.0f + expf(-gv))) * u[at];
-    float a = fabsf(val);
-    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
-    const float s = a / 127.f;
-    q[at] = (int8_t) (s > 0.f ? __float2int_rn(val / s) : 0);
-    if (j == 0) d[(size_t) r * (n_in / 32) + b] = s;
+    quant_block<Sum>(val, j, q + at, d, xsum, (size_t) r * (n_in / 32) + b);
 }
 
 // ---- attention v3: 32 keys a CTA, halves in LDS (~29 KB: two CTAs a CU), dot2, four independent sums a thread ----
@@ -651,32 +857,42 @@ void topk(const float* logits, int rows, int64_t ld, int valid, float* scratch, 
     topk_merge_kernel<<<rows, 256, 0, st>>>(scratch, ids, vals);
 }
 
-void pack_q8_0(const void* q8_0, int n_in, int n_out, int8_t* q, float* d, cudaStream_t st) {
+Mat Mat::slice(int first, int rows) const {
+    const size_t at = (size_t) first * (n_in / 32);
+    return {q + at * code_bytes(), static_cast<const uint8_t*>(d) + at * scale_bytes(), n_in, rows, kind, scale_f32};
+}
+
+void pack_q8_0(const void* src, int n_in, int n_out, uint8_t* q, float* d, cudaStream_t st) {
     const size_t total = (size_t) n_out * (n_in / 32);
-    pack_kernel<<<(unsigned) ((total + 7) / 8), 256, 0, st>>>(static_cast<const uint8_t*>(q8_0), n_in / 32, q, d, total);
+    pack_kernel<<<div_up(total, 8), 256, 0, st>>>(static_cast<const uint8_t*>(src), q, d, total);
 }
 
-void quantize(const float* x, int n_in, int rows, int8_t* q, float* d, cudaStream_t st) {
-    quantize_kernel<<<dim3(div_up(n_in / 32, 8), rows), 256, 0, st>>>(x, n_in, q, d);
+void pack_q4_0(const void* src, int n_in, int n_out, uint8_t* q, void* d, bool scale_f32, cudaStream_t st) {
+    const size_t total = (size_t) n_out * (n_in / 32);
+    const auto* bytes = static_cast<const uint8_t*>(src);
+    if (scale_f32) pack4_kernel<<<div_up(total, 16), 256, 0, st>>>(bytes, q, static_cast<float*>(d), total);
+    else pack4_kernel<<<div_up(total, 16), 256, 0, st>>>(bytes, q, static_cast<__half*>(d), total);
 }
 
-void gemv8(const Mat8& w, const int8_t* xq, const float* xd, float* y, int rows, cudaStream_t st) {
-    gemv8_split(w, xq, xd, y, w.n_out, nullptr, 0, nullptr, 0, rows, st);
+void quantize(const float* x, int n_in, int rows, int8_t* q, float* d, int32_t* xsum, cudaStream_t st) {
+    const dim3 grid(div_up(n_in / 32, 8), rows);
+    if (xsum) quantize_kernel<true><<<grid, 256, 0, st>>>(x, n_in, q, d, xsum);
+    else quantize_kernel<false><<<grid, 256, 0, st>>>(x, n_in, q, d, nullptr);
 }
 
-void gemv8_split(const Mat8& w, const int8_t* xq, const float* xd, float* y0, int n0, float* y1, int n1, float* y2,
-                 int n2, int rows, cudaStream_t st) {
+static void gemv8_split(const Mat& w, const int8_t* xq, const float* xd, Outs out, int rows, cudaStream_t st) {
     static const bool fast = [] {
         const char* e = std::getenv("STRATA_DFLASH2_FAST");
         const bool on = e && e[0] == '1' && !e[1];
         if (on) std::fputs("strata-poly: STRATA_DFLASH2_FAST=1: 32B-block L8/R2 gemv8 and fused drafter quantize\n", stderr);
         return on;
     }();
-    const Outs out{{y0, y1, y2}, {n0, n1 ? n1 : 1 << 30, n2 ? n2 : 1 << 30}};
+    const auto* q = reinterpret_cast<const int8_t*>(w.q);
+    const auto* d = static_cast<const float*>(w.d);
     if (fast && w.n_out >= 4096 && w.n_in % 32 == 0) {
         const dim3 grid(div_up(w.n_out, 64));
         switch (rows) {
-#define DF2_G2(N) case N: gemv8_l8_r2_kernel<N><<<grid, 256, 0, st>>>(w.q, w.d, xq, xd, out, w.n_in, w.n_out); break;
+#define DF2_G2(N) case N: gemv8_l8_r2_kernel<N><<<grid, 256, 0, st>>>(q, d, xq, xd, out, w.n_in, w.n_out); break;
             DF2_G2(1) DF2_G2(2) DF2_G2(3) DF2_G2(4) DF2_G2(5) DF2_G2(6) DF2_G2(7) DF2_G2(8)
 #undef DF2_G2
             default: break;
@@ -685,25 +901,96 @@ void gemv8_split(const Mat8& w, const int8_t* xq, const float* xd, float* y0, in
     }
     const dim3 grid(div_up(w.n_out, 16));
     switch (rows) {
-#define DF2_G(N) case N: gemv8_kernel<N><<<grid, 256, 0, st>>>(w.q, w.d, xq, xd, out, w.n_in, w.n_out); break;
+#define DF2_G(N) case N: gemv8_kernel<N><<<grid, 256, 0, st>>>(q, d, xq, xd, out, w.n_in, w.n_out); break;
         DF2_G(1) DF2_G(2) DF2_G(3) DF2_G(4) DF2_G(5) DF2_G(6) DF2_G(7) DF2_G(8)
 #undef DF2_G
         default: break;
     }
 }
 
-void rms_norm_quantize(const float* x, const float* w, float* y_out, int8_t* q, float* d, int n_in, int rows, float eps,
-                       cudaStream_t st) {
-    rms_norm_quantize_kernel<<<rows, 256, 0, st>>>(x, w, y_out, q, d, n_in, eps);
+namespace {
+constexpr int kHeadRowsPerCta = 64;   // L8/R2
+
+template <int M, int L, int R, bool Fused = false>
+void launch_q4(const Mat& w, const int8_t* xq, const float* xd, const int32_t* xsum, Outs out, Pair* parts,
+               cudaStream_t st) {
+    const dim3 grid(div_up(w.n_out, 256 / L * R));
+    const auto* q = reinterpret_cast<const int4*>(w.q);
+    if (w.scale_f32)
+        planar_kernel<M, L, R, true, float, Fused><<<grid, 256, 0, st>>>(
+            q, static_cast<const float*>(w.d), xq, xd, xsum, out, parts, w.n_in, w.n_out);
+    else
+        planar_kernel<M, L, R, true, __half, Fused><<<grid, 256, 0, st>>>(
+            q, static_cast<const __half*>(w.d), xq, xd, xsum, out, parts, w.n_in, w.n_out);
+}
+
+template <int M>
+void gemv4_split(const Mat& w, const int8_t* xq, const float* xd, const int32_t* xsum, Outs out, cudaStream_t st) {
+    if (w.n_in == kWidth && w.n_out == 2 * 6912)             // gate|up
+        launch_q4<M, 8, 4>(w, xq, xd, xsum, out, nullptr, st);
+    else if (w.n_in == kQuery && w.n_out == kWidth)          // O
+        launch_q4<M, 16, 2>(w, xq, xd, xsum, out, nullptr, st);
+    else if (w.n_in == kWidth && w.n_out >= kQuery + 2 * kKey)  // QKV or private head
+        launch_q4<M, 8, 2>(w, xq, xd, xsum, out, nullptr, st);
+    else                                                    // Down, conv, selector, K|V
+        launch_q4<M, 16, 1>(w, xq, xd, xsum, out, nullptr, st);
+}
+}  // namespace
+
+#ifdef STRATA_DFLASH2_TEST
+// Test control: same L16 floating-point order as Down, with two outputs per lane group instead of one.
+void down_r2_for_test(const Mat& w, const int8_t* xq, const float* xd, const int32_t* xsum, float* y, cudaStream_t st) {
+    const Outs out{{y, nullptr, nullptr}, {w.n_out, 0, 0}};
+    launch_q4<kBlock, 16, 2>(w, xq, xd, xsum, out, nullptr, st);
+}
+#endif
+
+void gemv(const Mat& w, const int8_t* xq, const float* xd, const int32_t* xsum, float* y, int rows, cudaStream_t st) {
+    gemv_split(w, xq, xd, xsum, y, w.n_out, nullptr, 0, nullptr, 0, rows, st);
+}
+
+void gemv_split(const Mat& w, const int8_t* xq, const float* xd, const int32_t* xsum, float* y0, int n0, float* y1,
+                int n1, float* y2, int n2, int rows, cudaStream_t st) {
+    const Outs out{{y0, y1, y2}, {n0, n1 ? n1 : 1 << 30, n2 ? n2 : 1 << 30}};
+    if (!w.q4()) return gemv8_split(w, xq, xd, out, rows, st);
+    switch (rows) {
+#define DF2_G4(N) case N: gemv4_split<N>(w, xq, xd, xsum, out, st); break;
+        DF2_G4(1) DF2_G4(2) DF2_G4(3) DF2_G4(4) DF2_G4(5) DF2_G4(6) DF2_G4(7) DF2_G4(8)
+#undef DF2_G4
+        default: break;
+    }
+}
+
+size_t head_top_bytes(int n_out) { return (size_t) div_up(n_out, kHeadRowsPerCta) * kGuess * kTop * sizeof(Pair); }
+
+void head_top(const Mat& w, const int8_t* xq, const float* xd, const int32_t* xsum, void* scratch, int32_t* ids,
+              float* vals, cudaStream_t st) {
+    const int lists = div_up(w.n_out, kHeadRowsPerCta);
+    auto* parts = static_cast<Pair*>(scratch);
+    if (w.q4()) launch_q4<kGuess, 8, 2, true>(w, xq, xd, xsum, {}, parts, st);
+    else planar_kernel<kGuess, 8, 2, false, float, true><<<lists, 256, 0, st>>>(
+        reinterpret_cast<const int4*>(w.q), static_cast<const float*>(w.d), xq, xd, nullptr, {}, parts, w.n_in, w.n_out);
+    fused_merge_kernel<<<kGuess, kMergeThreads, 0, st>>>(parts, lists, ids, vals);
+}
+
+void rms_norm_quantize(const float* x, const float* w, float* y_out, int8_t* q, float* d, int32_t* xsum, int n_in,
+                       int rows, float eps, cudaStream_t st) {
+    if (xsum) rms_norm_quantize_kernel<true><<<rows, 256, 0, st>>>(x, w, y_out, q, d, xsum, n_in, eps);
+    else rms_norm_quantize_kernel<false><<<rows, 256, 0, st>>>(x, w, y_out, q, d, nullptr, n_in, eps);
 }
 
 void conv_quantize(const float* x, const float* dyn, const float* base, int stage, int rows, int8_t* q, float* d,
-                   cudaStream_t st) {
-    conv_quantize_kernel<<<dim3(div_up(kWidth / 32, 8), rows), 256, 0, st>>>(x, dyn, base, stage, q, d);
+                   int32_t* xsum, cudaStream_t st) {
+    const dim3 grid(div_up(kWidth / 32, 8), rows);
+    if (xsum) conv_quantize_kernel<true><<<grid, 256, 0, st>>>(x, dyn, base, stage, q, d, xsum);
+    else conv_quantize_kernel<false><<<grid, 256, 0, st>>>(x, dyn, base, stage, q, d, nullptr);
 }
 
-void swiglu_quantize(const float* g, const float* u, int n_in, int rows, int8_t* q, float* d, cudaStream_t st) {
-    swiglu_quantize_kernel<<<dim3(div_up(n_in / 32, 8), rows), 256, 0, st>>>(g, u, n_in, q, d);
+void swiglu_quantize(const float* g, const float* u, int n_in, int rows, int8_t* q, float* d, int32_t* xsum,
+                     cudaStream_t st) {
+    const dim3 grid(div_up(n_in / 32, 8), rows);
+    if (xsum) swiglu_quantize_kernel<true><<<grid, 256, 0, st>>>(g, u, n_in, q, d, xsum);
+    else swiglu_quantize_kernel<false><<<grid, 256, 0, st>>>(g, u, n_in, q, d, nullptr);
 }
 
 void attend3(const float* q, const float* kb, const float* vb, const __half* kc, const __half* vc, int64_t lo,
@@ -726,7 +1013,7 @@ void unpack_top(const float* in, int rows, int32_t* ids, float* vals, cudaStream
     unpack_top_kernel<<<rows, 64, 0, st>>>(in, ids, vals);
 }
 
-void select(const int32_t* ids, const float* vals, const float* h, const __half* pred, const __half* succ,
+void select(const int32_t* ids, const float* vals, const float* h, Book pred, Book succ,
             int32_t anchor, float cap, float* edges, Guess* out, cudaStream_t st) {
     static const float inv_temp = [] {
         const char* e = std::getenv("STRATA_DFLASH2_PROB_TEMP");
@@ -739,7 +1026,10 @@ void select(const int32_t* ids, const float* vals, const float* h, const __half*
         }
         return 1.f;
     }();
-    edges_kernel<<<kGuess, 256, 0, st>>>(ids, vals, h, pred, succ, anchor, cap, edges);
+    if (pred.kind == BookKind::kF16 && succ.kind == BookKind::kF16)
+        edges_kernel<true><<<kGuess, 256, 0, st>>>(ids, vals, h, pred, succ, anchor, cap, edges);
+    else
+        edges_kernel<false><<<kGuess, 256, 0, st>>>(ids, vals, h, pred, succ, anchor, cap, edges);
     walk_kernel<<<1, 64, 0, st>>>(ids, edges, inv_temp, out);
 }
 

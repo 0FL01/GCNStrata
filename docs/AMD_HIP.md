@@ -759,21 +759,34 @@ Kernel bench: `artifacts/specv4-20261126/bench/moe_bench.hip` in the control rep
 
 ### Inkling-2-Mini: native DFlash2 drafter
 
-`--draft-model` with a `dflash` GGUF that has `selector_hidden.weight` (incoai/Inkling-2-Mini-DFlash2 converted with
-matmuls in Q8_0, codebooks F16 trimmed to 200,058 rows) selects the DFlash2 drafter instead of DSpark
-(`src/poly/inkling_dflash2.{hpp,cu}`, `Inkling2::df_*`). Five non-causal SWA(2048) layers with two-tap dynamic
-convolutions read the same target taps as DSpark (visits 5, 23, 41 and the final norm) through `fc` and
+`--draft-model` with a `dflash` GGUF that has `selector_hidden.weight` selects the DFlash2 drafter instead of DSpark.
+For Inkling-2-Mini, selector codebooks must be F16, Q8_0 or Q4_0 and trimmed to 200,058 rows. Both
+`enc.output_norm.weight` and `enc_output_norm.weight` are accepted.
+The implementation lives in `src/poly/inkling_dflash2.{hpp,cu}` and `Inkling2::df_*`. Five non-causal SWA(2048)
+layers with two-tap dynamic convolutions read the same target taps as DSpark (visits 5, 23, 41 and the final norm) through `fc` and
 `hidden_norm` into half K/V rings of 2048 positions; only kept rows are injected. One pass over `[anchor, MASK x 7]`
 gives all seven guesses (`Engine::drafter_block_`, `drafter_guesses()`): target head on rows 1..7, top-16 a row,
 the candidate selector's edges and greedy walk, one stream sync. Because the verifier is width invariant, the
 drafter changes only speed, never output.
 
-- `STRATA_DFLASH2_GEMV8=1`: the block's products from int8 rows repacked at load (16 lanes a row, activation K tiles
-  in LDS, fused q|k|v and gate|up).
+- `STRATA_DFLASH2_MIXED=1` (or the existing `STRATA_DFLASH2_GEMV8=1`): repack homogeneous Q8_0 and Q4_0 groups
+  at load. The q|k|v and gate|up groups each run as one product; groups with other or mismatched formats use `lin()`.
+  Q4_0 stores FP16 scales by default; use `STRATA_DFLASH2_Q4_F32=1` to compare with FP32 backbone scales.
 - `STRATA_DFLASH2_ATTEND3=1`: 32 keys a CTA, halves in LDS, `v_dot2_f32_f16`.
-- `STRATA_DFLASH2_HEAD8=1` (with GEMV8, TP2): a drafter-private int8 copy of the target head, each owner holding its
-  half; both owners compute logits and a top-16 at once and rank 1 returns 7 x 16 candidates.
+- `STRATA_DFLASH2_HEAD8=1` (TP2): a drafter-private int8 copy of the target head, independent of the draft GGUF's
+  precision or GEMV flag. Each owner holds half the vocabulary; rank 1 returns 7 x 16 candidates.
+- `STRATA_DFLASH2_HEAD_Q4=1` (TP2): use a private Q4_0 head with FP16 scales instead of int8.
+- `STRATA_DFLASH2_HEAD_FUSE=1` (TP2): fuse the private head's L8/R2 product and local top-16 without dense logits.
+  This enables the private head even without `HEAD8` and combines with `HEAD_Q4`. For the unfused int8 L8/R2
+  comparison, use `HEAD8=1` with `STRATA_DFLASH2_FAST=1`.
+- `STRATA_DFLASH2_KEPT_OPT=1`: for at most eight kept rows, quantize the normalized context once and use each layer's
+  packed K|V slice. Larger batches and layers without a packed group keep the existing `lin()` path. The packed
+  projection uses FP32 activation scales and a different reduction order than native `lin()`, so it is not bitwise
+  equivalent to `lin()`. This can change guesses, not the verifier.
 - `guesses.hpp`: for an all-at-once drafter the run is paid once; later guesses carry no ask cost.
+
+The `poly_inkling_dflash2_test` target (`STRATA_BUILD_TESTS=ON`) checks planar projections, mixed codebooks, and
+fused vs. unfused head top-16 on gfx906 without a model.
 
 A restored or reset state starts the drafter without context (its rings are not saved with a state yet).
 Measured on four MI50 (Q4_0 target, 2K/18K/64K): mean accepted guesses of 7 on one greedy trajectory 4.43 / 3.42 /

@@ -2182,6 +2182,15 @@ if(STRATA_NATIVE_EXPERTS AND STRATA_HIP_GFX906)
   target_include_directories(poly_inkling_attend_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                              ${_strata_gpu_include_directories})
   target_link_libraries(poly_inkling_attend_test PRIVATE ${_strata_gpu_runtime_target})
+
+  if(STRATA_HIP_GFX906 AND STRATA_BUILD_TESTS)
+    add_executable(poly_inkling_dflash2_test src/poly/inkling_dflash2_test.cu src/poly/inkling_dflash2.cu)
+    target_compile_definitions(poly_inkling_dflash2_test PRIVATE STRATA_DFLASH2_TEST=1)
+    target_include_directories(poly_inkling_dflash2_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(poly_inkling_dflash2_test PRIVATE ${_strata_gpu_runtime_target})
+    add_test(NAME poly_inkling_dflash2_test COMMAND poly_inkling_dflash2_test)
+    set_tests_properties(poly_inkling_dflash2_test PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
 endif()
 
 # ---- HIP gfx906: every CUDA source of the tree (and the ggml-cuda MMQ sources) is compiled as HIP ----

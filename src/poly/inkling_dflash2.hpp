@@ -3,7 +3,7 @@
 // at visits 5, 23, 41 and its final norm (concatenated, fc, hidden_norm) as a K/V prefix, a block [anchor, MASK x 7]
 // in one pass, the target's head on the seven guessing rows, and a candidate selector that walks the top-16 lattice
 // (z-lab/dflash model.py DFlash2DraftModel / CandidateSelector; llama.cpp renoirvieir4@0280b55a).  These are the
-// launches the engine has no kernel for; the matrix products are the engine's (lin()).
+// launches the engine has no kernel for, including optional planar matrix products.
 #pragma once
 
 #include <cuda_fp16.h>
@@ -56,38 +56,59 @@ void unpack_top(const float* in, int rows, int32_t* ids, float* vals, cudaStream
 
 /// The selector: edges S_t(a, b) = cap tanh((U_t(b) + sum_r P[a][r] H_t[r] Q[b][r]) / cap) from the anchor (t = 0) or
 /// the candidates of position t - 1, then the greedy walk.  out[i] = the i-th guess and the softmax probability (over
-/// its 16 candidates, temperature 1) of it.  pred/succ: half [vocab][256]; h: [7][256]; edges: 7 x 256 floats.
+/// its 16 candidates, temperature 1) of it.  pred/succ: [vocab][256]; h: [7][256]; edges: 7 x 256 floats.
 struct Guess {
     int32_t token;
     float prob;
 };
-void select(const int32_t* ids, const float* vals, const float* h, const __half* pred, const __half* succ,
+enum class BookKind { kF16, kQ8, kQ4 };
+struct Book {
+    const void* data = nullptr;
+    BookKind kind = BookKind::kF16;
+};
+void select(const int32_t* ids, const float* vals, const float* h, Book pred, Book succ,
             int32_t anchor, float cap, float* edges, Guess* out, cudaStream_t st);
 
-/// A drafter matrix repacked for the block's few rows: int8 codes [n_out][n_in] and one float scale a 32-value block
-/// [n_out][n_in / 32] (a Q8_0 matrix's own values, aligned).  pack() converts ggml Q8_0 rows on the card.
-struct Mat8 {
-    const int8_t* q = nullptr;
-    const float* d = nullptr;
+/// Planar GGML blocks: 32 int8 codes and one float scale (Q8), or 16 split-half nibble bytes and one half/float
+/// scale (Q4). Each plane is row-major, with blocks of 32 weights; all code blocks are 16-byte aligned.
+enum class MatKind { kQ8, kQ4 };
+struct Mat {
+    const uint8_t* q = nullptr;
+    const void* d = nullptr;
     int n_in = 0, n_out = 0;
+    MatKind kind = MatKind::kQ8;
+    bool scale_f32 = true;
+
+    explicit operator bool() const { return q != nullptr; }
+    bool q4() const { return kind == MatKind::kQ4; }
+    int code_bytes() const { return q4() ? 16 : 32; }
+    int scale_bytes() const { return scale_f32 ? sizeof(float) : sizeof(__half); }
+    Mat slice(int first, int rows) const;   // contiguous output-row view; no copy
 };
-void pack_q8_0(const void* q8_0, int n_in, int n_out, int8_t* q, float* d, cudaStream_t st);
-/// Activations of `rows` <= 8 rows of n_in values as int8 codes and a float scale a 32-value block (Q8_1's rule).
-void quantize(const float* x, int n_in, int rows, int8_t* q, float* d, cudaStream_t st);
-/// y[r][o] = sum over blocks of d_w d_x sum(q_w q_x), rows <= 8.  xq/xd: quantize()'s.
-void gemv8(const Mat8& w, const int8_t* xq, const float* xd, float* y, int rows, cudaStream_t st);
-/// gemv8() of a fused matrix whose rows [0, n0) go to y0, the next n1 to y1 and the next n2 to y2 ([rows][n_i] each).
-void gemv8_split(const Mat8& w, const int8_t* xq, const float* xd, float* y0, int n0, float* y1, int n1, float* y2,
-                 int n2, int rows, cudaStream_t st);
+void pack_q8_0(const void* src, int n_in, int n_out, uint8_t* q, float* d, cudaStream_t st);
+void pack_q4_0(const void* src, int n_in, int n_out, uint8_t* q, void* d, bool scale_f32, cudaStream_t st);
+
+/// Activations: int8 codes, a float scale, and (when xsum is nonnull) the integer sum of codes per 32 values.
+void quantize(const float* x, int n_in, int rows, int8_t* q, float* d, int32_t* xsum, cudaStream_t st);
+void gemv(const Mat& w, const int8_t* xq, const float* xd, const int32_t* xsum, float* y, int rows, cudaStream_t st);
+/// Output rows [0, n0) go to y0, the next n1 to y1, and the next n2 to y2 ([rows][n_i] each).
+void gemv_split(const Mat& w, const int8_t* xq, const float* xd, const int32_t* xsum, float* y0, int n0, float* y1,
+                int n1, float* y2, int n2, int rows, cudaStream_t st);
+
+/// Private vocabulary half, exactly kGuess activation rows. Fused IDs are local, like topk()'s.
+size_t head_top_bytes(int n_out);
+void head_top(const Mat& w, const int8_t* xq, const float* xd, const int32_t* xsum, void* scratch, int32_t* ids,
+              float* vals, cudaStream_t st);
 
 /// attend() with 32 keys a CTA, halves in LDS and dot2 (two CTAs a CU).
 void attend3(const float* q, const float* kb, const float* vb, const __half* kc, const __half* vc, int64_t lo,
              int64_t pos, float* scratch, float* out, cudaStream_t st);
 
 /// Fused drafter helpers (STRATA_DFLASH2_FAST=1): eliminate intermediate FP32 round-trips and quantize launches.
-void rms_norm_quantize(const float* x, const float* w, float* y_out, int8_t* q, float* d, int n_in, int rows, float eps,
-                       cudaStream_t st);
+void rms_norm_quantize(const float* x, const float* w, float* y_out, int8_t* q, float* d, int32_t* xsum, int n_in,
+                       int rows, float eps, cudaStream_t st);
 void conv_quantize(const float* x, const float* dyn, const float* base, int stage, int rows, int8_t* q, float* d,
-                   cudaStream_t st);
-void swiglu_quantize(const float* g, const float* u, int n_in, int rows, int8_t* q, float* d, cudaStream_t st);
+                   int32_t* xsum, cudaStream_t st);
+void swiglu_quantize(const float* g, const float* u, int n_in, int rows, int8_t* q, float* d, int32_t* xsum,
+                     cudaStream_t st);
 }  // namespace strata::poly::dflash2
