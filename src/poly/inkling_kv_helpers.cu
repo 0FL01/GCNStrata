@@ -19,6 +19,28 @@ namespace strata::poly::inkling::kv_helpers {
 namespace {
 
 constexpr int kPreseedEnd = 32768, kOffloadPos = 65536, kPromptRows = 32, kSeedRows = 2048;
+int kv_helper_min_pos() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_INKLING_KV_HELPERS_MIN_POS");
+        if (!e || !*e) return kOffloadPos;
+        char* end = nullptr;
+        long x = std::strtol(e, &end, 10);
+        if (end == e || *end != '\0' || x < 4096 || x > 262144) return kOffloadPos;
+        return int(x);
+    }();
+    return v;
+}
+int kv_helper_min_new() {
+    static const int v = [] {
+        const char* e = std::getenv("STRATA_INKLING_KV_HELPERS_MIN_NEW");
+        if (!e || !*e) return 256;
+        char* end = nullptr;
+        long x = std::strtol(e, &end, 10);
+        if (end == e || *end != '\0' || x < 1 || x > 65536) return 256;
+        return int(x);
+    }();
+    return v;
+}
 constexpr int kThreads = 128;
 using Word = uint32_t;   // transport the bit patterns of FP32, Q8 codes and FP16 scales
 constexpr int kHeads = kHalfKvHeads * kQueriesPerKv;
@@ -46,7 +68,6 @@ __host__ __device__ constexpr int offset(int field) {
     return words;
 }
 constexpr int kKvWords = offset(Fields) - offset(K);
-constexpr int kPacketWords = offset(Fields) * kMaxRows;
 constexpr int blocks(int words) { return (words + kThreads - 1) / kThreads; }
 static_assert(kOwnerKvHeads == 2 * kHalfKvHeads);
 
@@ -140,13 +161,13 @@ void enable_link(int from, int to) {
 }  // namespace
 
 struct Mirror {
-    Mirror(int rank, int capacity, hipStream_t model_stream)
-        : owner(rank), helper(rank + 2), capacity(capacity), model_stream(model_stream) {}
+    Mirror(int rank, int capacity, hipStream_t model_stream, int decode_max_rows)
+        : owner(rank), helper(rank + 2), capacity(capacity), decode_max_rows(decode_max_rows), model_stream(model_stream) {}
 
     Resources owner, helper;
     std::unique_ptr<Resources> bulk;
     bool balance_flash = false;
-    const int capacity;
+    const int capacity, decode_max_rows;
     const hipStream_t model_stream;
     bool used = false, long_answer = false;
     std::array<int, kFullVisits> valid{};
@@ -155,19 +176,21 @@ struct Mirror {
     float *tables = nullptr, *partial = nullptr, *scores = nullptr;
 
     void init() {
-        constexpr size_t seed_words = kKvWords * kSeedRows, answer_words = kAnswerWords * kMaxRows;
+        constexpr size_t seed_words = kKvWords * kSeedRows;
+        const size_t packet_words = size_t(offset(Fields)) * decode_max_rows;
+        const size_t answer_words = size_t(kAnswerWords) * decode_max_rows;
         const size_t kv_words = size_t(capacity) * kKvWords * kFullVisits;
-        const size_t score_words = size_t(capacity) * kHeads * kMaxRows;
-        const size_t partial_words = half_decode_floats();
+        const size_t score_words = size_t(capacity) * kHeads * decode_max_rows;
+        const size_t partial_words = half_decode_floats(decode_max_rows);
         constexpr size_t table_words = kTableWords * kFullVisits;
         static_assert(sizeof(Word) == sizeof(float));
-        owner.init(kPacketWords + seed_words + answer_words, true);
+        owner.init(packet_words + seed_words + answer_words, true);
         send = owner.memory;
-        seed = send + kPacketWords;
+        seed = send + packet_words;
         receive = seed + seed_words;
-        helper.init(kPacketWords + answer_words + kv_words + table_words + partial_words + score_words, false);
+        helper.init(packet_words + answer_words + kv_words + table_words + partial_words + score_words, false);
         packet = helper.memory;
-        answer = packet + kPacketWords;
+        answer = packet + packet_words;
         kv = answer + answer_words;
         tables = reinterpret_cast<float*>(kv + kv_words);
         partial = tables + table_words;
@@ -193,7 +216,8 @@ struct Mirror {
 
 void FreeMirror::operator()(Mirror* mirror) const noexcept { delete mirror; }
 
-std::array<MirrorPtr, 2> create_pair(int capacity, std::array<cudaStream_t, 2> owner_streams) {
+std::array<MirrorPtr, 2> create_pair(int capacity, std::array<cudaStream_t, 2> owner_streams,
+                                    bool wide_decode) {
     if (capacity <= kOffloadPos) throw std::runtime_error("max context must be greater than 65536");
     int previous = 0, devices = 0;
     check(hipGetDevice(&previous), "get KV helper setup device");
@@ -212,7 +236,8 @@ std::array<MirrorPtr, 2> create_pair(int capacity, std::array<cudaStream_t, 2> o
     }
     std::array<MirrorPtr, 2> mirrors;
     for (int rank : {0, 1}) {
-        mirrors[rank].reset(new Mirror(rank, capacity, owner_streams[rank]));
+        mirrors[rank].reset(new Mirror(rank, capacity, owner_streams[rank],
+                                      wide_decode ? kMaxDecodeRows : kDefaultDecodeRows));
         mirrors[rank]->init();
     }
     return mirrors;
@@ -314,7 +339,7 @@ bool try_flash_rows(Mirror& m, const Attend& a) {
 
 void set_budget(Mirror& mirror, int64_t prompt_rows, int64_t max_new) {
     // A 64K/256 generation amortized the peer seed; a sampled /16 request did not.
-    mirror.long_answer = prompt_rows >= kOffloadPos && max_new >= 256;
+    mirror.long_answer = prompt_rows >= kv_helper_min_pos() && max_new >= kv_helper_min_new();
 }
 
 Visit try_visit(Mirror& m, const Attend& a, int slot, float* partial, float* scores, size_t score_floats, void* q8) {
@@ -328,11 +353,20 @@ Visit try_visit(Mirror& m, const Attend& a, int slot, float* partial, float* sco
     valid = std::min(valid, pos);
     // A short request still trims provisional rows above. Do not seed its prefix, or recopy a long missing
     // prefix after restore. A continuous long read reaches the preseed crossing with at most 32K rows missing.
+    const int min_pos = kv_helper_min_pos();
+    const int preseed_end = std::min(kPreseedEnd, min_pos);
     if (!m.long_answer || pos - valid > kPreseedEnd) return Visit::Local;
-    const bool preseed = rows >= kPromptRows && end >= kPreseedEnd;
-    if (!preseed && (pos < kOffloadPos || rows > kMaxRows || !partial || !scores || !q8 ||
-                     size_t(end) > score_floats / (rows * kHeads * 2)))
-        return Visit::Local;
+    const bool preseed = rows >= kPromptRows && end >= preseed_end;
+    int score_rows = 0;
+    if (!preseed) {
+        if (pos < min_pos || rows > m.decode_max_rows || !partial || !scores || !q8)
+            return Visit::Local;
+        // The owner's score slab has the full 12-head stride despite computing only six heads.
+        // T<=4 keeps its existing eligibility. Wider calls may reuse that slab across groups of rows.
+        const size_t fit = score_floats / (size_t(end) * kHeads * 2);
+        if (!fit || (rows <= kDefaultDecodeRows && fit < size_t(rows))) return Visit::Local;
+        score_rows = static_cast<int>(std::min(size_t(rows), fit));
+    }
 
     int current = 0;
     check(hipGetDevice(&current), "get KV helper visit device");
@@ -378,7 +412,7 @@ Visit try_visit(Mirror& m, const Attend& a, int slot, float* partial, float* sco
             check(hipMemcpyPeerAsync(table, m.helper.device, a.table, m.owner.device,
                                      kTableWords * sizeof(float), comm), "send KV helper bias table");
         check(hipEventRecord(m.owner.sent, comm), "record KV helper packet sent");
-        attend_decode_half(a, partial, scores, q8, model);
+        attend_decode_half(a, partial, scores, q8, model, score_rows);
 
         check(hipSetDevice(m.helper.device), "select KV helper device");
         check(hipStreamWaitEvent(work, m.owner.sent, 0), "wait for KV helper packet");

@@ -10,6 +10,7 @@
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/q8_1_finite.hpp"
 
 #include <cuda_fp16.h>
 #include "ggml.h"
@@ -255,6 +256,145 @@ struct Streams3 {
 __global__ void mix3_kernel(MixInputs in, int count, Streams3 s) {
     mix_row(in, count, s.query[blockIdx.y], s.out[blockIdx.y], (size_t) blockIdx.x * kRowWidth);
 }
+
+#if defined(STRATA_HIP_GFX906)
+struct MixQ81 { half2 ds; int8_t qs[32]; };
+static_assert(sizeof(MixQ81) == 36 && alignof(MixQ81) == 4);
+struct MixNormRows {
+    const float* query[3];
+    const float* weight[3];
+    float* normalized[3];
+    void* quant[3];
+};
+
+__device__ __forceinline__ float mix_norm_sum(float x) {
+#pragma unroll
+    for (int offset = 32 / 2; offset > 0; offset >>= 1) {
+        x += __shfl_xor(x, offset, 32);
+    }
+    return x;
+}
+
+__device__ __forceinline__ float mix_norm_max(float x) {
+#pragma unroll
+    for (int offset = 32 / 2; offset > 0; offset >>= 1) {
+        x = fmaxf(x, __shfl_xor(x, offset, 32));
+    }
+    return x;
+}
+
+// One stock SUM thread per logical index. 576 physical threads in mix can
+// emulate the other 448 logical SUM threads without changing any shuffles:
+// 576 is a multiple of both 32 and 64.
+template<bool Ffn>
+__device__ __forceinline__ void mix_norm_from_lds(const float* values, const MixNormRows& out, int stream, int row, float eps) {
+#pragma clang fp contract(off)
+    constexpr int sum_threads = Ffn ? 128 : 1024;
+    __shared__ float part[sum_threads / 32];
+    const int tid = threadIdx.x;
+    for (int logical = tid; logical < sum_threads; logical += kMixThreads) {
+        float ss = 0.f;
+        for (int i = logical; i < kRowWidth; i += sum_threads) {
+            const float v = values[i];
+            ss = __fmaf_rn(v, v, ss);
+        }
+        ss = mix_norm_sum(ss);
+        if ((logical & 31) == 0) part[logical >> 5] = ss;
+    }
+    __syncthreads();
+    float sum = 0.f;
+    for (int k = 0; k < sum_threads / 32; ++k) sum = __fadd_rn(sum, part[k]);
+    float scale;
+    if constexpr (Ffn) scale = __fdiv_rn(1.f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, float(kRowWidth)), eps)));
+    else scale = 1.f / sqrtf(sum / float(kRowWidth) + eps);
+    float* y = out.normalized[stream] + row * kRowWidth;
+    MixQ81* q = static_cast<MixQ81*>(out.quant[stream]) + row * (kRowWidth / 32);
+    // kMixThreads and the stock 1024-thread quantizer both stride in multiples
+    // of 32: each block's amax and raw FP32 sum have the same XOR tree.
+    for (int i = tid; i < kRowWidth; i += kMixThreads) {
+        float xi;
+        if constexpr (Ffn) xi = __fmul_rn(__fmul_rn(values[i], scale), out.weight[stream][i]);
+        else xi = values[i] * scale * out.weight[stream][i];
+        y[i] = xi;
+        const float amax = mix_norm_max(fabsf(xi));
+        const float bsum = mix_norm_sum(xi);
+        const float d = kernels::q8_1_finite(amax / 127.f);
+        q[i / 32].qs[i % 32] = kernels::q8_1_quant(xi, d, amax);
+        if (i % 32 == 0) q[i / 32].ds = kernels::q8_1_ds(d, bsum);
+    }
+}
+
+// Same mixer arithmetic as the stock runtime-bound loops, but a constant
+// upper bound lets LLVM scalarize all five float4s, scales and probabilities.
+// Dynamic indexing of those per-thread arrays otherwise uses scratch.
+__device__ __forceinline__ float4 mix_value_registers(const MixInputs& in, int count, const float* query, size_t row) {
+    constexpr int kMost = 5, kW = kMixThreads / 64;
+    static_assert(kMixThreads * 4 == kRowWidth && kMixThreads % 64 == 0, "576 threads = 9 wave64s x float4");
+    const int tid = threadIdx.x;
+    const int lane = tid & 63, wave = tid >> 6;
+    __shared__ float waves[2 * kMost][kW];
+
+    const float4 q = reinterpret_cast<const float4*>(query)[tid];
+    float4 xv[kMost];
+
+#pragma unroll
+    for (int j = 0; j < kMost; ++j) if (j < count) {
+        const float4 x = reinterpret_cast<const float4*>(in.x[j] + row)[tid];
+        xv[j] = x;
+        float ss = __fmaf_rn(x.x, x.x, __fmaf_rn(x.y, x.y, __fmaf_rn(x.z, x.z, x.w * x.w)));
+        float dot = __fmaf_rn(x.x, q.x, __fmaf_rn(x.y, q.y, __fmaf_rn(x.z, q.z, x.w * q.w)));
+        ss = wave64_sum_mix(ss);
+        dot = wave64_sum_mix(dot);
+        if (lane == 0) {
+            waves[2 * j][wave] = ss;
+            waves[2 * j + 1][wave] = dot;
+        }
+    }
+    __syncthreads();
+    if (wave == 0 && lane < 2 * count) {
+        float s = 0.f;
+#pragma unroll
+        for (int w = 0; w < kW; ++w) s += waves[lane][w];
+        waves[lane][0] = s;
+    }
+    __syncthreads();
+    float scale[kMost], w[kMost], top = -INFINITY;
+
+#pragma unroll
+    for (int j = 0; j < kMost; ++j) if (j < count) {
+        scale[j] = rsqrtf(waves[2 * j][0] / kRowWidth + 1.e-6f);
+        w[j] = waves[2 * j + 1][0] * scale[j] * rsqrtf((float) kRowWidth);
+        top = fmaxf(top, w[j]);
+    }
+    float sum = 0.f;
+
+#pragma unroll
+    for (int j = 0; j < kMost; ++j) if (j < count) sum += (w[j] = expf(w[j] - top));
+    const float inv_sum = 1.f / sum;
+    float4 res = make_float4(0.f, 0.f, 0.f, 0.f);
+
+#pragma unroll
+    for (int j = 0; j < kMost; ++j) if (j < count) {
+        const float c = w[j] * scale[j] * inv_sum;
+        res.x = __fmaf_rn(c, xv[j].x, res.x);
+        res.y = __fmaf_rn(c, xv[j].y, res.y);
+        res.z = __fmaf_rn(c, xv[j].z, res.z);
+        res.w = __fmaf_rn(c, xv[j].w, res.w);
+    }
+    return res;
+}
+
+template<bool Ffn>
+__global__ void __launch_bounds__(kMixThreads) fused_mix_norm(MixInputs in, int count, MixNormRows out, float eps) {
+    __shared__ float4 mixed[kMixThreads];
+    const int stream = blockIdx.y, row = blockIdx.x;
+    const float4 v = mix_value_registers(in, count, out.query[stream], size_t(row) * kRowWidth);
+    mixed[threadIdx.x] = v;
+    __syncthreads();
+    mix_norm_from_lds<Ffn>(reinterpret_cast<const float*>(mixed), out, stream, row, eps);
+}
+
+#endif
 
 __global__ void control_kernel(float* cur, const float* msg, const float* gain, const float* forget, int count) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -927,6 +1067,12 @@ void Inkling2::load_geometry() {
     if (decode_) std::fputs("strata-poly: STRATA_INKLING_DECODE=1: decode kernels for a few tokens at a time\n", stderr);
     const char* norm_q8 = std::getenv("STRATA_INKLING_NORM_Q8");
     norm_q8_ = decode_ && norm_q8 && norm_q8[0] == '1' && norm_q8[1] == '\0';
+#if defined(STRATA_HIP_GFX906)
+    const char* mix_rms = std::getenv("STRATA_INKLING_MIX_RMS_FUSE");
+    mix_rms_fuse_ = decode_ && gfx906 && p.warpSize == 64 && mix_rms && std::strcmp(mix_rms, "1") == 0;
+    const char* group_ballot = std::getenv("STRATA_INKLING_MOE_GROUP_BALLOT");
+    moe_group_ballot_ = gfx906 && p.warpSize == 64 && group_ballot && std::strcmp(group_ballot, "1") == 0;
+#endif
     if (norm_q8_)
         std::fputs("strata-poly: STRATA_INKLING_NORM_Q8=1: a visit's stream norms and their Q8_1 in one launch\n",
                    stderr);
@@ -1167,7 +1313,12 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
                        "DECODE, DECODE_DPP, DECODE_FACTORED and matching context limits; using ordinary TP2\n", stderr);
         } else {
             try {
-                auto mirrors = inkling::kv_helpers::create_pair(r0->opt_.max_context, {cs(r0->st_), cs(r1->st_)});
+                const bool wide_decode = enabled("STRATA_INKLING_KV_HELPERS_W8");
+                auto mirrors = inkling::kv_helpers::create_pair(r0->opt_.max_context, {cs(r0->st_), cs(r1->st_)},
+                                                                wide_decode);
+                if (wide_decode)
+                    std::fputs("strata-poly: STRATA_INKLING_KV_HELPERS_W8=1: up to eight full-attention decode rows\n",
+                               stderr);
                 if (enabled("STRATA_INKLING_FLASH_HELPERS") && r0->flash_ && r1->flash_ &&
                     enabled("STRATA_INKLING_FLASH_LEAN") && enabled("STRATA_INKLING_LANE_PROB") &&
                     !enabled("STRATA_INKLING_FLASH_H2")) {
@@ -1422,7 +1573,7 @@ void Inkling2::gpu_route_moe(Layer& L, int il, int n) {
         // STRATA_INKLING_MOE_GROUPED: the same words in a schedule that reads each distinct expert of a window once
         if (!(n == 1 ? (gu_r4 && kernels::inkling_gu_q4_0_r4((int) L.gu_type, gu, rr, n_embd_, 2 * n_ff_exp_, st_)) ||
                            kernels::native_mmvq_ids((int) L.gu_type, gu, rr, n_embd_, 2 * n_ff_exp_, st_)
-                     : kernels::inkling_gu_window((int) L.gu_type, gu, n, grp_ids_, st_)))
+                     : kernels::inkling_gu_window((int) L.gu_type, gu, n, grp_ids_, st_, moe_group_ballot_ && kExperts <= 128)))
             throw std::logic_error("Inkling grouped gate/up rejected a validated shape");
         situ_rows_q8_1(gpu_route_gu_, gpu_route_q8_, n_ff_exp_, rr, situ_.beta, situ_.linear_beta, st_, expert_scales(L, ids));
         const kernels::MmvqIds dn{table, ids, L.gu2(), gpu_route_q8_, kernels::native_q8_1_bytes(n_ff_exp_), 1, d_,
@@ -2380,7 +2531,7 @@ void Inkling2::attention(const Block& b, int n) {
     if (kv_helper_ && !swa) {
         using namespace inkling::kv_helpers;
         static_assert(kVisits / kBlock == kFullVisits && kKv / 2 == kOwnerKvHeads && kWindow == kTableRows &&
-                      kRelative == kRelativeWidth && kHead == kHeadWidth && kMaxRows < kStageRows);
+                      kRelative == kRelativeWidth && kHead == kHeadWidth && kMaxDecodeRows < kStageRows);
         const auto path = try_visit(*kv_helper_, a, visit_ / kBlock, chunks_, scores_,
                                     inkling::plain_score_floats(attend_tiles_), attq_);
         if (path == Visit::Offloaded) return;
@@ -2413,6 +2564,17 @@ void Inkling2::depth_mix(const float* query, float* dst, int first, int n) {
     m.x[depth_n_] = r_ + at;
     mix_kernel<<<n, kMixThreads, 0, cs(st_)>>>(m, depth_n_ + 1, query, dst);
 }
+
+#if defined(STRATA_HIP_GFX906)
+template<bool Ffn>
+void Inkling2::depth_mix_norm(const float* query, const float* weight, float* y, void* q, int n) {
+    MixInputs m{};
+    for (int i = 0; i < depth_n_; ++i) m.x[i] = depth_[i];
+    m.x[depth_n_] = r_;
+    const MixNormRows rows{{query}, {weight}, {y}, {q}};
+    fused_mix_norm<Ffn><<<n, kMixThreads, 0, cs(st_)>>>(m, depth_n_ + 1, rows, rms_eps_);
+}
+#endif
 
 void Inkling2::control(const Block& b, int il, int stream, float* in, int n, const float* shared_depth) {
     const size_t row = 2 * (size_t) (il - kStart) + (stream >= 2 ? 1 : 0);
@@ -2467,6 +2629,21 @@ bool Inkling2::heads(const Block& b, int il, bool swa, bool loop, int n, const D
         ms.query[i] = fp(b.aquery) + (swa ? 0 : i * kWidth);
         ms.out[i] = s3cur_ + i * w;
     }
+#if defined(STRATA_HIP_GFX906)
+    if (!loop && mix_rms_fuse_ && norm_q8_ && n <= 8) {
+        MixNormRows rs{};
+        const size_t wq = (size_t) n * kernels::native_q8_1_bytes(kWidth);
+        for (int i = 0; i < 3; ++i) {
+            rs.query[i] = ms.query[i];
+            rs.weight[i] = fp(*norm[i]);
+            rs.normalized[i] = s3in_ + i * w;
+            rs.quant[i] = (uint8_t*) s3q8_ + i * wq;
+        }
+        // Only the normalized FP32 and Q8_1 are live on the non-loop path.
+        fused_mix_norm<false><<<dim3(n, 3), kMixThreads, 0, cs(st_)>>>(m, depth_n_ + 1, rs, rms_eps_);
+        return true;
+    }
+#endif
     if (loop) {
         Control3 c{};
         F32Segments down;
@@ -2676,6 +2853,15 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
         }
 #endif
         for (int i = 0; i < streams; ++i) {
+#if defined(STRATA_HIP_GFX906)
+            if (mix_rms_fuse_ && norm_q8_ && n <= 8 && (streams == 1 || n == 1) && il != 0 && !loop &&
+                depth_n_ + 1 <= 5) {
+                void* q = i == 0 ? xq_ : i == 1 ? kq8_ : vq8_;
+                depth_mix_norm<false>(fp(b.aquery) + (swa ? 0 : i * kWidth), fp(*norm[i]), input_[i], q, n);
+                q8in = true;
+                continue;
+            }
+#endif
             if (il == 0) axpy(r_, 1.f, cur_, n * kWidth, false, st_);
             else if (!shared_depth) depth_mix(fp(b.aquery) + (swa ? 0 : i * kWidth), cur_, 0, n);
             if (loop) control(b, il, i, cur_, n, shared_depth);
@@ -2816,10 +3002,17 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
             depth_mix(fp(b.fquery), cur_, 0, n);
             control(b, il, 3, cur_, n);
         }
+#if defined(STRATA_HIP_GFX906)
+    } else if (mix_rms_fuse_ && n <= 8 && depth_n_ + 1 <= 5) {
+        depth_mix_norm<true>(fp(b.fquery), fp(L.ffn_norm), xn_, xq_, n);
+#endif
     } else {
         depth_mix(fp(b.fquery), cur_, 0, n);
     }
-    kernels::native_add_rms_norm_q8_1(cur_, nullptr, fp(L.ffn_norm), xn_, xq_, kWidth, n, rms_eps_, 128, st_);
+#if defined(STRATA_HIP_GFX906)
+    if (loop || !mix_rms_fuse_ || n > 8 || depth_n_ + 1 > 5)
+#endif
+        kernels::native_add_rms_norm_q8_1(cur_, nullptr, fp(L.ffn_norm), xn_, xq_, kWidth, n, rms_eps_, 128, st_);
     // with STRATA_INKLING_ROUTE_DUAL and one token, the router's gemv below also writes the host h_rl_ and h_x_,
     // and moe_router() launches no copy2 for them
     // The dual-store variant uses the same GEMV dot product, but its host copies are only needed by stock moe().

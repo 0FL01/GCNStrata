@@ -3763,6 +3763,49 @@ __device__ __forceinline__ void stage_q8_1_words(int* dst, const uint8_t* const*
 
 // Gate/up, 2304 -> 1152 Q4_0.  G: one CTA column per distinct expert (all its window columns, LDS n x 2592 B);
 // else one per pick (one column).  WARPS logical warps x TILE rows per CTA; each lane's five k steps unrolled.
+// Single wave, no LDS. For each bit of the 7-bit expert ID, a ballot partitions
+// the wave. Intersect the matching partitions to recover the exact pick mask.
+// Separate ballots capture the four bits of each leader's multiplicity. For
+// each lane this gives all greater-count leaders, and the equal-count leaders
+// whose first pick is earlier. Each pick then scatters its own position,
+// rather than making the leader serially scan and write up to eight positions.
+__global__ void __launch_bounds__(64) inkling_moe_group_ballot_kernel(const int32_t* __restrict__ ids, int rr,
+                                                         int32_t* __restrict__ g) {
+    const int lane = int(threadIdx.x);
+    const bool valid = lane < rr;
+    const int id = valid ? ids[lane] : 0;
+    using Mask = unsigned long long;
+    const Mask active = __ballot(valid);
+    Mask matches = active;
+#pragma unroll
+    for (int b = 0; b < 7; ++b) {
+        const bool bit = (id >> b) & 1;
+        const Mask ones = __ballot(bit);
+        matches &= bit ? ones : ~ones;
+    }
+    const int count = __popcll(matches);
+    const int first = __ffsll(matches) - 1;
+    const bool lead = valid && lane == first;
+    const Mask leaders = __ballot(lead);
+    Mask eq = leaders, gt = 0;
+#pragma unroll
+    for (int b = 3; b >= 0; --b) {
+        const bool bit = (count >> b) & 1;
+        const Mask ones = __ballot(bit);
+        gt |= bit ? 0 : eq & ones;
+        eq &= bit ? ones : ~ones;
+    }
+    if (valid) {
+        const Mask earlier_first = (1ull << first) - 1ull;
+        const int rank = __popcll(gt | (eq & earlier_first));
+        const int pos = __popcll(matches & ((1ull << lane) - 1ull));
+        int32_t* o = g + 1 + rank * kGroupStride;
+        if (lead) { o[0] = id; o[1] = count; }
+        o[2 + pos] = lane;
+    }
+    if (lane == 0) g[0] = __popcll(leaders);
+}
+
 template<int TILE, int WARPS, bool G, int MAX_C = kGroupCols>
 __global__ void __launch_bounds__(32 * WARPS) inkling_gu_q4_0_window_kernel(MmvqIds ids, const int32_t* __restrict__ g) {
     using F = Fmt<2>;
@@ -4184,7 +4227,7 @@ bool inkling_moe_mult_enabled() {
     return on;
 }
 
-bool inkling_gu_window(int t, const MmvqIds& gu, int n, int32_t* group, void* stream) {
+bool inkling_gu_window(int t, const MmvqIds& gu, int n, int32_t* group, void* stream, bool ballot) {
     const auto st = (cudaStream_t)stream;
     const int rr = n * kInklingGuPicks;
     if (t != 2 || n < 2 || n > kGroupCols || !gu.table || !gu.ids || !gu.x || !gu.y || gu.offset != 0 ||
@@ -4192,7 +4235,9 @@ bool inkling_gu_window(int t, const MmvqIds& gu, int n, int32_t* group, void* st
         gu.y_stride != kInklingGuOut || !group)
         return false;
     const bool mult = inkling_moe_mult_enabled();
-    if (mult) inkling_moe_group_heavy_kernel<<<1, kGroupMaxPicks, 0, st>>>(gu.ids, rr, group);
+    if (mult && ballot && rr <= kGroupMaxPicks)
+        inkling_moe_group_ballot_kernel<<<1, kGroupMaxPicks, 0, st>>>(gu.ids, rr, group);
+    else if (mult) inkling_moe_group_heavy_kernel<<<1, kGroupMaxPicks, 0, st>>>(gu.ids, rr, group);
     else inkling_moe_group_kernel<<<1, kGroupMaxPicks, 0, st>>>(gu.ids, rr, group);
     check("Inkling window expert groups");
     const size_t col_bytes = kInklingGuBlocks * sizeof(block_q8_1);

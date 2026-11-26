@@ -151,6 +151,12 @@ private:
     bool kv_stored_ = false;   // layer_head() stored the decode row's K and V (heads_kv_kernel) for attention()
     bool heads_kv_rows_ = false;   // STRATA_INKLING_HEADS_KV_ROWS=1: fuse conv2 + head_norms + store2_q8 for windows
     bool q4_0_dense_cols_ = false; // STRATA_INKLING_Q4_0_DENSE_COLS=1: grouped multi-row Q4_0 dense projections
+#if defined(STRATA_HIP_GFX906)
+    bool mix_rms_fuse_ = false;
+    bool moe_group_ballot_ = false;
+    template<bool Ffn>
+    void depth_mix_norm(const float* query, const float* weight, float* y, void* q, int n);
+#endif
     bool mix_ctrl_fuse_ = false;   // STRATA_INKLING_MIX_CTRL_FUSE=1: fuse depth_mix + control_in on loop visits
     bool kvproj_fuse_ = false;     // STRATA_GEMV_ROWS_SHARED_OPT=1: fuse kproj + vproj into one 2-segment GEMV
     bool df_fast_ = false;         // STRATA_DFLASH2_FAST=1: fused DFlash2 quantize/conv/swiglu and L8/R2 gemv8

@@ -99,6 +99,8 @@ void native_q4_k_mmvq(const void* weights, const void* x_q8_1, float* y,
 void native_q4_k_f32(const void* weights, const float* x, void* scratch_q8_1,
                      float* y, int n_in, int n_out, int ncols, void* stream);
 
+// gfx906 K=2304, T=2..8: STRATA_INKLING_Q6_K_COLS=1/2 hoists each weight decode across T,
+// using R=1/2 output rows per wave. Unset, other shapes, and T1 keep the stock dispatch.
 void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
                       int n_in, int n_out, int ncols, void* stream);
 
@@ -231,7 +233,10 @@ bool inkling_down_sum(int ggml_type, const MmvqIds& ids, const float* weights, f
 // equals inkling_gu_q4_0_r4 / the slots kernel and inkling_down_sum.  inkling_gu_window (n >= 2) also writes the
 // window's distinct-expert table to group (1 + 64 * 10 ints), which inkling_down_window reads (n >= 2; part: 8n x
 // 2304 floats).  inkling_down_window with n == 1 is inkling_down_sum with its activations staged in LDS.
-bool inkling_gu_window(int ggml_type, const MmvqIds& gu, int n, std::int32_t* group, void* stream);
+// ballot replaces only the heavy-first grouping; caller guarantees gfx906 wave64, at most 128 experts,
+// and no repeated expert within a token's top eight.
+bool inkling_gu_window(int ggml_type, const MmvqIds& gu, int n, std::int32_t* group, void* stream,
+                       bool ballot = false);
 bool inkling_down_window(int ggml_type, const MmvqIds& down, int n, const float* weights, float* fo, float* part,
                          const std::int32_t* group, void* stream);
 #endif

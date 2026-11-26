@@ -9,7 +9,8 @@
 
 namespace strata::poly::inkling::kv_helpers {
 
-inline constexpr int kFullVisits = 8, kOwnerKvHeads = 4, kHalfKvHeads = 2, kMaxRows = 4;
+inline constexpr int kFullVisits = 8, kOwnerKvHeads = 4, kHalfKvHeads = 2;
+inline constexpr int kDefaultDecodeRows = 4, kMaxDecodeRows = 8;
 inline constexpr int kHeadWidth = 128, kQueriesPerKv = 3, kRelativeWidth = 16, kTableRows = 1024;
 inline constexpr int kQ8BlockValues = 32, kQ81BlockBytes = 36;
 
@@ -18,7 +19,8 @@ struct FreeMirror { void operator()(Mirror*) const noexcept; };
 using MirrorPtr = std::unique_ptr<Mirror, FreeMirror>;
 
 // Either both links are usable and both mirrors are allocated, or setup throws before either rank uses one.
-std::array<MirrorPtr, 2> create_pair(int capacity, std::array<cudaStream_t, 2> owner_streams);
+std::array<MirrorPtr, 2> create_pair(int capacity, std::array<cudaStream_t, 2> owner_streams,
+                                    bool wide_decode);
 // Optional disposable packet per helper. No replica validity or checkpoint semantics for prompt rows.
 void enable_flash_rows(std::array<MirrorPtr, 2>& mirrors);
 bool try_flash_rows(Mirror& mirror, const Attend& a);
@@ -33,8 +35,10 @@ Visit try_visit(Mirror& mirror, const Attend& a, int slot, float* partial, float
 void join_seed(Mirror& mirror);
 
 // Shared factored kernels and stock combine: two groups, stride 4 in the owner's buffers or 2 in a compact mirror.
-size_t half_decode_floats();
-void attend_decode_half(const Attend& a, float* partial, float* scores, void* q8, cudaStream_t stream);
+size_t half_decode_floats(int rows);
+// score_rows=0 means the score slab fits every row. A smaller slab is reused in order on the same stream.
+void attend_decode_half(const Attend& a, float* partial, float* scores, void* q8, cudaStream_t stream,
+                        int score_rows = 0);
 
 }  // namespace strata::poly::inkling::kv_helpers
 #endif

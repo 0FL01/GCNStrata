@@ -1897,6 +1897,153 @@ __global__ void native_mmvq_wave_kernel(const typename F::Block* __restrict__ w,
         }
 }
 
+constexpr int kQ6HoistK = 2304, kQ6HoistNb = kQ6HoistK / QK, kQ6HoistNx = kQ6HoistK / Q8K;
+static_assert(kQ6HoistNx * sizeof(Q81Block) % sizeof(int4) == 0);
+
+// The 210 B stride alternates 0/2 mod 4. Copy one dword without assuming
+// 4-byte alignment or reading beyond the block. ROCm selects the legal load
+// for the target rather than us casting the odd block to int*.
+__device__ __forceinline__ uint32_t load_q6_word(const void* p) {
+    uint32_t v;
+    __builtin_memcpy(&v, __builtin_assume_aligned(p, 2), sizeof(v));
+    return v;
+}
+
+struct Q6HoistW { int vi0, vi1, sc0, sc1; float d; };
+struct Q6HoistX { int u0, u1; float dx0, dx1; };
+
+__device__ __forceinline__ int q6_signed_word(uint32_t codes) {
+    // All four bytes are in [0,63]. No saturation is possible. Force each
+    // byte's top bit to prevent a cross-byte borrow, then restore it.
+    return int(((codes | 0x80808080u) - 0x20202020u) ^ 0x80808080u);
+}
+
+__device__ __forceinline__ Q6HoistW q6_hoist_w(const Q6KBlock* w, int q) {
+    const int hi = 8 * (q / 16) + q % 8;
+    const int sc = 8 * (q / 16) + (q % 16) / 4;
+    const uint32_t vl = load_q6_word(w->ql + 4 * q);
+    const uint32_t vh = load_q6_word(w->qh + 4 * hi) >> (2 * ((q % 16) / 8));
+    return {
+        q6_signed_word((vl & 0x0f0f0f0fu) | ((vh << 4) & 0x30303030u)),
+        q6_signed_word(((vl >> 4) & 0x0f0f0f0fu) | (vh & 0x30303030u)),
+        w->scales[sc], w->scales[sc + 4], __half2float(w->d),
+    };
+}
+
+__device__ __forceinline__ Q6HoistX q6_hoist_x(const Q81Block* x, int q) {
+    const Q81Block* a = x + 4 * (q / 16) + (q % 16) / 8;
+    int u0, u1;
+    __builtin_memcpy(&u0, __builtin_assume_aligned(a[0].qs + 4 * (q % 8), 4), sizeof(u0));
+    __builtin_memcpy(&u1, __builtin_assume_aligned(a[2].qs + 4 * (q % 8), 4), sizeof(u1));
+    return {u0, u1, __low2float(a[0].ds), __low2float(a[2].ds)};
+}
+
+__device__ __forceinline__ float q6_hoist_dot(const Q6HoistW& w, const Q6HoistX& x) {
+#if defined(__gfx906__)
+    const int p0 = __builtin_amdgcn_sdot4(w.vi0, x.u0, 0, false) * w.sc0;
+    const int p1 = __builtin_amdgcn_sdot4(w.vi1, x.u1, 0, false) * w.sc1;
+#else
+    const int p0 = STRATA_DP4A(w.vi0, x.u0, 0) * w.sc0;
+    const int p1 = STRATA_DP4A(w.vi1, x.u1, 0) * w.sc1;
+#endif
+    // Match q6_q8_dot_impl's FP expression boundaries, including +0.0f.
+    float sumf = 0.0f;
+    sumf += x.dx0 * p0;
+    sumf += x.dx1 * p1;
+    return w.d * sumf;
+}
+
+// R counts *output weight rows per wave*, T counts verifier token rows. Stock
+// R1 already shares its raw loads across T and stages LDS. Here the decoded
+// signed packed bytes and the scales stay live across T; x/u/ds loads are
+// issued once per token and reused across R. Each lane still accumulates K
+// blocks lane/32, lane/32+2, ... then executes the stock XOR(32,16,...,1).
+template<int T, int R>
+__global__ void __launch_bounds__(256) q6k_hoist_lds(const Q6KBlock* __restrict__ w,
+                                                     const Q81Block* __restrict__ xg,
+                                                     float* __restrict__ y, int n) {
+    constexpr int stage = T * kQ6HoistNx * sizeof(Q81Block) / sizeof(int4);
+    __shared__ int4 sx[stage];
+    const int tid = int(threadIdx.x);
+    for (int i = tid; i < stage; i += 256) sx[i] = reinterpret_cast<const int4*>(xg)[i];
+    __syncthreads();
+
+    const int lane = tid & 63, q = lane % 32;
+    const int row0 = (int(blockIdx.x) * 4 + (tid >> 6)) * R;
+    if (row0 >= n) return;  // wave-uniform; only after the staging barrier
+    const Q81Block* x = reinterpret_cast<const Q81Block*>(sx);
+    const Q6KBlock* w0 = w + std::size_t(row0) * kQ6HoistNb;
+    const bool has_row1 = row0 + 1 < n;
+    // For the odd LM-head tail, alias the valid row (no OOB loads). Only the
+    // last partial wave can do redundant work; y for that row is never stored.
+    const Q6KBlock* w1 = w0 + (has_row1 ? kQ6HoistNb : 0);
+    float tmp[T][R] = {};
+#pragma unroll 1
+    for (int kb = lane / 32; kb < kQ6HoistNb; kb += 2) {
+        const Q6HoistW a = q6_hoist_w(w0 + kb, q);
+        Q6HoistW b{};
+        if constexpr (R == 2) b = q6_hoist_w(w1 + kb, q);
+#pragma unroll
+        for (int t = 0; t < T; ++t) {
+            const Q6HoistX u = q6_hoist_x(x + t * kQ6HoistNx + kb * 8, q);
+            tmp[t][0] += q6_hoist_dot(a, u);
+            if constexpr (R == 2) tmp[t][1] += q6_hoist_dot(b, u);
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+#pragma unroll
+        for (int r = 0; r < R; ++r) {
+            float v = tmp[t][r];
+#pragma unroll
+            for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+            if (lane == 0 && (r == 0 || has_row1)) y[std::size_t(t) * n + row0 + r] = v;
+        }
+    }
+}
+
+template<int R>
+void launch_q6k_hoist_lds(const void* weights, const void* x, float* y, int n_out, int ncols, void* stream) {
+    const auto* w = static_cast<const Q6KBlock*>(weights);
+    const auto* q = static_cast<const Q81Block*>(x);
+    const auto st = static_cast<cudaStream_t>(stream);
+    const int grid = (n_out - 1) / (4 * R) + 1;
+    switch (ncols) {
+    case 2: q6k_hoist_lds<2, R><<<grid, 256, 0, st>>>(w, q, y, n_out); break;
+    case 3: q6k_hoist_lds<3, R><<<grid, 256, 0, st>>>(w, q, y, n_out); break;
+    case 4: q6k_hoist_lds<4, R><<<grid, 256, 0, st>>>(w, q, y, n_out); break;
+    case 5: q6k_hoist_lds<5, R><<<grid, 256, 0, st>>>(w, q, y, n_out); break;
+    case 6: q6k_hoist_lds<6, R><<<grid, 256, 0, st>>>(w, q, y, n_out); break;
+    case 7: q6k_hoist_lds<7, R><<<grid, 256, 0, st>>>(w, q, y, n_out); break;
+    case 8: q6k_hoist_lds<8, R><<<grid, 256, 0, st>>>(w, q, y, n_out); break;
+    }
+}
+
+// Both Inkling projections (including project_cols's lin fallback) and the target head
+// use the same native Q6_K entry point. Keep T1, packed weights and other shapes stock.
+bool try_q6k_hoist_lds(const void* w, const void* x, float* y, int n_in, int n_out, int ncols, void* stream) {
+    static const int r = [] {
+        const char* e = std::getenv("STRATA_INKLING_Q6_K_COLS");
+        return e && (e[0] == '1' || e[0] == '2') && !e[1] ? e[0] - '0' : 0;
+    }();
+    if (!r || g_wave_off || n_in != kQ6HoistK || ncols < 2 || ncols > 8 ||
+        reinterpret_cast<std::uintptr_t>(x) % sizeof(int4)) return false;
+    int device = -1;
+    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    static thread_local int last_device = -1;
+    static thread_local bool arch_ok = false;
+    if (device != last_device) {
+        cudaDeviceProp p{};
+        if (cudaGetDeviceProperties(&p, device) != cudaSuccess) return false;
+        arch_ok = p.warpSize == 64 && gfx_arch_is(p.gcnArchName, "gfx906");
+        last_device = device;
+    }
+    if (!arch_ok) return false;
+    if (r == 2) launch_q6k_hoist_lds<2>(w, x, y, n_out, ncols, stream);
+    else launch_q6k_hoist_lds<1>(w, x, y, n_out, ncols, stream);
+    return true;
+}
+
 // STRATA_MMVQ_WAVE_LDS=1: native_mmvq_wave_kernel for 2..8 columns with the columns' Q8_1 activations staged in
 // LDS once per block.  The same rows, lanes, loads, applies and butterfly: every output word is the stock kernel's.
 // The stock kernel re-read each column's activation block through L1/L2 for every weight row it applied it to.
@@ -3100,6 +3247,10 @@ void native_q6_k_mmvq(const void* weights, const void* x_q8_1, float* y,
     validate_pointer(y);
     validate_stream(stream);
 #if defined(STRATA_HIP_GFX906)
+    if (try_q6k_hoist_lds(weights, x_q8_1, y, n_in, n_out, ncols, stream)) {
+        launch_check();
+        return;
+    }
     if (!g_wave_off && n_in == 2560 && n_out >= 32768) {
         // (mb/q6head.hip on MI50: R2 at 1 / 3 / 4 columns, R4 at 2; 5..8 columns slower than the R1 kernel: kept)
         if (ncols <= 4 && q6_head_x()) {

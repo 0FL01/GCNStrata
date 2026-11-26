@@ -1246,24 +1246,39 @@ void attend_plain(const Attend& a, float* scores, float* partial, int tiles, cud
 size_t decode_floats() { return (size_t) kDecodeBlocks * kChunkFloats; }
 
 #if defined(STRATA_HIP_GFX906)
-size_t kv_helpers::half_decode_floats() {
-    return size_t(kMaxRows) * kHalfKvHeads * kFactoredTargetChunks * kChunkFloats;
+size_t kv_helpers::half_decode_floats(int rows) {
+    static_assert(kMaxDecodeRows * kOwnerKvHeads * kFactoredTargetChunks <= kDecodeBlocks);
+    return size_t(rows) * kHalfKvHeads * kFactoredTargetChunks * kChunkFloats;
 }
 
-void kv_helpers::attend_decode_half(const Attend& a, float* partial, float* scores, void* q8, cudaStream_t st) {
+void kv_helpers::attend_decode_half(const Attend& a, float* partial, float* scores, void* q8, cudaStream_t st,
+                                    int score_rows) {
     static_assert(sizeof(Q81) == kQ81BlockBytes && kRelative == kRelativeWidth && kExtent == kTableRows &&
                   kHead == kHeadWidth && kGroup == kQueriesPerKv);
     const int span = static_cast<int>(a.pos + a.n);
     const int chunk = factored_chunk(span), chunks = div_up(span, chunk), packet = a.n <= 2 ? 16 : chunk;
-    const int pitch = row_chunks() ? row_pitch(a.pos, 0, a.n, chunks) : 0;
+    // W8 must keep each row's T1 partition even at a chunk boundary. For stock widths keep the existing knob.
+    const int pitch = (a.n > kDefaultDecodeRows || row_chunks()) ? row_pitch(a.pos, 0, a.n, chunks) : 0;
+    const int batch = score_rows > 0 ? score_rows : a.n;
     const auto run = [&]<int Stride>() {
-        constexpr int threads = 32 * kHalfKvHeads;
-        decode_q8_score_kernel<Stride><<<dim3(div_up(span, packet), a.n), threads, 0, st>>>(
-            a.q, a.rel, a.table, a.k, a.pos, 0, 0, packet, span, scores);
+        constexpr int threads = 32 * kHalfKvHeads, heads = Stride * kGroup;
+        // Only the score slab is batched. Reuse the full-call span/packet/pitch and keep partials in row order
+        // for the same combine. In particular a sub-batch's last row does not choose a new chunk tree.
+        for (int row = 0; row < a.n; row += batch) {
+            const int n = std::min(batch, a.n - row);
+            decode_q8_score_kernel<Stride><<<dim3(div_up(span, packet), n), threads, 0, st>>>(
+                a.q + size_t(row) * heads * kHead, a.rel + size_t(row) * heads * kRelative,
+                a.table, a.k, a.pos + row, 0, 0, packet, span, scores);
+            float* part = partial + size_t(row) * Stride * (pitch ? pitch : chunks) * kChunkFloats;
+            if (pitch)
+                decode_q8_value_rows_kernel<Stride><<<dim3(pitch, n), threads, 0, st>>>(
+                    a.v, a.pos + row, 0, 0, pitch, scores, span, part);
+            else
+                decode_q8_value_kernel<Stride><<<dim3(chunks, n), threads, 0, st>>>(
+                    a.v, a.pos + row, 0, 0, chunk, scores, span, part);
+        }
         const bool par = combine_par_enabled();
         if (pitch) {
-            decode_q8_value_rows_kernel<Stride><<<dim3(pitch, a.n), threads, 0, st>>>(
-                a.v, a.pos, 0, 0, pitch, scores, span, partial);
             if (par)
                 decode_combine_rows_kernel<Stride, true><<<dim3(kHalfKvHeads * kGroup, a.n), kHead, 0, st>>>(
                     partial, pitch, a.pos, 0, a.sink, a.gate, a.out, static_cast<Q81*>(q8));
@@ -1272,8 +1287,6 @@ void kv_helpers::attend_decode_half(const Attend& a, float* partial, float* scor
                     partial, pitch, a.pos, 0, a.sink, a.gate, a.out, static_cast<Q81*>(q8));
             return;
         }
-        decode_q8_value_kernel<Stride><<<dim3(chunks, a.n), threads, 0, st>>>(
-            a.v, a.pos, 0, 0, chunk, scores, span, partial);
         if (par)
             decode_combine_kernel<Stride, true><<<dim3(kHalfKvHeads * kGroup, a.n), kHead, 0, st>>>(
                 partial, chunks, a.sink, a.gate, a.out, static_cast<Q81*>(q8));
