@@ -26,6 +26,10 @@ public:
     bool sees() const override { return true; }
 #if defined(STRATA_HIP_GFX906)
     void request_budget(int64_t prompt_rows, int64_t max_new) override;
+    bool kv_prefix_tags() const override { return mirror_tagging_; }
+    void set_kv_prefix_tag(uint64_t tag, int64_t preserved) override;
+    void on_keep_rows(int64_t end) override;
+    LogitShards project_target_shards(const float* h, int rows, bool window) override;
 #endif
     size_t card_row_bytes() const override;
     void save_card_rows(int64_t first, int64_t n, uint8_t* dst) override;
@@ -42,6 +46,8 @@ protected:
 #endif
     void on_loaded() override;
     void on_reset() override;
+    void before_state_access() override;
+    bool draft_independent_of_model_stream() const override { return decode_async_keep_ && df_gpu23_; }
     void on_keep_snap(size_t snap_idx) override;
     Dev load_output_matrix(const TensorInfo* t, int64_t file_vocab) override;
     void project_logits(const float* h, float* out, int rows) override;
@@ -90,13 +96,14 @@ private:
     int conv_floats_ = kConvFloats;
     std::shared_ptr<Tp2Comm> tp2_;
     std::unique_ptr<Inkling2> peer_;
-    enum class PeerCmd { kIdle, kRunVisits, kRunGpuVisits, kLogits, kKeepSnap, kReset, kStop, kDraftHead };
+    enum class PeerCmd { kIdle, kRunVisits, kRunGpuVisits, kLogits, kLogitShards, kKeepSnap, kReset, kStop, kDraftHead };
     int tp2_vocab_lo_ = 0, tp2_vocab_n_ = 0;
     float *tp2_logits_half_ = nullptr, *tp2_logits_peer_ = nullptr;
     std::thread peer_thread_;
     std::mutex peer_mu_;
     std::condition_variable peer_cv_;
-    PeerCmd peer_cmd_ = PeerCmd::kIdle;
+    std::atomic<PeerCmd> peer_cmd_{PeerCmd::kIdle};
+    bool decode_async_keep_ = false, peer_pending_keep_ = false;
     int peer_arg_n_ = 0;
     size_t peer_arg_snap_ = 0;
     bool peer_done_ = true;
@@ -125,6 +132,12 @@ private:
     bool compact_swa_asked_ = false;
     int swa_stage_rows_ = 0;   // positive only when the stage fits in input_[0]
     inkling::kv_helpers::MirrorPtr kv_helper_;
+    bool mirror_tagging_ = false;
+    struct HeadPair;
+    std::unique_ptr<HeadPair> head_pair_;
+    static std::unique_ptr<HeadPair> init_head_pair(Inkling2& owner, int rows);
+    void enqueue_head_pair(const float* h, int rows, bool window);
+    void sync_head_pair();
     // Phase-Adaptive Co-Resident DualTP (STRATA_INKLING_PHASE_DUALTP=24): canonical GPU0/1 owns full
     // state, decode, DFlash2 and KV helpers; co-resident Stage B on GPU2/3 owns blocks 6..23 / visits [24,48)
     // and accelerates multi-chunk reads with staggered cut-24 packets and async KV delta return.
@@ -200,6 +213,7 @@ private:
     bool mix_ctrl_fuse_ = false;   // STRATA_INKLING_MIX_CTRL_FUSE=1: fuse depth_mix + control_in on loop visits
     bool kvproj_fuse_ = false;     // STRATA_GEMV_ROWS_SHARED_OPT=1: fuse kproj + vproj into one 2-segment GEMV
     bool df_fast_ = false;         // STRATA_DFLASH2_FAST=1: fused DFlash2 quantize/conv/swiglu and L8/R2 gemv8
+    size_t score_floats_ = 0;
     void* attq_ = nullptr;  // the attention's output as Q8_1 (attend_decode()), for the output projection
     void *kq8_ = nullptr, *vq8_ = nullptr;   // K's and V's own inputs as Q8_1 (project())
     // heads(): the three streams' current rows, messages, norm pairs, ranks, normed inputs (one after the other)

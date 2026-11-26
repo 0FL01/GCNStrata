@@ -187,6 +187,7 @@ struct Mirror {
     const hipStream_t model_stream;
     bool used = false, long_answer = false;
     std::array<int, kFullVisits> valid{};
+    uint64_t active_tag = 0, mirror_tag = 0;
     std::array<bool, kFullVisits> table_ready{};
     Word *send = nullptr, *seed = nullptr, *receive = nullptr, *packet = nullptr, *answer = nullptr, *kv = nullptr;
     float *tables = nullptr, *partial = nullptr, *scores = nullptr;
@@ -267,8 +268,34 @@ std::array<MirrorPtr, 2> create_pair(int capacity, std::array<cudaStream_t, 2> o
 }
 
 void invalidate(Mirror& mirror, int64_t first) {
+    if (mirror.active_tag != mirror.mirror_tag) return;
     for (int& end : mirror.valid) end = static_cast<int>(std::min<int64_t>(end, first));
 }
+
+void set_prefix_tag(Mirror& m, uint64_t tag, int64_t preserved) {
+    m.active_tag = tag;
+    invalidate(m, preserved);
+}
+
+void invalidate_state(Mirror& m, int64_t first) {
+    // A raw state change can't authenticate a lineage. The conversation cache detaches before raw loads, then
+    // reattaches the verified prefix. Direct callers instead lose the active lineage, but not a parked one.
+    invalidate(m, m.active_tag ? 0 : first);
+    m.active_tag = 0;
+}
+
+static int valid_before_write(Mirror& m, int slot, int pos) {
+    if (m.active_tag != m.mirror_tag) return 0;
+    return m.valid[slot] = std::min(m.valid[slot], pos);
+}
+
+static void claim_mirror(Mirror& m) {
+    if (m.active_tag != m.mirror_tag) {
+        m.mirror_tag = m.active_tag;
+        m.valid.fill(0);
+    }
+}
+
 
 namespace {
 constexpr int kBulkHalf = 1024, kBulkQ = kOwnerKvHeads * kQueriesPerKv * kHeadWidth;
@@ -341,11 +368,12 @@ void enable_flash_mirror(std::array<MirrorPtr, 2>& mirrors) {
 void seed_slot(Mirror& m, int slot, KvView k, KvView v, const float* table, int src_device, int end_row) {
     if (!m.mirror_flash || slot < 0 || slot >= kFullVisits || end_row <= 0 || end_row > m.capacity ||
         !k.scales || !v.scales) return;
-    const int start = m.valid[slot];
+    const int start = m.active_tag == m.mirror_tag ? m.valid[slot] : 0;
     if (start >= end_row && m.table_ready[slot]) return;
     int prev = 0;
     check(hipGetDevice(&prev), "seed_slot getDevice");
     RestoreDevice restore(prev);
+    claim_mirror(m);
     m.used = true;
     const OwnerPlanes src{{nullptr, nullptr, nullptr, nullptr,
                            reinterpret_cast<const Word*>(k.data), reinterpret_cast<const Word*>(v.data),
@@ -404,8 +432,7 @@ bool try_flash_mirror(Mirror& m, const Attend& a, int slot) {
         a.pos > m.capacity - a.n)
         return false;
     const int pos = static_cast<int>(a.pos), rows = a.n, end = pos + rows;
-    int& valid = m.valid[slot];
-    valid = std::min(valid, pos);
+    const int valid = valid_before_write(m, slot, pos);
     const int max_catchup = (rows >= 1024) ? 32768 : 4096;
     if (pos - valid > max_catchup) return false;
 
@@ -413,6 +440,7 @@ bool try_flash_mirror(Mirror& m, const Attend& a, int slot) {
     check(hipGetDevice(&current), "flash mirror getDevice");
     if (current != m.owner.device) throw std::logic_error("Inkling flash mirror called on wrong TP2 owner");
     RestoreDevice restore(current);
+    claim_mirror(m);
     m.used = true;
     const bool use_h1 = (rows <= 256);
     try {
@@ -479,7 +507,7 @@ bool try_flash_mirror(Mirror& m, const Attend& a, int slot) {
             m.mirror_recv, reinterpret_cast<Word*>(a.out), rows);
         check(hipGetLastError(), "mirror unpack answer");
         m.table_ready[slot] = true;
-        valid = end;
+        m.valid[slot] = end;
         return true;
     } catch (...) {
         m.owner.wait(m.owner.stream);
@@ -556,10 +584,9 @@ Visit try_visit(Mirror& m, const Attend& a, int slot, float* partial, float* sco
         slot < 0 || slot >= kFullVisits || a.n <= 0 || a.pos < 0 || a.pos > m.capacity - a.n)
         return Visit::Local;
     const int pos = static_cast<int>(a.pos), rows = a.n, end = pos + rows;
-    int& valid = m.valid[slot];
     // keep() may accept only a prefix, or replay the tail after a snap. New owner stores supersede any provisional
     // suffix, even on a call that will run locally. Catch-up always starts from the remaining contiguous prefix.
-    valid = std::min(valid, pos);
+    const int valid = valid_before_write(m, slot, pos);
     // A short request still trims provisional rows above. Do not seed its prefix, or recopy a long missing
     // prefix after restore. A continuous long read reaches the preseed crossing with at most 32K rows missing.
     const int min_pos = kv_helper_min_pos();
@@ -581,6 +608,7 @@ Visit try_visit(Mirror& m, const Attend& a, int slot, float* partial, float* sco
     check(hipGetDevice(&current), "get KV helper visit device");
     if (current != m.owner.device) throw std::logic_error("Inkling KV helper called on the wrong TP2 owner");
     RestoreDevice restore(current);
+    claim_mirror(m);
     m.used = true;
     try {
         const OwnerPlanes src{{reinterpret_cast<const Word*>(a.q), reinterpret_cast<const Word*>(a.rel),
@@ -608,7 +636,7 @@ Visit try_visit(Mirror& m, const Attend& a, int slot, float* partial, float* sco
         }
         if (preseed) {
             check(hipEventRecord(m.owner.sent, comm), "record KV helper seed sent");
-            valid = seed_to;
+            m.valid[slot] = seed_to;
             return Visit::Seeding;
         }
 
@@ -647,7 +675,7 @@ Visit try_visit(Mirror& m, const Attend& a, int slot, float* partial, float* sco
             m.receive, reinterpret_cast<Word*>(a.out), static_cast<Word*>(q8), rows);
         check(hipGetLastError(), "unpack KV helper answer");
         m.table_ready[slot] = true;
-        valid = end;
+        m.valid[slot] = end;
         return Visit::Offloaded;
     } catch (...) {
         // Never silently fall back after launching half an attention pass. Drain any in-flight transfers before

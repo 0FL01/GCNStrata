@@ -43,7 +43,9 @@ template<class E>
 class Conversations {
 public:
     Conversations(E& engine, CacheOptions o)
-        : e_(engine), o_(std::move(o)), slots_((size_t) std::max(o_.park_slots, 0) + 1) {}
+        : e_(engine), o_(std::move(o)), slots_((size_t) std::max(o_.park_slots, 0) + 1) {
+        if constexpr (requires { e_.kv_prefix_tags(); }) prefix_tags_ = e_.kv_prefix_tags();
+    }
 
     /// The tokens the engine has read.
     const std::vector<int32_t>& seq() const { return slots_[cur_].seq; }
@@ -63,13 +65,19 @@ public:
             // nothing kept starts like this
             if (!cur().seq.empty() && park(slots_.size())) cur_ = take(cur_);
             slots_[cur_] = Slot{};
+            set_prefix(0, 0);
             e_.reset();
         } else if (best != cur_ || at < len(cur())) {
             if (best != cur_) enter(best, at);
             // The conversation is left at `at`.  If the prompt the client sent for it went on from there, the
             // client may send that again, so the conversation is parked and this one goes on in a copy.
             if (same >= cur().prompt || !branch(at)) cut(cur(), at);
+            set_prefix(0, 0);
             e_.load_state(state_at(cur(), at), at);
+        }
+        if (prefix_tags_) {
+            if (!cur().tag) cur().tag = ++last_tag_;
+            set_prefix(cur().tag, at);
         }
         cur().stamp = clock_;
         return at;
@@ -152,6 +160,7 @@ public:
     int64_t rewind() {
         due_.clear();
         Slot& s = cur();
+        set_prefix(0, 0);
         if (s.marks.empty()) {
             slots_[cur_] = Slot{};
             e_.reset();
@@ -160,12 +169,14 @@ public:
         const int64_t at = s.marks.back().pos;
         cut(s, at);
         e_.load_state(s.marks.back().state->data(), at);
+        set_prefix(s.tag, at);
         return at;
     }
     /// The first n tokens of the conversation are the prompt the client sent.
     void prompt_was(int64_t n) { cur().prompt = std::min(n, len(cur())); }
     /// After an engine error: the conversation being read is lost.  The caller resets the engine.
     void drop() {
+        set_prefix(0, 0);
         slots_[cur_] = Slot{};
         due_.clear();
     }
@@ -175,6 +186,7 @@ public:
     void leave() {
         if (!cur().seq.empty() && park(slots_.size())) cur_ = take(cur_);
         slots_[cur_] = Slot{};
+        set_prefix(0, 0);
         due_.clear();
     }
     /// The engine holds `seq` now, with the state at its end: a prompt that goes on from there reads none of it.
@@ -184,6 +196,10 @@ public:
         s.seq = std::move(seq);
         s.prompt = len(s);
         s.stamp = ++clock_;
+        if (prefix_tags_) {
+            s.tag = ++last_tag_;
+            set_prefix(s.tag, len(s));
+        }
     }
 
     /// Between requests: what the parked conversations hold leaves the process.  On the laptop four parked
@@ -223,10 +239,18 @@ private:
         std::vector<Checkpoint> marks;  // by position
         std::vector<Rows> rows;         // back to back from row 0; a parked conversation has all of its rows
         uint64_t stamp = 0;
+        uint64_t tag = 0;   // a lineage, never copied to a diverging branch or recycled when a slot is evicted
     };
     struct Held {
         size_t count = 0, bytes = 0;
     };
+
+    // A tag is only reattached after exact token-prefix matching and successful restoration of the canonical rows.
+    // Detaching before a reset or load keeps that mirror parked without trusting the bytes being loaded.
+    void set_prefix(uint64_t tag, int64_t n) {
+        if constexpr (requires { e_.set_kv_prefix_tag(tag, n); })
+            if (prefix_tags_) e_.set_kv_prefix_tag(tag, n);
+    }
 
     Slot& cur() { return slots_[cur_]; }
     const Slot& cur() const { return slots_[cur_]; }
@@ -384,6 +408,7 @@ private:
             if (in.rows[k].keep != cur().rows[k].keep) break;
         }
         if (cur().seq.empty() || !park(i)) slots_[cur_] = Slot{};
+        set_prefix(0, 0);
         for (const Rows& r : in.rows) {
             const int64_t a = std::max(r.first, have), b = std::min(r.first + r.keep, need);
             if (a < b) e_.load_rows(r.blob->data(), r.first, r.count, a, b - a);
@@ -423,6 +448,8 @@ private:
 
     E& e_;
     CacheOptions o_;
+    bool prefix_tags_ = false;
+    uint64_t last_tag_ = 0;
     std::vector<Slot> slots_;   // the current conversation and the parked ones
     size_t cur_ = 0;
     uint64_t clock_ = 0;

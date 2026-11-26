@@ -2008,6 +2008,32 @@ void Engine::project_logits(const float* h, float* out, int rows) {
     lin(output_, h, out, rows);
 }
 
+LogitShards Engine::logits_view() const {
+    if (next_) return next_->logits_view();
+    return last_shards_.split() ? last_shards_ : LogitShards(h_logits_, n_vocab_);
+}
+
+LogitShards Engine::logits_view_of(int i) const {
+    if (next_) return next_->logits_view_of(i);
+    if (!window_shards_.split()) return {h_wlogits_ + (size_t) i * n_vocab_, n_vocab_};
+    LogitShards row = window_shards_;
+    for (size_t j = 0; j < row.ptr.size(); ++j) row.ptr[j] += (size_t) i * row.len[j];
+    return row;
+}
+
+const float* Engine::logits() const {
+    if (next_) return next_->logits();
+    if (last_shards_.split()) last_shards_.copy(0, n_vocab_, h_logits_);
+    return h_logits_;
+}
+
+const float* Engine::logits_of(int i) const {
+    if (next_) return next_->logits_of(i);
+    float* dst = h_wlogits_ + (size_t) i * n_vocab_;
+    if (window_shards_.split()) logits_view_of(i).copy(0, n_vocab_, dst);
+    return dst;
+}
+
 int64_t Engine::vram_free_mib() const {
     OnCard here(device_, split_);
     size_t free_b = 0, total_b = 0;
@@ -3444,6 +3470,7 @@ void Engine::save_profile() const {
 }
 
 void Engine::reset() {
+    before_state_access();
     OnCard here(device_, split_);
     ck(cudaMemsetAsync(state_, 0, state_n_ * sizeof(float), cs(st_)), "reset");
     pos_ = 0;
@@ -3469,6 +3496,7 @@ void Engine::refreeze_experts() {
 }
 
 void Engine::save_state(uint8_t* dst) {
+    before_state_access();
     OnCard here(device_, split_);
     ck(cudaStreamSynchronize(cs(st_)), "save state");
     save_card_state(dst);
@@ -3490,6 +3518,7 @@ void Engine::save_last(uint8_t* dst) {
 }
 
 void Engine::load_state(const uint8_t* src, int64_t pos) {
+    before_state_access();
     if (pos < 0 || pos > opt_.max_context) throw std::logic_error("load_state: the position is outside the context");
     OnCard here(device_, split_);
     ck(cudaStreamSynchronize(cs(st_)), "load state");
@@ -3503,12 +3532,14 @@ void Engine::load_state(const uint8_t* src, int64_t pos) {
 }
 
 void Engine::save_rows(int64_t first, int64_t n, uint8_t* dst) {
+    before_state_access();
     OnCard here(device_, split_);
     save_card_rows(first, n, dst);
     if (next_) next_->save_rows(first, n, dst + (size_t) n * card_row_bytes());
 }
 
 void Engine::load_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) {
+    before_state_access();
     OnCard here(device_, split_);
     load_card_rows(src, from, count, first, n);
     if (next_) next_->load_rows(src + (size_t) count * card_row_bytes(), from, count, first, n);
@@ -3824,8 +3855,8 @@ void Engine::lin(const Dev& w, const float* x, float* y, int n, const void* xq, 
 }
 
 void Engine::lin_on(const LinWorkspace& ws, const Dev& w, const float* x, float* y, int n,
-                    const void* xq, int rows_per_x) {
-    lin_raw(ws, w, x, y, n, xq, rows_per_x);
+                    const void* xq, int rows_per_x, bool output_slice) {
+    lin_raw(ws, w, x, y, n, xq, rows_per_x, output_slice);
     if (w.scale != 1.0f) axpy(y, w.scale, y, n * w.n_out, false, ws.stream);
 }
 
@@ -3847,7 +3878,7 @@ void Engine::expert_activation(const float* gate_up, float* out, int rows, float
     else swiglu_clamp_rows(gate_up, out, n_ff_exp_, rows, limit, st_, &scales);
 }
 
-void Engine::lin_raw(const LinWorkspace& ws, const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x) {
+void Engine::lin_raw(const LinWorkspace& ws, const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x, bool output_slice) {
     if (w.type == kTypeF32 || w.type == kTypeBF16) {
         const int per = rows_per_x ? rows_per_x : w.n_out;
         const size_t count = (size_t) w.n_in * w.n_out;
@@ -3888,7 +3919,7 @@ void Engine::lin_raw(const LinWorkspace& ws, const Dev& w, const float* x, float
         kernels::native_quantize_q8_1(x, ws.q8, w.n_in * n, 1, ws.stream);
         xq = ws.q8;
     }
-    if (head_warps_ && n == 1 && w.type == GGML_TYPE_Q6_K && w.p == output_.p &&
+    if (head_warps_ && n == 1 && w.type == GGML_TYPE_Q6_K && (w.p == output_.p || output_slice) &&
         kernels::native_q6_k_mmvq_warps(w.p, xq, y, w.n_in, w.n_out, ws.stream))
         return;
     // A guesser's windows and its own block: a few rows, each weight block read once for all of them.  The Q6_K head
@@ -5682,6 +5713,7 @@ void Engine::step(const int* seqs, const int32_t* tokens, int n, const int32_t* 
         next_->step(seqs, tokens, n);
     } else {
         output_rows(0, R, xn_);
+        window_shards_ = {};
         project_logits(xn_, wlogits_, R);
         finish_logits(wlogits_, R);
         ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) R * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost,
@@ -5902,6 +5934,7 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
         return;
     }
     // The model's output: the last token's for the logits, and every token's for the draft block.
+    if (want_logits) last_shards_ = {};
     if (want_logits || draft_) {
         const bool replay = opt_.graphs && n == 1 && want_logits && !opt_.dump && opt_.tp == 1;
         const int m = draft_ ? n : 1;
@@ -5911,7 +5944,10 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
             dbg("out_norm", n_layer_, h, n_embd_);
             if (!want_logits) return;
             if (!replay) on_verify_rows(m);
-            project_logits(h + (size_t) (m - 1) * n_embd_, logits_, 1);
+            const float* last = h + (size_t) (m - 1) * n_embd_;
+            if (!replay && n <= 8 && !opt_.dump) last_shards_ = project_target_shards(last, 1, false);
+            if (last_shards_.split()) return;
+            project_logits(last, logits_, 1);
             finish_logits(logits_, 1);
             ck(cudaMemcpyAsync(h_logits_, logits_, (size_t) n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost,
                                cs(st_)),
@@ -6205,10 +6241,13 @@ void Engine::window(const int32_t* tokens, int t) {
     float* h = draft_ ? hn_ + n_embd_ : xn_;
     output_rows(0, t, h);
     on_verify_rows(t);
-    project_logits(h, wlogits_, t);
-    finish_logits(wlogits_, t);
-    ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) t * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)),
-       "logits");
+    window_shards_ = t <= 8 && !opt_.dump ? project_target_shards(h, t, true) : LogitShards{};
+    if (!window_shards_.split()) {
+        project_logits(h, wlogits_, t);
+        finish_logits(wlogits_, t);
+        ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) t * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)),
+           "logits");
+    }
     ck(cudaStreamSynchronize(cs(st_)), "window");
     if (timed && !recorded_ && !freeze_experts_) took_way(t, ms_since(t0));
     recorded_ = recorded_ || recorded;
@@ -6244,6 +6283,7 @@ void Engine::keep(int n) {
     // The next card reads the window's rows again for the tokens it puts through its layers again: a right token's
     // row is the same, whatever came after it.
     if (n < win_) {
+        on_keep_rows(pos_ + n);
         // The state after the last right token, when that token left it.  Else the one of the last token before
         // it that did, and the right tokens after that one go through the layers again: they come out as they
         // did, and the state with them.
@@ -6383,7 +6423,7 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
     }
     if (drafter_block_) {   // one pass for the block; the guesses after the first are the host's copies
         if (i == 0) {
-            ck(cudaStreamSynchronize(cs(st_)), "draft");
+            if (!draft_independent_of_model_stream()) ck(cudaStreamSynchronize(cs(st_)), "draft");
             drafter_guesses(token);
         }
         *prob = i < block_n_ ? h_block_[i].prob : 0.f;

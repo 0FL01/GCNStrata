@@ -17,6 +17,8 @@
 #include "cpu_experts.hpp"
 #include "strata/poly/kernels.hpp"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
@@ -41,6 +43,42 @@ namespace strata::poly {
 
 class Shards;
 struct Likeliest;
+
+/// A host logits row, in vocabulary order. The pointers live until this result is replaced.
+struct LogitShards {
+    std::array<const float*, 4> ptr{};
+    std::array<int, 4> len{};
+
+    LogitShards() = default;
+    LogitShards(const float* p, int n) : ptr{p}, len{n} {}
+    bool split() const { return ptr[1] != nullptr; }
+    template<class F> void spans(int at, int n, F f) const {
+        for (size_t j = 0; n > 0 && j < ptr.size(); ++j) {
+            if (at >= len[j]) { at -= len[j]; continue; }
+            const int m = std::min(n, len[j] - at);
+            f(ptr[j] + at, m);
+            n -= m;
+            at = 0;
+        }
+    }
+    void copy(int at, int n, float* dst) const {
+        spans(at, n, [&](const float* p, int m) { dst = std::copy_n(p, m, dst); });
+    }
+    // Keep the same vector lanes and scalar tail even for a run that crosses a shard boundary.
+    const float* run(int at, int n, float* scratch) const {
+        if (!split()) return ptr[0] + at;
+        int local = at;
+        for (size_t j = 0; j < ptr.size(); ++j) {
+            if (local < len[j]) {
+                if (n <= len[j] - local) return ptr[j] + local;
+                break;
+            }
+            local -= len[j];
+        }
+        copy(at, n, scratch);
+        return scratch;
+    }
+};
 
 /// The attention caches' storing format, opt-in via --kv.  q8_0 is ggml's blocks (one fp16 scale a 32-value
 /// block of int8 codes) and reads them back element by element; int8 is the same rule with the codes and the
@@ -267,7 +305,8 @@ public:
     /// Feed n tokens from position pos().  With want_logits, logits() then holds the scores of the token after the
     /// last one.
     void eval(const int32_t* tokens, int n, bool want_logits);
-    const float* logits() const { return next_ ? next_->logits() : h_logits_; }
+    const float* logits() const;
+    LogitShards logits_view() const;
     /// Feed n tokens of a prompt, none of them a picture's row, as eval() without logits would in calls of
     /// max_rows(): the same tokens a call.  With experts outside the cache it is faster than those calls, the
     /// more the more of them n is; under stage_ahead tokens it makes those calls.  The result is the calls' own
@@ -296,6 +335,8 @@ public:
 
     /// Optional cost hint before a request. Does not change the tokens read, generated or kept.
     virtual void request_budget(int64_t /*prompt_rows*/, int64_t /*max_new*/) {}
+    virtual bool kv_prefix_tags() const { return false; }
+    virtual void set_kv_prefix_tag(uint64_t, int64_t) {}
 
     /// Whether the architecture reads pictures.
     virtual bool sees() const { return false; }
@@ -313,7 +354,8 @@ public:
     /// What a kept token computed is what eval() would have computed for it.
     int max_window() const { return opt_.window; }
     void window(const int32_t* tokens, int t);
-    const float* logits_of(int i) const { return next_ ? next_->logits_of(i) : h_wlogits_ + (size_t) i * n_vocab_; }
+    const float* logits_of(int i) const;
+    LogitShards logits_view_of(int i) const;
     void keep(int n);
 
     /// Some files carry a block that guesses ahead: one layer that takes a token and the model's output for the
@@ -482,9 +524,13 @@ protected:
     }
     virtual void on_loaded() {}
     virtual void on_reset() {}
+    virtual void before_state_access() {}
+    virtual void on_keep_rows(int64_t) {}
+    virtual bool draft_independent_of_model_stream() const { return false; }
     virtual void on_keep_snap(size_t snap_idx) { (void) snap_idx; }
     virtual Dev load_output_matrix(const TensorInfo* t, int64_t file_vocab);
     virtual void project_logits(const float* h, float* out, int rows);
+    virtual LogitShards project_target_shards(const float*, int, bool) { return {}; }
     /// A decode call has produced its final norm, immediately before the target LM head.
     virtual void on_verify_rows(int rows) { (void) rows; }
     /// The model's output for `rows` tokens from row `first` of the call, normed: what the output matrix takes.
@@ -614,8 +660,8 @@ protected:
         size_t bf16_max;
     };
     void lin_on(const LinWorkspace& ws, const Dev& w, const float* x, float* y, int n,
-                const void* xq = nullptr, int rows_per_x = 0);
-    void lin_raw(const LinWorkspace& ws, const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x);
+                const void* xq = nullptr, int rows_per_x = 0, bool output_slice = false);
+    void lin_raw(const LinWorkspace& ws, const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x, bool output_slice);
     /// The layer's ExpertScales for rows of the experts ids[r] (on the card), or none.
     ExpertScales expert_scales(const Layer& L, const int32_t* ids = nullptr) const;
     void expert_activation(const float* gate_up, float* out, int rows, float limit, const ExpertScales& scales);
@@ -916,6 +962,7 @@ protected:
     int way_calls_[9] = {};      ///< windows of each size since the way behind had one
     int way_backoff_[9] = {};    ///< the way behind waits kWayAgain << this many windows of the size
     bool halves_ = false;        ///< the way of the window under way
+    LogitShards last_shards_, window_shards_;
     float *wlogits_ = nullptr, *h_wlogits_ = nullptr;   ///< a window's logits, token after token: VRAM and pinned
     int cached_ = 0;
 

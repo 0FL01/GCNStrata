@@ -22,6 +22,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#if defined(__x86_64__) || defined(_M_X64)
+#include <emmintrin.h>
+#endif
 
 #if defined(STRATA_HIP_GFX906)
 #include "inkling_prefill.hpp"
@@ -1526,17 +1529,149 @@ struct Inkling2::DfGpu23 {
     }
 };
 
+#if defined(STRATA_HIP_GFX906)
+struct Inkling2::HeadPair {
+    int owner, helper, rows;
+    cudaStream_t head_st = nullptr;
+    cudaEvent_t inputs = nullptr;
+    Dev weights[2];   // owner prefix (view into the unsplit weight), helper suffix (owned)
+    void* q8[2]{};
+    float* logits[2]{};
+    float* host[2]{};  // first row reserved for eval(), followed by window rows
+
+    ~HeadPair() {
+        int prev = 0;
+        (void) cudaGetDevice(&prev);
+        (void) cudaSetDevice(helper);
+        if (head_st) (void) cudaStreamSynchronize(head_st);
+        if (weights[1].p) (void) cudaFree(weights[1].p);
+        if (q8[1]) (void) cudaFree(q8[1]);
+        if (logits[1]) (void) cudaFree(logits[1]);
+        if (head_st) (void) cudaStreamDestroy(head_st);
+        (void) cudaSetDevice(owner);
+        if (inputs) (void) cudaEventDestroy(inputs);
+        if (q8[0]) (void) cudaFree(q8[0]);
+        if (logits[0]) (void) cudaFree(logits[0]);
+        for (auto* p : host) if (p) (void) cudaFreeHost(p);
+        (void) cudaSetDevice(prev);
+    }
+
+    float* result(int shard, bool window) const {
+        return host[shard] + (window ? weights[shard].n_out : 0);
+    }
+};
+
+std::unique_ptr<Inkling2::HeadPair> Inkling2::init_head_pair(Inkling2& owner, int rows) {
+    auto p = std::make_unique<HeadPair>();
+    p->owner = owner.device_;
+    p->helper = owner.device_ + 2;
+    p->rows = rows;
+    p->weights[0] = owner.output_;
+    p->weights[0].n_out = (owner.output_.n_out + 1) / 2;
+    p->weights[1] = {nullptr, owner.output_.type, kWidth, owner.output_.n_out - p->weights[0].n_out,
+                     owner.output_.scale};
+    for (int shard = 0; shard < 2; ++shard) {
+        const int from = shard ? p->helper : p->owner, to = shard ? p->owner : p->helper;
+        DfOnDevice on(from);
+        int can = 0;
+        ck(cudaDeviceCanAccessPeer(&can, from, to), "head4 can access peer");
+        if (!can) throw std::runtime_error("head4 requires bidirectional P2P on 0/2 and 1/3");
+        const auto rc = cudaDeviceEnablePeerAccess(to, 0);
+        if (rc == cudaErrorPeerAccessAlreadyEnabled) (void) cudaGetLastError();
+        else ck(rc, "head4 enable peer access");
+        const size_t out = p->weights[shard].n_out;
+        ck(cudaMalloc(&p->q8[shard], (size_t) rows * kernels::native_q8_1_bytes(kWidth)), "head4 Q8_1");
+        ck(cudaMalloc(&p->logits[shard], rows * out * sizeof(float)), "head4 device logits");
+        ck(cudaMallocHost(&p->host[shard], (rows + 1) * out * sizeof(float)), "head4 pinned logits");
+        if (!shard) {
+            ck(cudaEventCreateWithFlags(&p->inputs, cudaEventDisableTiming), "head4 inputs event");
+        } else {
+            ck(cudaStreamCreateWithFlags(&p->head_st, cudaStreamNonBlocking), "head4 helper stream");
+            const size_t row_bytes = ggml_row_size(GGML_TYPE_Q6_K, kWidth);
+            const auto* suffix = (const uint8_t*) owner.output_.p + row_bytes * p->weights[0].n_out;
+            ck(cudaMalloc(&p->weights[1].p, out * row_bytes), "head4 helper weights");
+            ck(cudaMemcpyPeerAsync(p->weights[1].p, from, suffix, to, out * row_bytes, p->head_st),
+               "head4 copy weights");
+            ck(cudaStreamSynchronize(p->head_st), "head4 wait weights");
+        }
+    }
+    return p;
+}
+
+void Inkling2::enqueue_head_pair(const float* h, int rows, bool window) {
+    auto& p = *head_pair_;
+    const auto stream = cs(st_);
+    kernels::native_quantize_q8_1(h, p.q8[0], kWidth * rows, 1, st_);
+    ck(cudaEventRecord(p.inputs, stream), "head4 quantized input ready");
+    const auto enqueue = [&](int i, cudaStream_t st) {
+        const LinWorkspace ws{st, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, 0};
+        // Use the baseline lin() dispatch (including HEAD_WARPS, Q6_K_COLS and the scale) on each slice.
+        lin_on(ws, p.weights[i], nullptr, p.logits[i], rows, p.q8[i], 0, true);
+        const size_t n = (size_t) rows * p.weights[i].n_out;
+        softcap(p.logits[i], n, cap_, st);
+        ck(cudaMemcpyAsync(p.result(i, window), p.logits[i], n * sizeof(float), cudaMemcpyDeviceToHost, st),
+           "head4 copy logits");
+    };
+    {
+        DfOnDevice on(p.helper);
+        ck(cudaStreamWaitEvent(p.head_st, p.inputs, 0), "head4 wait quantized input");
+        ck(cudaMemcpyPeerAsync(p.q8[1], p.helper, p.q8[0], p.owner,
+                               (size_t) rows * kernels::native_q8_1_bytes(kWidth), p.head_st), "head4 copy input");
+        enqueue(1, p.head_st);
+    }
+    enqueue(0, stream);
+}
+
+void Inkling2::sync_head_pair() {
+    ck(cudaStreamSynchronize(cs(st_)), "head4 owner logits");
+    DfOnDevice on(head_pair_->helper);
+    ck(cudaStreamSynchronize(head_pair_->head_st), "head4 helper logits");
+}
+
+LogitShards Inkling2::project_target_shards(const float* h, int rows, bool window) {
+    if (!head_pair_ || rows < 1 || rows > head_pair_->rows || recording_) return {};
+    peer_dispatch(PeerCmd::kLogitShards, rows, window);
+    try {
+        tp2_->broadcast_from_0(0, const_cast<float*>(h), rows * kWidth, st_);
+        enqueue_head_pair(h, rows, window);
+        sync_head_pair();
+    } catch (...) {
+        tp2_->abort_barrier();
+        peer_wait();
+        throw;
+    }
+    peer_wait();
+    LogitShards out;
+    for (int rank = 0; rank < 2; ++rank) {
+        const auto& p = *(rank ? peer_->head_pair_ : head_pair_);
+        for (int shard = 0; shard < 2; ++shard) {
+            out.ptr[2 * rank + shard] = p.result(shard, window);
+            out.len[2 * rank + shard] = p.weights[shard].n_out;
+        }
+    }
+    return out;
+}
+#endif
+
 Inkling2::Inkling2() = default;
 
 cudaStream_t Inkling2::df_stream() const { return df_gpu23_ ? df_gpu23_->s2 : cs(st_); }
 
 Inkling2::~Inkling2() {
+    stop_peer_thread();
 #if defined(STRATA_HIP_GFX906)
     stage_b_.reset();
     destroy_phase_dualtp_handles();
     free_v7r4_bufs();
+    if (head_pair_) {
+        int prev = 0;
+        (void) cudaGetDevice(&prev);
+        (void) cudaSetDevice(device_);
+        (void) cudaStreamSynchronize(cs(st_));
+        head_pair_.reset();
+        (void) cudaSetDevice(prev);
+    }
 #endif
-    stop_peer_thread();
     if (df_gpu23_) {
         int previous = 0;
         if (cudaGetDevice(&previous) == cudaSuccess && cudaSetDevice(device_) == cudaSuccess) {
@@ -1699,6 +1834,7 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
                         std::fprintf(stderr, "strata-poly: mirror Flash helpers unavailable: %s; keeping decode helpers\n", e.what());
                     }
                 }
+                r0->mirror_tagging_ = enabled("STRATA_INKLING_MIRROR_TAG");
                 r0->kv_helper_ = std::move(mirrors[0]);
                 r1->kv_helper_ = std::move(mirrors[1]);
                 std::fputs("strata-poly: STRATA_INKLING_KV_HELPERS=1: TP2 full-attention decode on GPUs 0/2 and 1/3\n",
@@ -1713,9 +1849,37 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
 #endif
     ck(cudaSetDevice(0), "tp2 setDevice 0");
     r0->peer_ = std::move(r1);
+#if defined(STRATA_HIP_GFX906)
+    r0->decode_async_keep_ = enabled("STRATA_INKLING_DECODE_ASYNC_KEEP");
+#endif
     r0->start_peer_thread();
 #if defined(STRATA_HIP_GFX906)
     r0->phase_dualtp_init(o);
+    if (enabled("STRATA_INKLING_HEAD_4GPU")) {
+        try {
+            int devices = 0;
+            ck(cudaGetDeviceCount(&devices), "head4 device count");
+            if (devices < 4 || o.dump || r0->n_vocab_ != 200058 || r0->n_embd_ != kWidth ||
+                r0->output_.type != GGML_TYPE_Q6_K || r0->peer_->output_.type != GGML_TYPE_Q6_K ||
+                enabled("STRATA_Q6_PACKED"))
+                throw std::runtime_error("requires four gfx906 GPUs, the 2304 x 200058 Q6_K head, and no dump/packing");
+            for (int d = 0; d < 4; ++d) {
+                cudaDeviceProp props{};
+                ck(cudaGetDeviceProperties(&props, d), "head4 device properties");
+                if (props.warpSize != 64 || !kernels::gfx_arch_is(props.gcnArchName, "gfx906"))
+                    throw std::runtime_error("requires four gfx906 wave64 GPUs");
+            }
+            const int rows = std::clamp(r0->opt_.window, 1, 8);
+            auto p0 = init_head_pair(*r0, rows);
+            auto p1 = init_head_pair(*r0->peer_, rows);
+            r0->head_pair_ = std::move(p0);
+            r0->peer_->head_pair_ = std::move(p1);
+            std::fputs("strata-poly: STRATA_INKLING_HEAD_4GPU=1: four direct-to-host Q6_K target shards\n", stderr);
+        } catch (const std::runtime_error& e) {
+            (void) cudaGetLastError();
+            std::fprintf(stderr, "strata-poly: STRATA_INKLING_HEAD_4GPU=1 unavailable: %s; using TP2 head\n", e.what());
+        }
+    }
     if (fast_ckpt_enabled() && !r0->ds_on() && r0->q8()) {
         const size_t keep = (size_t) std::min(r0->opt_.max_context, kWindow - 1);
         const size_t swa = (size_t) (kVisits - kVisits / kBlock) * keep * r0->kv_bytes();
@@ -1755,6 +1919,17 @@ void Inkling2::start_peer_thread() {
             PeerCmd cmd = PeerCmd::kIdle;
             int n = 0;
             size_t snap_idx = 0;
+            if (decode_async_keep_) {
+                const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(400);
+                while (peer_cmd_.load(std::memory_order_relaxed) == PeerCmd::kIdle &&
+                       std::chrono::steady_clock::now() < until) {
+#if defined(__x86_64__) || defined(_M_X64)
+                    _mm_pause();
+#else
+                    std::this_thread::yield();
+#endif
+                }
+            }
             {
                 std::unique_lock<std::mutex> lk(peer_mu_);
                 peer_cv_.wait(lk, [&] { return peer_cmd_ != PeerCmd::kIdle; });
@@ -1779,6 +1954,12 @@ void Inkling2::start_peer_thread() {
                     tp2_->broadcast_from_0(1, peer_->xn_, n * kWidth, peer_->st_);
                     peer_->lin(peer_->output_, peer_->xn_, peer_->tp2_logits_half_, n);
                     tp2_->gather_from_1(1, nullptr, peer_->tp2_logits_half_, n * peer_->tp2_vocab_n_, peer_->st_);
+#if defined(STRATA_HIP_GFX906)
+                } else if (cmd == PeerCmd::kLogitShards) {
+                    tp2_->broadcast_from_0(1, peer_->xn_, n * kWidth, peer_->st_);
+                    peer_->enqueue_head_pair(peer_->xn_, n, snap_idx != 0);
+                    peer_->sync_head_pair();
+#endif
                 } else if (cmd == PeerCmd::kDraftHead) {
                     tp2_->broadcast_from_0(1, peer_->df_hx_, n * kWidth, peer_->st_);
                     peer_->df_head_run(peer_->df_hx_, cs(peer_->st_));
@@ -1819,6 +2000,8 @@ void Inkling2::start_peer_thread() {
 
 void Inkling2::stop_peer_thread() {
     if (!peer_thread_.joinable()) return;
+    // A pending keep must be queued on the peer's stream before its worker can be stopped.
+    try { before_state_access(); } catch (...) {}  // the worker already logged the error
     {
         std::lock_guard<std::mutex> lk(peer_mu_);
         peer_cmd_ = PeerCmd::kStop;
@@ -1827,7 +2010,12 @@ void Inkling2::stop_peer_thread() {
     peer_thread_.join();
 }
 
+void Inkling2::before_state_access() {
+    if (std::exchange(peer_pending_keep_, false)) peer_wait();
+}
+
 void Inkling2::peer_dispatch(PeerCmd cmd, int n, size_t snap_idx) {
+    before_state_access();
     {
         std::lock_guard<std::mutex> lk(peer_mu_);
         peer_done_ = false;
@@ -1999,6 +2187,18 @@ void Inkling2::count_gpu_route(int n) {
 #endif
 
 #if defined(STRATA_HIP_GFX906)
+void Inkling2::set_kv_prefix_tag(uint64_t tag, int64_t preserved) {
+    if (!mirror_tagging_) return;
+    inkling::kv_helpers::set_prefix_tag(*kv_helper_, tag, preserved);
+    inkling::kv_helpers::set_prefix_tag(*peer_->kv_helper_, tag, preserved);
+}
+
+void Inkling2::on_keep_rows(int64_t end) {
+    if (!mirror_tagging_) return;
+    inkling::kv_helpers::invalidate(*kv_helper_, end);
+    inkling::kv_helpers::invalidate(*peer_->kv_helper_, end);
+}
+
 void Inkling2::request_budget(int64_t prompt_rows, int64_t max_new) {
     // DFlash2: the first block (at the prompt's end) attends its last 2047 positions, later ones only newer rows
     df_skip_ = df2_ ? std::max<int64_t>(0, prompt_rows - dflash2::kWindow - 8) : 0;
@@ -2013,7 +2213,7 @@ void Inkling2::on_reset() {
     if (df_gpu23_) df_gpu23_->prov_valid = false;
     df_lo_ = df_hi_ = df_skip_ = 0;
 #if defined(STRATA_HIP_GFX906)
-    if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, 0);
+    if (kv_helper_) inkling::kv_helpers::invalidate_state(*kv_helper_, 0);
     stage_b_kv_valid_ = 0;
     if (stage_b_) {
         int prev = 0; (void) cudaGetDevice(&prev);
@@ -2044,7 +2244,8 @@ void Inkling2::on_keep_snap(size_t snap_idx) {
 #endif
     if (!peer_) return;
     peer_dispatch(PeerCmd::kKeepSnap, 0, snap_idx);
-    peer_wait();
+    if (decode_async_keep_) peer_pending_keep_ = true;
+    else peer_wait();
 }
 
 Dev Inkling2::load_output_matrix(const TensorInfo* t, int64_t file_vocab) {
@@ -2657,10 +2858,10 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
         throw std::logic_error("load_rows: outside saved rows");
     if (!n) return;
 #if defined(STRATA_HIP_GFX906)
-    if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, first);
+    if (kv_helper_) inkling::kv_helpers::invalidate_state(*kv_helper_, first);
     stage_b_kv_valid_ = std::min(stage_b_kv_valid_, first);
     if (fast_park_enabled() && peer_ && tp_size_ == 2 && !ds_on()) {
-        if (peer_->kv_helper_) inkling::kv_helpers::invalidate(*peer_->kv_helper_, first);
+        if (peer_->kv_helper_) inkling::kv_helpers::invalidate_state(*peer_->kv_helper_, first);
         peer_->stage_b_kv_valid_ = std::min(peer_->stage_b_kv_valid_, first);
         ensure_park_bufs();
         peer_->ensure_park_bufs();
@@ -2912,8 +3113,8 @@ bool Inkling2::load_card_state_fast(const uint8_t* src, int64_t pos) {
         !build_swa_pack_desc(peer_->caches_, 0, kVisits, peer_->ring_, d1))
         return false;
     const int64_t keep_valid = (pos <= pos_) ? pos : 0;
-    if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, keep_valid);
-    if (peer_->kv_helper_) inkling::kv_helpers::invalidate(*peer_->kv_helper_, keep_valid);
+    if (kv_helper_) inkling::kv_helpers::invalidate_state(*kv_helper_, keep_valid);
+    if (peer_->kv_helper_) inkling::kv_helpers::invalidate_state(*peer_->kv_helper_, keep_valid);
     stage_b_kv_valid_ = std::min(stage_b_kv_valid_, keep_valid);
     peer_->stage_b_kv_valid_ = std::min(peer_->stage_b_kv_valid_, keep_valid);
     if (df_gpu23_) df_gpu23_->prov_valid = false;
@@ -2969,7 +3170,7 @@ void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
     // Conversation switches and resets already invalidated via load_card_rows() / on_reset().
     // Same-conversation rollbacks (pos <= pos_) preserve canonical full KV rows [0, pos).
     const int64_t keep_valid = (pos <= pos_) ? pos : 0;
-    if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, keep_valid);
+    if (kv_helper_) inkling::kv_helpers::invalidate_state(*kv_helper_, keep_valid);
     stage_b_kv_valid_ = std::min(stage_b_kv_valid_, keep_valid);
 #endif
     const size_t one = (size_t) std::min(opt_.max_context, kWindow - 1) * kv_bytes();
@@ -3009,7 +3210,19 @@ void Inkling2::assign_scratch() {
     constexpr int target_tiles = (1 << 20) / (kHeads * kValueTile);
     attend_tiles_ = std::max(div_up(opt_.max_context, kValueTile),
                              std::min(target_tiles, rows_ * div_up(opt_.max_context, kValueTile)));
-    scores_ = fbuf(inkling::plain_score_floats(attend_tiles_));
+    score_floats_ = inkling::plain_score_floats(attend_tiles_);
+#if defined(STRATA_HIP_GFX906)
+    if (!prefill_only_ && tp_size_ == 2 && factored_decode_) {
+        const auto on = [](const char* name) { const char* s = std::getenv(name); return s && !std::strcmp(s, "1"); };
+        if (on("STRATA_INKLING_KV_HELPERS") && on("STRATA_INKLING_KV_HELPERS_W8")) {
+            // The half-attention owner still indexes scores with the full query-head stride. Size for end,
+            // including all eight new rows, and cap the extra scratch at a 128K context.
+            const size_t end = std::min<int64_t>(opt_.max_context, 131072 + 8);
+            score_floats_ = std::max(score_floats_, 8 * (size_t) n_heads_ * end);
+        }
+    }
+#endif
+    scores_ = fbuf(score_floats_);
     partial_ = fbuf(inkling::plain_partial_floats(attend_tiles_));
     if (decode_) {
         chunks_ = fbuf(inkling::decode_floats());
@@ -3220,7 +3433,7 @@ void Inkling2::attention(const Block& b, int n, const float* k_in, const float* 
                       kRelative == kRelativeWidth && kHead == kHeadWidth && kMaxDecodeRows < kStageRows);
         if (n >= 64 && n <= 2048 && try_flash_mirror(*kv_helper_, a, visit_ / kBlock)) return;
         const auto path = try_visit(*kv_helper_, a, visit_ / kBlock, chunks_, scores_,
-                                    inkling::plain_score_floats(attend_tiles_), attq_);
+                                    score_floats_, attq_);
         if (path == Visit::Offloaded) return;
         if (path == Visit::Seeding) {
             try {

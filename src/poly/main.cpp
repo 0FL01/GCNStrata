@@ -61,6 +61,7 @@ using strata::poly::Conversations;
 using strata::poly::Engine;
 using strata::poly::Guesses;
 using strata::poly::KvFmt;
+using strata::poly::LogitShards;
 using strata::poly::Options;
 using Clock = std::chrono::steady_clock;
 
@@ -99,12 +100,17 @@ class Sampler {
 public:
     int pick(const float* logits, int n_vocab, const Sampling& s, const std::vector<int32_t>& history,
              std::mt19937_64& rng) {
+        return pick(LogitShards(logits, n_vocab), n_vocab, s, history, rng);
+    }
+    int pick(LogitShards logits, int n_vocab, const Sampling& s, const std::vector<int32_t>& history,
+             std::mt19937_64& rng) {
         if (penalizes(s)) {
-            pen_.assign(logits, logits + n_vocab);
+            pen_.resize((size_t) n_vocab);
+            logits.copy(0, n_vocab, pen_.data());
             penalize(s, history);
-            logits = pen_.data();
+            logits = {pen_.data(), n_vocab};
         }
-        if (s.temperature <= 0.f) return strata::poly::most_likely(logits, n_vocab);
+        if (s.temperature <= 0.f) return greedy(logits, n_vocab);
         const size_t k = s.top_k > 0 ? std::min((size_t) s.top_k, (size_t) n_vocab) : (size_t) n_vocab;
         // Nothing cut (top_k 0 or the whole vocabulary, top_p 1, min_p 0): the draw is over every token, so it needs
         // no order.  A heap of the whole vocabulary took 19.5 ms a token on a Ryzen 7 5700X, this one pass 0.3 ms.
@@ -124,16 +130,21 @@ public:
         // worst of the k so far, which is the heap's first; most of a vocabulary never does.
         auto by_logit = [](const Cand& a, const Cand& b) { return a.logit != b.logit ? a.logit > b.logit : a.id < b.id; };
         cand_.clear();
-        for (int i = 0; i < n_vocab; ++i) {
-            if (cand_.size() == k) {
-                if (!(logits[i] > cand_.front().logit)) continue;   // an equal with a higher id is no better
-                std::pop_heap(cand_.begin(), cand_.end(), by_logit);
-                cand_.back() = {logits[i], i};
-            } else {
-                cand_.push_back({logits[i], i});
+        int off = 0;
+        logits.spans(0, n_vocab, [&](const float* p, int n) {
+            for (int j = 0; j < n; ++j) {
+                const int i = off + j;
+                if (cand_.size() == k) {
+                    if (!(p[j] > cand_.front().logit)) continue;   // an equal with a higher id is no better
+                    std::pop_heap(cand_.begin(), cand_.end(), by_logit);
+                    cand_.back() = {p[j], i};
+                } else {
+                    cand_.push_back({p[j], i});
+                }
+                std::push_heap(cand_.begin(), cand_.end(), by_logit);
             }
-            std::push_heap(cand_.begin(), cand_.end(), by_logit);
-        }
+            off += n;
+        });
         std::sort_heap(cand_.begin(), cand_.end(), by_logit);
 
         if (s.top_p < 1.f) {
@@ -167,6 +178,18 @@ private:
     };
 
     static constexpr int kSumRun = 4096;
+
+    static int greedy(const LogitShards& logits, int n) {
+        if (!logits.split()) return strata::poly::most_likely(logits.ptr[0], n);
+        float best = -INFINITY;
+        int id = -1, off = 0;
+        logits.spans(0, n, [&](const float* p, int m) {
+            for (int i = 0; i < m; ++i)
+                if (p[i] > best || (id < 0 && p[i] == best)) best = p[i], id = off + i;
+            off += m;
+        });
+        return std::max(id, 0);
+    }
 
     // e^x for x <= 0 to float precision (relative error ~1e-7): 2^n 2^f, |f| <= 1/2, f's series to the 7th term.  A
     // loop of it vectorizes where std::exp's calls do not.
@@ -229,6 +252,12 @@ private:
         return mx;
     }
 
+    static float max_avx2_shards(const LogitShards& logits, int at, int n) {
+        float mx = -INFINITY;
+        logits.spans(at, n, [&](const float* p, int m) { mx = std::max(mx, max_avx2(p, m)); });
+        return mx;
+    }
+
     __attribute__((target("avx2,no-fma")))
     static double weight_run_avx2(const float* logits, float* q, int n, float mx, float inv) {
         const __m256 max_logit = _mm256_set1_ps(mx), inv_temp = _mm256_set1_ps(inv);
@@ -276,7 +305,8 @@ private:
         }
         ~SamplePool() { stop(); }
 
-        float max(const float* logits, int n, int nr) {
+        float max(const float* logits, int n, int nr) { return max(LogitShards(logits, n), n, nr); }
+        float max(LogitShards logits, int n, int nr) {
             dispatch({logits, nullptr, nullptr, n, nr});
             float mx = workers_[0].mx;
             // Slices are in token order. Each max_avx2 already chose its first zero on a tie;
@@ -284,13 +314,13 @@ private:
             for (int i = 1; i < threads_; ++i) mx = std::max(mx, workers_[i].mx);
             return mx;
         }
-        void weights(const float* logits, float* q, double* runs, int n, int nr, float mx, float inv) {
+        void weights(LogitShards logits, float* q, double* runs, int n, int nr, float mx, float inv) {
             dispatch({logits, q, runs, n, nr, mx, inv});
         }
 
     private:
         struct Job {
-            const float* logits;
+            LogitShards logits;
             float* q;
             double* runs;   // null for the max pass
             int n, nr;
@@ -308,12 +338,12 @@ private:
             const int first = job_.nr * i / threads_, last = job_.nr * (i + 1) / threads_;
             const int at = first * kSumRun, end = last == job_.nr ? job_.n : last * kSumRun;
             if (!job_.runs) {
-                workers_[i].mx = max_avx2(job_.logits + at, end - at);
+                workers_[i].mx = max_avx2_shards(job_.logits, at, end - at);
             } else {
+                float scratch[kSumRun];
                 for (int r = first; r < last; ++r) {
-                    const int off = r * kSumRun;
-                    job_.runs[r] = weight_run_avx2(job_.logits + off, job_.q + off,
-                                                   std::min(kSumRun, end - off), job_.mx, job_.inv);
+                    const int off = r * kSumRun, n = std::min(kSumRun, end - off);
+                    job_.runs[r] = weight_run_avx2(job_.logits.run(off, n, scratch), job_.q + off, n, job_.mx, job_.inv);
                 }
             }
         }
@@ -398,17 +428,24 @@ private:
     // by the runs' sums, its token by the sums in id order inside it.
     template <bool UseAvx2 = false>
     int draw_all(const float* logits, int n_vocab, const Sampling& s, std::mt19937_64& rng,
+                 SamplePool* pool = nullptr) {
+        return draw_all<UseAvx2>(LogitShards(logits, n_vocab), n_vocab, s, rng, pool);
+    }
+    template <bool UseAvx2 = false>
+    int draw_all(LogitShards logits, int n_vocab, const Sampling& s, std::mt19937_64& rng,
                  [[maybe_unused]] SamplePool* pool = nullptr) {
         float mx = -INFINITY;
 #if defined(STRATA_POLY_HAVE_AVX2_SAMPLE)
         const int nr = n_runs(n_vocab);
-        if constexpr (UseAvx2) mx = pool ? pool->max(logits, n_vocab, nr) : max_avx2(logits, n_vocab);
+        if constexpr (UseAvx2) mx = pool ? pool->max(logits, n_vocab, nr) : max_avx2_shards(logits, 0, n_vocab);
         else
 #endif
-            for (int i = 0; i < n_vocab; ++i) mx = std::max(mx, logits[i]);
+            logits.spans(0, n_vocab, [&](const float* p, int n) {
+                for (int i = 0; i < n; ++i) mx = std::max(mx, p[i]);
+            });
         const float inv = 1.f / s.temperature;
         // nothing to draw from (every token taken out), or a temperature so small its scale overflows: the most likely
-        if (!std::isfinite(mx) || !std::isfinite(inv)) return strata::poly::most_likely(logits, n_vocab);
+        if (!std::isfinite(mx) || !std::isfinite(inv)) return greedy(logits, n_vocab);
         q_.resize((size_t) n_vocab);
         float* q = q_.data();
         double sum = 0.0;
@@ -422,15 +459,17 @@ private:
 #endif
         {
             runs_.clear();
+            float scratch[kSumRun];
             for (int at = 0; at < n_vocab; at += kSumRun) {
                 const int end = std::min(n_vocab, at + kSumRun);
+                const float* in = logits.run(at, end - at, scratch);
                 double run;
 #if defined(STRATA_POLY_HAVE_AVX2_SAMPLE)
-                if constexpr (UseAvx2) run = weight_run_avx2(logits + at, q + at, end - at, mx, inv);
+                if constexpr (UseAvx2) run = weight_run_avx2(in, q + at, end - at, mx, inv);
                 else
 #endif
                 {
-                    for (int i = at; i < end; ++i) q[i] = exp_below_0((logits[i] - mx) * inv);
+                    for (int i = at; i < end; ++i) q[i] = exp_below_0((in[i - at] - mx) * inv);
                     // in doubles, as the scan below adds them: a run's sum is the mass the scan finds in it.  Four sums
                     // the loop can keep apart: one would wait on each add.
                     double lane[4] = {};
@@ -649,7 +688,7 @@ struct Session {
     Sampler sampler;
     std::mt19937_64 rng{std::random_device{}()};
     const std::vector<int32_t>* follow = nullptr;   // --follow: the answer's tokens, taken in place of the picks
-    const float* picked_from = nullptr;             // the logits of the last token picked
+    LogitShards picked_from;             // the logits of the last token picked
     long long asked = 0, reused = 0;   // prompt tokens of every request, and those of them not read again
     // Guesses at the tokens to come, checked a window at a time (Engine::window).  They come from the block some
     // files carry for it (Engine::draft), and from the conversation: when the last tokens repeat an earlier stretch
@@ -800,7 +839,7 @@ struct Session {
             repeats.reset();
             repeats.append(history.data(), history.size());
         }
-        const auto pick = [&](const float* logits) {
+        const auto pick = [&](LogitShards logits) {
             picked_from = logits;
             if (follow && r.produced < (int64_t) follow->size()) return (*follow)[(size_t) r.produced];
             return (int32_t) sampler.pick(logits, engine.n_vocab(), s, history, rng);
@@ -819,7 +858,7 @@ struct Session {
         if (max_new > 0) {
             int32_t w[strata::spec::DraftPolicy::kMaxT], d[strata::spec::DraftPolicy::kMaxT];
             const int block_window = engine.guesses_at_once() ? most : draft_most;
-            int32_t t = pick(engine.logits());   // picked, and not shown yet
+            int32_t t = pick(engine.logits_view());   // picked, and not shown yet
             while (show(t)) {
                 // t goes into the model now, and with it guesses at what follows when there are any that pay
                 const Clock::time_point round = Clock::now();
@@ -866,7 +905,7 @@ struct Session {
                 if (use.t == 1) {
                     engine.eval(&t, 1, true);
                     kept.read(&t, 1);
-                    t = pick(engine.logits());
+                    t = pick(engine.logits_view());
                     policy.observe(false, 1, 0, 0, count(1, 1));
                     continue;
                 }
@@ -877,8 +916,8 @@ struct Session {
                 // already; the token an answer ends with is shown and never fed, as without guesses.
                 int right = 0;
                 bool more = true;
-                t = pick(engine.logits_of(0));
-                while (right < use.t - 1 && t == w[right + 1] && (more = show(t))) t = pick(engine.logits_of(++right));
+                t = pick(engine.logits_view_of(0));
+                while (right < use.t - 1 && t == w[right + 1] && (more = show(t))) t = pick(engine.logits_view_of(++right));
                 engine.keep(right + 1);
                 kept.read(w, right + 1);
                 r.guessed += use.t - 1;
@@ -1355,10 +1394,20 @@ int once(Session& ss, const std::vector<int32_t>& ids, const Pictures& pictures,
          const Sampling& s, int top_probs) {
     std::atomic<bool> stop{false};
     std::string out;
+    std::vector<float> top_logits;
     const Session::Result r = ss.generate(
         ids, pictures, pad, -1, max_new, s, stop,
         [&](int32_t t) {
-            if (top_probs > 0) print_top(ss.picked_from, ss.engine.n_vocab(), top_probs);
+            if (top_probs > 0) {
+                const int vocab = ss.engine.n_vocab();
+                const float* p = ss.picked_from.ptr[0];
+                if (ss.picked_from.split()) {
+                    top_logits.resize(vocab);
+                    ss.picked_from.copy(0, vocab, top_logits.data());
+                    p = top_logits.data();
+                }
+                print_top(p, vocab, top_probs);
+            }
             out += (out.empty() ? "" : ",") + std::to_string(t);
         },
         [](int64_t, int64_t, double, bool) {});

@@ -30,6 +30,8 @@ bool try_flash_mirror(Mirror& mirror, const Attend& a, int slot);
 void seed_slot(Mirror& mirror, int slot, KvView k, KvView v, const float* table, int src_device, int end_row);
 void sync_seed(Mirror& mirror);
 void invalidate(Mirror& mirror, int64_t first);
+void set_prefix_tag(Mirror& mirror, uint64_t tag, int64_t preserved);
+void invalidate_state(Mirror& mirror, int64_t first);
 void set_budget(Mirror& mirror, int64_t prompt_rows, int64_t max_new);
 
 enum class Visit { Local, Seeding, Offloaded };
