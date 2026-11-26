@@ -289,8 +289,27 @@ gemm_small_2x2_kernel(const float* __restrict__ w, const float* __restrict__ x, 
     if (t + 1 < rows && o + 1 < n_out) y[size_t(t + 1) * n_out + o + 1] = acc11;
 }
 
+bool fast_enabled() {
+#if defined(STRATA_HIP_GFX906)
+    static const bool enabled = [] {
+        const char* value = std::getenv("STRATA_TP2_PREFILL_F32_FAST");
+        return value && value[0] == '1' && value[1] == '\0';
+    }();
+    return enabled;
+#else
+    return false;
+#endif
+}
+
 bool use(int n_in, int n_out, int rows) {
 #if defined(STRATA_HIP_GFX906)
+    if (fast_enabled()) {
+        const bool router = n_in == 2304 && n_out == 128 && rows >= 384 && rows <= 2048;
+        const bool ctrl_down = n_in == 4608 && n_out == 64 && rows >= 640 && rows <= 2048;
+        const bool sink_taps = n_in == 2304 && rows >= 1536 && rows <= 2048 &&
+                               (n_out == 12 || n_out == 16 || n_out == 24 || n_out == 32 || n_out == 64);
+        if (router || ctrl_down || sink_taps) return true;
+    }
     const bool router = n_in == 2304 && n_out == 128 && rows >= 512 && rows <= 2048;
     const bool control = rows >= 2047 && rows <= 2048 &&
                          ((n_in == 2304 && (n_out == 24 || n_out == 32 || n_out == 64)) ||
@@ -329,7 +348,7 @@ void launch(const float* w, const float* x, float* y, int n_in, int n_out, int r
         const char* value = std::getenv("STRATA_TP2_PREFILL_F32_VEC");
         return value && value[0] == '1' && value[1] == '\0';
     }();
-    if (vector && (rows == 2047 || rows == 2048) && n_in % SMALL_K == 0 &&
+    if ((fast_enabled() || (vector && (rows == 2047 || rows == 2048))) && n_in % SMALL_K == 0 &&
         ((reinterpret_cast<std::uintptr_t>(w) | reinterpret_cast<std::uintptr_t>(x)) & 15) == 0) {
         gemm_small_2x2_kernel<true><<<grid, SMALL_THREADS, 0, stream>>>(w, x, y, n_in, n_out, rows);
         return;
@@ -3199,6 +3218,11 @@ void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, in
 #if defined(STRATA_USE_HIP)
         if (small_gemm_2x2::use(n_in, n_out, rows)) {
             small_gemm_2x2::launch(w, x, y, n_in, n_out, rows, stream);
+            return;
+        }
+        if (small_gemm_2x2::fast_enabled() && n_in == 2304 && n_out == 128 && rows < 384) {
+            gemm_small_kernel<<<dim3((rows + SMALL_TOK - 1) / SMALL_TOK, (n_out + SMALL_OUT - 1) / SMALL_OUT),
+                                SMALL_TOK * WARP, 0, stream>>>(w, x, y, n_in, n_out, rows);
             return;
         }
 #endif

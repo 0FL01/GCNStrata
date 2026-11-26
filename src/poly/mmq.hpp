@@ -48,6 +48,9 @@ public:
     static bool try_inkling_prefill_compact(const void* w, int type, bool down, size_t stride, const void* xq,
                                             const int32_t* ids, int tokens, int c, int most,
                                             const inkling_prefill::Scratch* scratch, float* dst, void* stream);
+    static bool inkling_prefill_compact_single(const void* w, int type, bool down, size_t stride, const void* xq,
+                                               const int32_t* ids, int tokens, int j, bool separate_dn_list,
+                                               const inkling_prefill::Scratch* scratch, float* dst, void* stream);
 #endif
 
     /// One launch over n matrices of [w_rows, w_cols], `stride` bytes apart from w: matrix e times the rows

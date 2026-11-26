@@ -75,6 +75,64 @@ __global__ void make_plan(Scratch* s, int32_t* cb, int parts, int tokens, bool l
     for (int k = 0; k < n; k += j) s->list[at + k / j] = {e, row + k, n - k};
 }
 
+__global__ void make_plan_single(Scratch* s, int parts, int tokens, int j_gu, int j_dn) {
+    const int e = threadIdx.x;
+    if (s->summary.invalid) {
+        if (e == 0) {
+            s->any_invalid = 1;
+            s->used_gu = 0;
+            s->used_dn = 0;
+        }
+        return;
+    }
+    int n = 0;
+    for (int p = 0; p < parts; ++p) {
+        s->first[e][p] = n;
+        n += s->count[e][p];
+    }
+    s->summary.count[e] = n;
+    __shared__ int counts[experts], off_gu[experts], off_dn[experts];
+    counts[e] = n;
+    __syncthreads();
+    if (e == 0) {
+        int total = 0;
+        for (int v = 0; v < experts; ++v) {
+            total += counts[v];
+            if (counts[v] > tokens) s->summary.invalid = 1;
+        }
+        if (total != tokens * picks) s->summary.invalid = 1;
+        if (s->summary.invalid) {
+            s->any_invalid = 1;
+            s->used_gu = 0;
+            s->used_dn = 0;
+        } else {
+            int row = 0, ug = 0, ud = 0;
+            for (int v = 0; v < experts; ++v) {
+                const int nn = counts[v];
+                s->begin[v] = row;
+                off_gu[v] = ug;
+                off_dn[v] = ud;
+                if (nn > 0) {
+                    row += nn;
+                    ug += (nn + j_gu - 1) / j_gu;
+                    ud += (nn + j_dn - 1) / j_dn;
+                }
+            }
+            s->used_gu = ug;
+            s->used_dn = ud;
+        }
+    }
+    __syncthreads();
+    if (s->summary.invalid || n == 0) return;
+    const int row = s->begin[e];
+    const int ag = off_gu[e];
+    for (int k = 0; k < n; k += j_gu) s->list_gu[ag + k / j_gu] = {e, row + k, n - k};
+    if (j_dn != j_gu) {
+        const int ad = off_dn[e];
+        for (int k = 0; k < n; k += j_dn) s->list_dn[ad + k / j_dn] = {e, row + k, n - k};
+    }
+}
+
 __global__ void scatter_picks(const Scratch* s, bool inverse, int32_t* tok, int32_t* place) {
     const int e = blockIdx.x, part = blockIdx.y, lane = threadIdx.x % wave_size, wave = threadIdx.x / wave_size;
     if (s->summary.invalid || !s->count[e][part]) return;
@@ -135,7 +193,8 @@ void compact_mmq(const char* x, const int* y, const int32_t* ids, const Task* ta
         const auto half_tile = [&](int k, int half) {
             const int* src = y + ncols_y * (k / QK8_1_MMQ + half) * words;
 #pragma unroll
-            for (int i = 0; i < J * MMQ_TILE_Y_K; i += threads) ty[i + lane] = src[i + lane];
+            for (int i = 0; i < J * MMQ_TILE_Y_K; i += threads)
+                if (i + lane < J * MMQ_TILE_Y_K) ty[i + lane] = src[i + lane];
             __syncthreads();
             dot(tx, ty, sum, half * MMQ_TILE_NE_K);
             __syncthreads();

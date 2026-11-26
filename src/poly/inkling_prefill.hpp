@@ -14,6 +14,14 @@ constexpr int cutoffs[classes - 1] = {32, 128};
 constexpr int min(int a, int b) { return a < b ? a : b; }
 constexpr int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
+inline constexpr int gu_tile(int tokens) { return tokens <= 64 ? 8 : tokens <= 384 ? 16 : 32; }
+inline constexpr int dn_tile(int tokens) { return tokens <= 256 ? 8 : 32; }
+inline constexpr int single_cap(int tokens, int j) {
+    const int rows = tokens * picks;
+    return min(experts * ceil_div(tokens, j), (rows + experts * (j - 1)) / j);
+}
+constexpr int max_single_tasks = 640;
+
 // For m active experts of this class, sum ceil(rows[e]/J) is at most
 // floor((tokens*picks + m*(J-1))/J) and at most m*ceil(largest_possible_rows/J).
 // One token never picks the same expert twice. No count readback for the compact grid.
@@ -35,10 +43,13 @@ static_assert(sizeof(Summary) == 528);
 struct Task { int32_t slot, col, remaining; };
 struct Scratch {
     Summary summary;
+    int32_t any_invalid;
+    int32_t used_gu, used_dn;
     uint64_t mask[experts][max_parts][waves];
     int32_t count[experts][max_parts], first[experts][max_parts];
     int32_t begin[experts], used[classes];
     Task list[task_cap(max_tokens, 0) + task_cap(max_tokens, 1) + task_cap(max_tokens, 2)];
+    Task list_gu[max_single_tasks], list_dn[max_single_tasks];
 
     static constexpr int list_offset(int c) {
         return c == 0 ? 0 : task_cap(max_tokens, 0) + (c == 1 ? 0 : task_cap(max_tokens, 1));
@@ -48,6 +59,7 @@ struct Scratch {
 // Invoked on one stream, with the exact selector and its status preceding this work.
 // The plan writes stock class bounds and compact task lists; scatter builds stock gather/inverse and place.
 void plan(Scratch* s, const int32_t* ids, int tokens, SlotOrder order, int32_t* cb, bool lists, void* stream);
+void plan_single(Scratch* s, const int32_t* ids, int tokens, SlotOrder order, int j_gu, int j_dn, void* stream);
 void scatter(const Scratch* s, int tokens, bool inverse, int32_t* tok, int32_t* place, void* stream);
 
 }  // namespace strata::poly::inkling_prefill

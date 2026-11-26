@@ -185,6 +185,48 @@ __global__ void sum_f16_pair_to_f32_kernel(float* __restrict__ dst,
     if (i < n) dst[i] = __half2float(a[i]) + __half2float(b[i]);
 }
 
+#if defined(STRATA_HIP_GFX906)
+__device__ __forceinline__ uint32_t pack_half2_bits(float a, float b) {
+    const __half2 h = __halves2half2(__float2half(a), __float2half(b));
+    return *reinterpret_cast<const uint32_t*>(&h);
+}
+
+__global__ void f32_to_f16_push_uint4_kernel(const float* __restrict__ src,
+                                             uint4* __restrict__ peer,
+                                             unsigned vectors) {
+    for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i < vectors; i += blockDim.x * gridDim.x) {
+        const float* x = src + 8 * i;
+        peer[i] = make_uint4(pack_half2_bits(x[0], x[1]), pack_half2_bits(x[2], x[3]),
+                             pack_half2_bits(x[4], x[5]), pack_half2_bits(x[6], x[7]));
+    }
+}
+
+__global__ void sum_f16_direct_kernel(float* __restrict__ data,
+                                      const uint4* __restrict__ peer,
+                                      unsigned vectors) {
+    const unsigned i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= vectors) return;
+    const uint4 p = peer[i];
+    const __half2 h0 = *reinterpret_cast<const __half2*>(&p.x);
+    const __half2 h1 = *reinterpret_cast<const __half2*>(&p.y);
+    const __half2 h2 = *reinterpret_cast<const __half2*>(&p.z);
+    const __half2 h3 = *reinterpret_cast<const __half2*>(&p.w);
+    float4* dst = reinterpret_cast<float4*>(data);
+    float4 d0 = dst[2 * i];
+    float4 d1 = dst[2 * i + 1];
+    d0.x = __half2float(__float2half(d0.x)) + __low2float(h0);
+    d0.y = __half2float(__float2half(d0.y)) + __high2float(h0);
+    d0.z = __half2float(__float2half(d0.z)) + __low2float(h1);
+    d0.w = __half2float(__float2half(d0.w)) + __high2float(h1);
+    d1.x = __half2float(__float2half(d1.x)) + __low2float(h2);
+    d1.y = __half2float(__float2half(d1.y)) + __high2float(h2);
+    d1.z = __half2float(__float2half(d1.z)) + __low2float(h3);
+    d1.w = __half2float(__float2half(d1.w)) + __high2float(h3);
+    dst[2 * i] = d0;
+    dst[2 * i + 1] = d1;
+}
+#endif
+
 }  // namespace
 
 std::shared_ptr<Tp2Comm> Tp2Comm::create(int dev0, int dev1, int max_floats) {
@@ -243,6 +285,25 @@ std::shared_ptr<Tp2Comm> Tp2Comm::create(int dev0, int dev1, int max_floats) {
         const size_t dma_bytes = (size_t) c->max_floats_ * sizeof(uint16_t);
         ck(cudaMalloc((void**) &c->dma_send_[r], dma_bytes), "tp2 dma_send");
         ck(cudaMalloc((void**) &c->dma_recv_[r], dma_bytes), "tp2 dma_recv");
+#if defined(STRATA_HIP_GFX906)
+        static const bool want_direct = [] {
+            const char* v = std::getenv("STRATA_TP2_PREFILL_DIRECT");
+            return v && v[0] == '1' && v[1] == '\0';
+        }();
+        c->direct_enabled_ = want_direct;
+        if (want_direct) {
+            for (int b = 0; b < 2; ++b) {
+                ck(hipExtMallocWithFlags((void**) &c->direct_inbox_[r][b], dma_bytes, hipDeviceMallocUncached),
+                   "tp2 direct_inbox");
+                hipEvent_t ep = nullptr, ed = nullptr;
+                ck(hipEventCreateWithFlags(&ep, hipEventDisableTiming | hipEventReleaseToSystem),
+                   "tp2 ev_direct_pushed");
+                ck(hipEventCreateWithFlags(&ed, hipEventDisableTiming), "tp2 ev_direct_done");
+                c->ev_direct_pushed_[r][b] = ep;
+                c->ev_direct_done_[r][b] = ed;
+            }
+        }
+#endif
         if (r == 0) {
             cudaEvent_t eb = nullptr;
             ck(cudaEventCreateWithFlags(&eb, cudaEventDisableTiming), "tp2 ev_bcast");
@@ -270,6 +331,11 @@ Tp2Comm::~Tp2Comm() {
         if (p2p_gen_[r]) (void) cudaFree(p2p_gen_[r]);
         if (dma_send_[r]) (void) cudaFree(dma_send_[r]);
         if (dma_recv_[r]) (void) cudaFree(dma_recv_[r]);
+        for (int b = 0; b < 2; ++b) {
+            if (direct_inbox_[r][b]) (void) cudaFree(direct_inbox_[r][b]);
+            if (ev_direct_pushed_[r][b]) (void) cudaEventDestroy(static_cast<cudaEvent_t>(ev_direct_pushed_[r][b]));
+            if (ev_direct_done_[r][b]) (void) cudaEventDestroy(static_cast<cudaEvent_t>(ev_direct_done_[r][b]));
+        }
         if (r == 0 && ev_bcast_) (void) cudaEventDestroy(static_cast<cudaEvent_t>(ev_bcast_));
         if (r == 1 && ev_bcast_done_) (void) cudaEventDestroy(static_cast<cudaEvent_t>(ev_bcast_done_));
     }
@@ -342,6 +408,31 @@ void Tp2Comm::all_reduce(int rank, float* data, int n, void* stream) {
         throw std::runtime_error("Tp2Comm::all_reduce: n=" + std::to_string(n) + " exceeds max_floats=" +
                                  std::to_string(max_floats_));
     // Large prefill path: symmetric FP16 peer copy (both ranks compute fp16(a) + fp16(b))
+#if defined(STRATA_HIP_GFX906)
+    if (direct_enabled_ && (n & 7) == 0 && n >= 32 * 2304) {
+        const int slot = direct_slot_[rank];
+        if (direct_used_[rank][slot])
+            ck(cudaStreamWaitEvent(cs(stream), static_cast<cudaEvent_t>(ev_direct_done_[peer][slot]), 0),
+               "tp2 direct wait done");
+        const unsigned vecs = (unsigned) (n / 8);
+        const unsigned pblocks = std::min(480u, (vecs + 255u) / 256u);
+        f32_to_f16_push_uint4_kernel<<<pblocks, 256, 0, cs(stream)>>>(
+            data, reinterpret_cast<uint4*>(direct_inbox_[peer][slot]), vecs);
+        ck(cudaEventRecord(static_cast<cudaEvent_t>(ev_direct_pushed_[rank][slot]), cs(stream)),
+           "tp2 direct record pushed");
+        host_barrier(rank);
+        ck(cudaStreamWaitEvent(cs(stream), static_cast<cudaEvent_t>(ev_direct_pushed_[peer][slot]), 0),
+           "tp2 direct wait pushed");
+        const unsigned sblocks = (vecs + 255u) / 256u;
+        sum_f16_direct_kernel<<<sblocks, 256, 0, cs(stream)>>>(
+            data, reinterpret_cast<const uint4*>(direct_inbox_[rank][slot]), vecs);
+        ck(cudaEventRecord(static_cast<cudaEvent_t>(ev_direct_done_[rank][slot]), cs(stream)),
+           "tp2 direct record done");
+        direct_used_[rank][slot] = true;
+        direct_slot_[rank] ^= 1;
+        return;
+    }
+#endif
     const int blocks = (n + 255) / 256;
     f32_to_f16_kernel<<<blocks, 256, 0, cs(stream)>>>(data, reinterpret_cast<__half*>(dma_send_[rank]), n);
     ck(cudaStreamSynchronize(cs(stream)), "tp2 dma ready sync");

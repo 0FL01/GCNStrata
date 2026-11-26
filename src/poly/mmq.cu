@@ -186,6 +186,14 @@ void plan(Scratch* s, const int32_t* ids, int tokens, SlotOrder order, int32_t* 
     ck("Inkling prefill plan");
 }
 
+void plan_single(Scratch* s, const int32_t* ids, int tokens, SlotOrder order, int j_gu, int j_dn, void* stream) {
+    const int r = tokens * picks, parts = ceil_div(r, slice);
+    auto st = (cudaStream_t) stream;
+    mask_picks<<<dim3(experts, parts), threads, 0, st>>>(s, ids, r, order);
+    make_plan_single<<<1, experts, 0, st>>>(s, parts, tokens, j_gu, j_dn);
+    ck("Inkling prefill single plan");
+}
+
 void scatter(const Scratch* s, int tokens, bool inverse, int32_t* tok, int32_t* place, void* stream) {
     scatter_picks<<<dim3(experts, ceil_div(tokens * picks, slice)), threads, 0, (cudaStream_t) stream>>>(s, inverse,
                                                                                                    tok, place);
@@ -243,6 +251,54 @@ bool Mmq::try_inkling_prefill_compact(const void* w, int type, bool down, size_t
     if (best == 32) launch_j.template operator()<32>();
     else launch_j.template operator()<64>();
     ck("Inkling prefill compact MMQ");
+    return true;
+}
+
+bool Mmq::inkling_prefill_compact_single(const void* w, int type, bool down, size_t stride, const void* xq,
+                                         const int32_t* ids, int tokens, int j, bool separate_dn_list,
+                                         const inkling_prefill::Scratch* scratch, float* dst, void* stream) {
+    using namespace inkling_prefill;
+    if (tokens < 1 || tokens > max_tokens || (j != 8 && j != 16 && j != 32) ||
+        (type != GGML_TYPE_Q4_0 && (!down || type != GGML_TYPE_Q4_1))) return false;
+    const auto& dev = ggml_cuda_info().devices[ggml_cuda_get_device()];
+    if (dev.cc != GGML_CUDA_CC_VEGA20 || dev.warp_size != 64) return false;
+    const auto t = (ggml_type) type;
+    const auto cfg = ggml_cuda_mmq_get_config(t, j, false, dev.cc);
+    if (cfg.type == GGML_TYPE_COUNT || cfg.I != 64 || cfg.J != j || cfg.nthreads != threads ||
+        cfg.K_vram != 256 || cfg.stream_k || cfg.use_mma_data_layout(dev.cc) ||
+        mmq_get_nbytes_shared(cfg, dev.cc) > dev.smpbo)
+        return false;
+    const size_t bs = ggml_type_size(t), stride_blocks = stride / bs;
+    const int matrix_blocks = width / 32 * (down ? ff : 2 * ff);
+    if (stride % bs || stride_blocks < (size_t) matrix_blocks ||
+        stride_blocks > (size_t) (INT_MAX - matrix_blocks - 8) / (experts - 1)) return false;
+    static const bool tail = [] {
+        const char* v = std::getenv("STRATA_TP2_PREFILL_Q4_TAIL");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    const int cap = single_cap(tokens, j), lds = mmq_get_nbytes_shared(cfg, dev.cc) + j * (int) sizeof(int);
+    if (lds > dev.smpbo) return false;
+    const Task* tlist = (down && separate_dn_list) ? scratch->list_dn : scratch->list_gu;
+    const int32_t* tused = (down && separate_dn_list) ? &scratch->used_dn : &scratch->used_gu;
+    const auto launch = [&]<ggml_type Q, int J, int K, int M, bool Tail = false>() {
+        CUDA_SET_SHARED_MEMORY_LIMIT((compact_mmq<Q, J, K, M, Tail>), lds);
+        compact_mmq<Q, J, K, M, Tail><<<dim3(M / 64, cap), dim3(64, 4), lds, (cudaStream_t) stream>>>(
+            (const char*) w, (const int*) xq, ids, tlist, tused, dst, (int) stride_blocks, tokens * picks);
+    };
+    const auto launch_j = [&]<int J>() {
+        if (!down) launch.template operator()<GGML_TYPE_Q4_0, J, width, 2 * ff>();
+        else if (t == GGML_TYPE_Q4_0) {
+            if (tail) launch.template operator()<GGML_TYPE_Q4_0, J, ff, width, true>();
+            else launch.template operator()<GGML_TYPE_Q4_0, J, ff, width>();
+        } else {
+            if (tail) launch.template operator()<GGML_TYPE_Q4_1, J, ff, width, true>();
+            else launch.template operator()<GGML_TYPE_Q4_1, J, ff, width>();
+        }
+    };
+    if (j == 8) launch_j.template operator()<8>();
+    else if (j == 16) launch_j.template operator()<16>();
+    else launch_j.template operator()<32>();
+    ck("Inkling prefill compact single MMQ");
     return true;
 }
 #endif

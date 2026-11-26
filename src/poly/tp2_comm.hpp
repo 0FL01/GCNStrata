@@ -53,6 +53,12 @@ private:
     // FP16 staging buffers & cross-device events for large prefill all-reduce (T > 8)
     uint16_t* dma_send_[2] = {};
     uint16_t* dma_recv_[2] = {};
+    uint16_t* direct_inbox_[2][2] = {};
+    void* ev_direct_pushed_[2][2] = {};
+    void* ev_direct_done_[2][2] = {};
+    int direct_slot_[2] = {0, 0};
+    bool direct_used_[2][2] = {};
+    bool direct_enabled_ = false;
     void* ev_bcast_ = nullptr;
     void* ev_bcast_done_ = nullptr;
 

@@ -3868,11 +3868,16 @@ void Engine::lin_raw(const LinWorkspace& ws, const Dev& w, const float* x, float
         // A row too large for the halves its blocks keep their sums in goes in divided by a power of two, and x is
         // left as it was for whatever reads it next (both exact): its product comes out divided by the same.
         const bool guard = half_sum_guard_ && Mmq::half_sums((int) w.type);
-        float* xs = const_cast<float*>(x);
-        if (guard) guard_half_sums(xs, w.n_in, w.n_in, n, ws.hf, ws.stream);
-        Mmq::quantize(x, nullptr, ws.mqx, (int) w.type, w.n_in, w.n_in, n, ws.stream);
-        if (guard) scale_rows(xs, w.n_in, w.n_in, n, nullptr, ws.hf, false, ws.stream);
-        ws.mmq->mul(w.p, (int) w.type, w.n_out, w.n_in, 0, 1, ws.mqx, nullptr, nullptr, n, n, y, w.n_out, ws.stream);
+        const void* mq_in = ws.mqx;
+        if (xq && !guard) {
+            mq_in = xq;
+        } else {
+            float* xs = const_cast<float*>(x);
+            if (guard) guard_half_sums(xs, w.n_in, w.n_in, n, ws.hf, ws.stream);
+            Mmq::quantize(x, nullptr, ws.mqx, (int) w.type, w.n_in, w.n_in, n, ws.stream);
+            if (guard) scale_rows(xs, w.n_in, w.n_in, n, nullptr, ws.hf, false, ws.stream);
+        }
+        ws.mmq->mul(w.p, (int) w.type, w.n_out, w.n_in, 0, 1, mq_in, nullptr, nullptr, n, n, y, w.n_out, ws.stream);
         if (guard) scale_rows(y, w.n_out, w.n_out, n, nullptr, ws.hf, false, ws.stream);
         return;
     }
@@ -4734,7 +4739,12 @@ void Engine::stage(const Layer& L, const int32_t* experts, int m, void* stream, 
 // (not necessarily expert ID order). Checking the live slots also keeps trim/refill out of this path.
 bool Engine::moe_rows_inkling_gpu(Layer& L, int il, int n) {
     using namespace inkling_prefill;
-    if (!inkling_prefill_ || n < max_tokens - 1 || n > max_tokens || recording_ || opt_.dump || !all_cached() ||
+    static const bool any_width = [] {
+        const char* v = std::getenv("STRATA_INKLING_GPU_PREFILL_ANY");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    const int min_n = any_width ? kStageRows : (max_tokens - 1);
+    if (!inkling_prefill_ || n < min_n || n > max_tokens || recording_ || opt_.dump || !all_cached() ||
         L.gu_type != GGML_TYPE_Q4_0 || L.mixed() ||
         (L.d_type != GGML_TYPE_Q4_0 && L.d_type != GGML_TYPE_Q4_1) ||
         !L.h_s_gate.empty() || !L.h_s_up.empty() || !L.h_s_down.empty() ||
@@ -4763,6 +4773,32 @@ bool Engine::moe_rows_inkling_gpu(Layer& L, int il, int n) {
     int32_t* place = tok + cap;
     int32_t* cb = tab_ + 3 * cap + 3 * (experts + 1);
     const bool inverse = tp2_q4_scatter();
+    if (any_width && n < max_tokens - 1) {
+        const int j_gu = gu_tile(n), j_dn = dn_tile(n);
+        const bool sep_dn = (j_dn != j_gu);
+        plan_single(s, d_ids_, n, order, j_gu, j_dn, st_);
+        scatter(s, n, inverse, tok, place, st_);
+        stats_.batch_cached += rr;
+        moe_shared(L, il, n);
+        if (inverse) Mmq::quantize_q4_scatter(xn_, tok, mq_, width, n, picks, st_);
+        else Mmq::quantize(xn_, tok, mq_, GGML_TYPE_Q4_0, width, width, rr, st_);
+        const uint8_t* w = L.slot[(size_t) order.expert[0]];
+        if (!Mmq::inkling_prefill_compact_single(w, GGML_TYPE_Q4_0, false, L.slot_bytes, mq_, iota_, n, j_gu,
+                                                 sep_dn, s, gu_, st_))
+            throw std::logic_error("Inkling compact single GU rejected validated shape");
+        expert_activation(gu_, hx_, rr, clamp_exp_[(size_t) il], ExpertScales{});
+        Mmq::quantize(hx_, nullptr, mq2_, (int) L.d_type, ff, ff, rr, st_);
+        if (!Mmq::inkling_prefill_compact_single(w + L.gu2(), (int) L.d_type, true, L.slot_bytes, mq2_, place, n,
+                                                 j_dn, sep_dn, s, dx_, st_))
+            throw std::logic_error("Inkling compact single Down rejected validated shape");
+        moe_sum(dx_, d_wts_, fo_, width, picks, n, st_);
+        if (!inkling_prefill_logged_) {
+            std::fprintf(stderr, "strata-poly: STRATA_INKLING_GPU_PREFILL_ANY=1 on device %d, T=%d, J_gu=%d J_dn=%d\n",
+                         device_, n, j_gu, j_dn);
+            inkling_prefill_logged_ = true;
+        }
+        return true;
+    }
     // A/B control: keep the resident selector and tables but use only stock MMQ geometry.
     static const bool compact = [] {
         const char* v = std::getenv("STRATA_INKLING_GPU_PREFILL_COMPACT");

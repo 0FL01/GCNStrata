@@ -190,7 +190,9 @@ private:
     bool q4_0_dense_cols_ = false; // STRATA_INKLING_Q4_0_DENSE_COLS=1: grouped multi-row Q4_0 dense projections
 #if defined(STRATA_HIP_GFX906)
     bool mix_rms_fuse_ = false;
+    bool prefill_fuse_ = false;
     bool moe_group_ballot_ = false;
+    float* state_next_ = nullptr;
     template<bool Ffn>
     void depth_mix_norm(const float* query, const float* weight, float* y, void* q, int n);
 #endif
@@ -224,7 +226,7 @@ private:
     size_t kv_bytes() const;
     void conv(float* x, float* state, const float* w, const float* dynamic, int width, int n);
     void store(const float* x, Cache& c, int side, int n);
-    void attention(const Block& b, int n);
+    void attention(const Block& b, int n, const float* k_in = nullptr, const float* v_in = nullptr);
 #if defined(STRATA_HIP_GFX906)
     void copy_swa(const Cache& live, const Cache& stage, int ring_head, int stage_head, int n, bool gather);
 #endif

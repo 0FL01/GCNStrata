@@ -24,6 +24,7 @@
 #include <stdexcept>
 
 #if defined(STRATA_HIP_GFX906)
+#include "inkling_prefill.hpp"
 #include "inkling_route_gfx906.cuh"
 #include <cfenv>
 #if defined(__x86_64__) && defined(__GLIBC__)
@@ -395,6 +396,107 @@ __global__ void __launch_bounds__(kMixThreads) fused_mix_norm(MixInputs in, int 
     mix_norm_from_lds<Ffn>(reinterpret_cast<const float*>(mixed), out, stream, row, eps);
 }
 
+struct alignas(4) PrefillMmqBlock {
+    union { float d4[4]; __half2 ds4[4]; };
+    int8_t qs[128];
+};
+static_assert(sizeof(PrefillMmqBlock) == 144 && offsetof(PrefillMmqBlock, qs) == 16);
+constexpr int kMmqPaddedWidth = ((kRowWidth + 511) / 512) * 512;
+
+template<bool DS4>
+__device__ __forceinline__ void pack_mmq_prefill(PrefillMmqBlock* dst, float4 x, int col, int rows, int row) {
+#pragma clang fp contract(off)
+    float amax = fabsf(x.x);
+    amax = fmaxf(amax, fabsf(x.y));
+    amax = fmaxf(amax, fabsf(x.z));
+    amax = fmaxf(amax, fabsf(x.w));
+#pragma unroll
+    for (int d = 4; d > 0; d >>= 1) amax = fmaxf(amax, __shfl_xor(amax, d, 64));
+    float sum = 0.f;
+    if constexpr (DS4) {
+        sum = x.x + x.y + x.z + x.w;
+#pragma unroll
+        for (int d = 4; d > 0; d >>= 1) sum += __shfl_xor(sum, d, 64);
+    }
+    const float inv = 127.f / amax;
+    char4 q;
+    q.x = roundf(x.x * inv);
+    q.y = roundf(x.y * inv);
+    q.z = roundf(x.z * inv);
+    q.w = roundf(x.w * inv);
+    const float scale = 1.f / inv;
+    PrefillMmqBlock& b = dst[size_t(col / 128) * rows + row];
+    reinterpret_cast<char4*>(b.qs)[(col % 128) / 4] = q;
+    if (col % 32 == 0) {
+        if constexpr (DS4) b.ds4[(col % 128) / 32] = __floats2half2_rn(scale, sum);
+        else b.d4[(col % 128) / 32] = scale;
+    }
+}
+
+template<bool DS4>
+__global__ void __launch_bounds__(kMixThreads)
+fused_mix_rms_mmq_prefill(MixInputs in, int count, const float* query, const float* weight, float4* y,
+                          PrefillMmqBlock* packed, int rows, float eps, float pad_zero) {
+#pragma clang fp contract(off)
+    constexpr int sum_threads = 1024;
+    __shared__ float4 mixed[kMixThreads];
+    __shared__ float part[sum_threads / 32];
+    const int tid = threadIdx.x, row = blockIdx.x;
+    const float4 raw = mix_value_registers(in, count, query, size_t(row) * kRowWidth);
+    mixed[tid] = raw;
+    __syncthreads();
+    const float* v = reinterpret_cast<const float*>(mixed);
+    for (int logical = tid; logical < sum_threads; logical += kMixThreads) {
+        float ss = 0.f;
+        for (int i = logical; i < kRowWidth; i += sum_threads) ss = __fmaf_rn(v[i], v[i], ss);
+        ss = mix_norm_sum(ss);
+        if ((logical & 31) == 0) part[logical >> 5] = ss;
+    }
+    __syncthreads();
+    float sum = 0.f;
+    for (int k = 0; k < sum_threads / 32; ++k) sum = __fadd_rn(sum, part[k]);
+    const float scale = 1.f / sqrtf(sum / float(kRowWidth) + eps);
+    const int c = tid * 4;
+    const float4 out = make_float4(raw.x * scale * weight[c], raw.y * scale * weight[c + 1],
+                                   raw.z * scale * weight[c + 2], raw.w * scale * weight[c + 3]);
+    y[size_t(row) * (kRowWidth / 4) + tid] = out;
+    if (packed) {
+        pack_mmq_prefill<DS4>(packed, out, c, rows, row);
+        if (tid < (kMmqPaddedWidth - kRowWidth) / 4)
+            pack_mmq_prefill<DS4>(packed, make_float4(pad_zero, pad_zero, pad_zero, pad_zero),
+                                  kRowWidth + c, rows, row);
+    }
+}
+
+__global__ void __launch_bounds__(kMixThreads)
+fused_mix_rms_ffn_prefill(MixInputs in, int count, const float* query, const float* weight, float4* y, float eps) {
+#pragma clang fp contract(off)
+    constexpr int sum_threads = 128;
+    __shared__ float4 mixed[kMixThreads];
+    __shared__ float part[sum_threads / 32];
+    const int tid = threadIdx.x, row = blockIdx.x;
+    const float4 raw = mix_value_registers(in, count, query, size_t(row) * kRowWidth);
+    mixed[tid] = raw;
+    __syncthreads();
+    const float* v = reinterpret_cast<const float*>(mixed);
+    if (tid < sum_threads) {
+        float ss = 0.f;
+        for (int i = tid; i < kRowWidth; i += sum_threads) ss = __fmaf_rn(v[i], v[i], ss);
+        ss = mix_norm_sum(ss);
+        if ((tid & 31) == 0) part[tid >> 5] = ss;
+    }
+    __syncthreads();
+    float sum = 0.f;
+    for (int k = 0; k < sum_threads / 32; ++k) sum = __fadd_rn(sum, part[k]);
+    const float scale = __fdiv_rn(1.f, __fsqrt_rn(__fadd_rn(__fdiv_rn(sum, float(kRowWidth)), eps)));
+    const int c = tid * 4;
+    y[size_t(row) * (kRowWidth / 4) + tid] = make_float4(
+        __fmul_rn(__fmul_rn(raw.x, scale), weight[c]),
+        __fmul_rn(__fmul_rn(raw.y, scale), weight[c + 1]),
+        __fmul_rn(__fmul_rn(raw.z, scale), weight[c + 2]),
+        __fmul_rn(__fmul_rn(raw.w, scale), weight[c + 3]));
+}
+
 #endif
 
 __global__ void control_kernel(float* cur, const float* msg, const float* gain, const float* forget, int count) {
@@ -541,6 +643,75 @@ __global__ void conv_span_kernel(float* x, float* state, const float* halo, cons
         h[2] = c;
     }
 }
+
+#if defined(STRATA_HIP_GFX906)
+// Out-of-place ShortConv for prefill batches (n > kConvSpan): reads immutable raw input x and incoming
+// history `before`, writes filtered output to `y` and outgoing history to `after` (eliminates conv_halo_kernel).
+__global__ void conv_fused_prefill_kernel(const float* __restrict__ x, const float* __restrict__ before,
+                                          const float* __restrict__ w, const float* __restrict__ dynamic,
+                                          float* __restrict__ y, float* __restrict__ after, int width, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, first = blockIdx.y * kConvSpan;
+    if (i >= width) return;
+    const int end = min(n, first + kConvSpan);
+    float a = first ? x[(size_t) (first - 3) * width + i] : before[3 * i];
+    float b = first ? x[(size_t) (first - 2) * width + i] : before[3 * i + 1];
+    float c = first ? x[(size_t) (first - 1) * width + i] : before[3 * i + 2];
+    w += 4 * i;
+    const float scale = dynamic ? 1.f / 3.f : 0.4472135954999579f;
+    for (int t = first; t < end; ++t) {
+        const size_t at = (size_t) t * width + i;
+        const float d = x[at];
+        float s = a * w[0] + b * w[1] + c * w[2] + d * w[3];
+        if (dynamic) {
+            const float* p = dynamic + 4 * (t * (width / 128) + i / 128);
+            s += d * p[0] + c * p[1] + b * p[2] + a * p[3];
+        }
+        y[at] = (d + s) * scale;
+        a = b;
+        b = c;
+        c = d;
+    }
+    if (end == n) {
+        after[3 * i] = a;
+        after[3 * i + 1] = b;
+        after[3 * i + 2] = c;
+    }
+}
+
+// Out-of-place static ShortConv fused with residual update (and optional depth_ snapshot) for prefill batches.
+__global__ void conv_add_prefill_kernel(const float* __restrict__ x, const float* __restrict__ before,
+                                        const float* __restrict__ w, float* __restrict__ r,
+                                        float* __restrict__ depth_copy, float* __restrict__ after, int width, int n) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, first = blockIdx.y * kConvSpan;
+    if (i >= width) return;
+    const int end = min(n, first + kConvSpan);
+    float a = first ? x[(size_t) (first - 3) * width + i] : before[3 * i];
+    float b = first ? x[(size_t) (first - 2) * width + i] : before[3 * i + 1];
+    float c = first ? x[(size_t) (first - 1) * width + i] : before[3 * i + 2];
+    w += 4 * i;
+    constexpr float scale = 0.4472135954999579f;
+    for (int t = first; t < end; ++t) {
+        const size_t at = (size_t) t * width + i;
+        const float d = x[at];
+        const float s = a * w[0] + b * w[1] + c * w[2] + d * w[3];
+        const float y = (d + s) * scale;
+        if (depth_copy) {
+            depth_copy[at] = r[at];
+            r[at] = y;
+        } else {
+            r[at] = r[at] + y;
+        }
+        a = b;
+        b = c;
+        c = d;
+    }
+    if (end == n) {
+        after[3 * i] = a;
+        after[3 * i + 1] = b;
+        after[3 * i + 2] = c;
+    }
+}
+#endif
 
 __device__ __forceinline__ void head_norm(float* x, const float* w, int width, int heads, float clip, float eps,
                                           int64_t pos, int floor, float alpha, int head, int row, float* waves) {
@@ -1071,6 +1242,11 @@ void Inkling2::load_geometry() {
 #if defined(STRATA_HIP_GFX906)
     const char* mix_rms = std::getenv("STRATA_INKLING_MIX_RMS_FUSE");
     mix_rms_fuse_ = decode_ && gfx906 && p.warpSize == 64 && mix_rms && std::strcmp(mix_rms, "1") == 0;
+    const char* pfuse = std::getenv("STRATA_INKLING_PREFILL_FUSE");
+    prefill_fuse_ = gfx906 && p.warpSize == 64 && !opt_.dump && pfuse && std::strcmp(pfuse, "1") == 0;
+    if (prefill_fuse_ && tp_rank_ == 0 && !prefill_only_)
+        std::fputs("strata-poly: STRATA_INKLING_PREFILL_FUSE=1: fused prefill mix+rms+mmq, Q8_1 reuse & OOP ShortConv\n",
+                   stderr);
     const char* group_ballot = std::getenv("STRATA_INKLING_MOE_GROUP_BALLOT");
     moe_group_ballot_ = gfx906 && p.warpSize == 64 && group_ballot && std::strcmp(group_ballot, "1") == 0;
 #endif
@@ -1369,12 +1545,15 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
         const char* v = std::getenv(name);
         return v && !std::strcmp(v, "1");
     };
-    const bool want_decode = enabled("STRATA_INKLING_GPU_ROUTE"), want_prefill = enabled("STRATA_INKLING_GPU_PREFILL");
+    const bool want_decode = enabled("STRATA_INKLING_GPU_ROUTE");
+    const bool want_prefill_any = enabled("STRATA_INKLING_GPU_PREFILL_ANY");
+    const bool want_prefill = enabled("STRATA_INKLING_GPU_PREFILL") || want_prefill_any;
     if (want_decode || want_prefill) {
         const bool shared = gpu_route_host_expf() && r0->gpu_route_supported() && r1->gpu_route_supported();
         const bool decode = shared && want_decode && Tp2Comm::small_push_enabled() &&
                             r0->gpu_decode_supported() && r1->gpu_decode_supported();
-        const bool prefill = shared && want_prefill && r0->rows_ >= 2047 && r1->rows_ >= 2047;
+        const int min_rows = want_prefill_any ? kStageRows : 2047;
+        const bool prefill = shared && want_prefill && r0->rows_ >= min_rows && r1->rows_ >= min_rows;
         if (decode) {
             r0->gpu_down_sum_ = r1->gpu_down_sum_ = enabled("STRATA_INKLING_DOWN_SUM");
             // The ordinary down path materializes at most kSumRows; only the CTA sum bypasses that plane.
@@ -2469,6 +2648,7 @@ void Inkling2::assign_scratch() {
         if (tp_rank_ == 0) tp2_logits_peer_ = fbuf(max_r * (size_t) (n_vocab_ - tp2_vocab_n_));
     }
 #if defined(STRATA_HIP_GFX906)
+    if (prefill_fuse_ && rec_n_ > 0) state_next_ = fbuf(rec_n_);
     if (prefill_only_) {
         cut_depth0_ = fbuf(width);
         cut_prelude_ = fbuf(width);
@@ -2559,7 +2739,9 @@ void Inkling2::copy_swa(const Cache& live, const Cache& stage, int ring_head, in
 }
 #endif
 
-void Inkling2::attention(const Block& b, int n) {
+void Inkling2::attention(const Block& b, int n, const float* k_in, const float* v_in) {
+    const float* kp = k_in ? k_in : k_;
+    const float* vp = v_in ? v_in : v_;
     Cache& live = caches_[visit_];
     const bool swa = local(visit_);
     int64_t pos = pos_;
@@ -2597,19 +2779,19 @@ void Inkling2::attention(const Block& b, int n) {
         const int blocks = 2 * (n_key_ / 32) * n;
         if (!kv_stored_)
             store2_q8_kernel<<<div_up(blocks, 256), 256, 0, cs(st_)>>>(
-                k_, v_, (int8_t*) c.planes[0].data, (__half*) c.planes[1].data, (int8_t*) c.planes[2].data,
+                kp, vp, (int8_t*) c.planes[0].data, (__half*) c.planes[1].data, (int8_t*) c.planes[2].data,
                 (__half*) c.planes[3].data, pos, ring, n, n_key_);
         kv_stored_ = false;
     }
 #if defined(STRATA_HIP_GFX906)
     else if (selected != &live) {
-        store_q8(k_, (int8_t*) c.planes[0].data, (uint16_t*) c.planes[1].data, n_key_, pos, n, st_);
-        store_q8(v_, (int8_t*) c.planes[2].data, (uint16_t*) c.planes[3].data, n_key_, pos, n, st_);
+        store_q8(kp, (int8_t*) c.planes[0].data, (uint16_t*) c.planes[1].data, n_key_, pos, n, st_);
+        store_q8(vp, (int8_t*) c.planes[2].data, (uint16_t*) c.planes[3].data, n_key_, pos, n, st_);
     }
 #endif
     else {
-        store(k_, c, 0, n);
-        store(v_, c, 1, n);
+        store(kp, c, 0, n);
+        store(vp, c, 1, n);
     }
     inkling::Attend a;
     a.q = q_;
@@ -2894,6 +3076,16 @@ void Inkling2::run_visits_local(int n, [[maybe_unused]] bool gpu_route) {
         if (!refresh_card_slots()) throw std::logic_error("Inkling GPU route resident slot table unavailable");
         zero_vram(gpu_route_dev_, sizeof(int32_t));
     }
+    static const bool gpu_prefill_any = [] {
+        const char* v = std::getenv("STRATA_INKLING_GPU_PREFILL_ANY");
+        return v && v[0] == '1' && v[1] == '\0';
+    }();
+    const bool gpu_prefill_any_check =
+        gpu_prefill_any && !gpu_route && inkling_prefill_ && h_inkling_prefill_ &&
+        n >= kStageRows && n < inkling_prefill::max_tokens - 1 && !recording_ && !opt_.dump && all_cached();
+    if (gpu_prefill_any_check)
+        ck(cudaMemsetAsync(&inkling_prefill_->any_invalid, 0, sizeof(int32_t), cs(st_)),
+           "Inkling prefill clear any_invalid");
 #endif
     fo_clean_ = false;   // fo_ is what the last call left
     if (!first_visit_) depth_n_ = 0;
@@ -2956,6 +3148,21 @@ void Inkling2::run_visits_local(int n, [[maybe_unused]] bool gpu_route) {
 #endif
     }
 #if defined(STRATA_HIP_GFX906)
+    if (prefill_fuse_ && state_next_ && n > kConvSpan) {
+        const size_t n_vis = (size_t) (run_last_visit_ - first_visit_);
+        const size_t off = conv_at(first_visit_);
+        ck(cudaMemcpyAsync(state_ + off, state_next_ + off, n_vis * conv_floats_ * sizeof(float),
+                           cudaMemcpyDeviceToDevice, cs(st_)),
+           "Inkling prefill conv state commit");
+    }
+    if (gpu_prefill_any_check) {
+        ck(cudaMemcpyAsync(&h_inkling_prefill_->invalid, &inkling_prefill_->any_invalid, sizeof(int32_t),
+                           cudaMemcpyDeviceToHost, cs(st_)),
+           "Inkling prefill deferred check");
+        ck(cudaStreamSynchronize(cs(st_)), "Inkling prefill deferred check sync");
+        if (h_inkling_prefill_->invalid)
+            throw std::runtime_error("Inkling GPU prefill routing failed (deferred check)");
+    }
     if (gpu_route) {
         const size_t bytes = (1 + size_t(kVisits) * n * inkling_route::kPicks) * sizeof(int32_t);
         ck(cudaMemcpyAsync(gpu_route_host_, gpu_route_dev_, bytes, cudaMemcpyDeviceToHost, cs(st_)),
@@ -2981,6 +3188,22 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
     const bool mmv = n < kStageRows;
     const bool three = streams == 3 && heads(b, il, swa, loop, n, norm);
     bool q8in = three;   // the stream inputs are Q8_1 already (heads(), or the loop below when it fuses)
+    const float* mqx_src = nullptr;
+    int mqx_bucket = -1;
+#if defined(STRATA_HIP_GFX906)
+    const bool can_pfuse = prefill_fuse_ && mmq_ && n >= kStageRows && !half_sum_guard_;
+    const auto mmq_bucket = [](uint32_t type) -> int {
+        switch (type) {
+            case GGML_TYPE_Q4_0:
+            case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_0:
+            case GGML_TYPE_Q5_1: return 0;  // DS4
+            case GGML_TYPE_Q8_0:
+            case GGML_TYPE_Q6_K: return 1;  // D4
+            default: return 2 + (int) type;
+        }
+    };
+#endif
     if (three) {
         const size_t w = (size_t) n * kWidth, wq = (size_t) n * kernels::native_q8_1_bytes(kWidth);
         xq = s3in_;
@@ -2994,7 +3217,7 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
     } else {
         const float* shared_depth = nullptr;
 #if defined(STRATA_HIP_GFX906)
-        if (prefill_depth_share_ && swa && loop && !windowed_ && (n == 2047 || n == 2048)) {
+        if (prefill_depth_share_ && swa && loop && !windowed_ && n >= kStageRows) {
             // Only SWA shares a depth query. Keep its raw mix in input_[2] until V's control reads it,
             // then V's final norm overwrites it on the same stream. Each bank norm writes only pair_'s second half.
             depth_mix(fp(b.aquery), input_[2], 0, n);
@@ -3009,6 +3232,32 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
                 void* q = i == 0 ? xq_ : i == 1 ? kq8_ : vq8_;
                 depth_mix_norm<false>(fp(b.aquery) + (swa ? 0 : i * kWidth), fp(*norm[i]), input_[i], q, n);
                 q8in = true;
+                continue;
+            }
+            if (can_pfuse && il != 0 && !loop && depth_n_ + 1 <= 5) {
+                MixInputs fm{};
+                for (int j = 0; j < depth_n_; ++j) fm.x[j] = depth_[j];
+                fm.x[depth_n_] = r_;
+                const float* qptr = fp(b.aquery) + (swa ? 0 : i * kWidth);
+                const int qb = mmq_bucket(b.q.type);
+                const bool pack_this =
+                    (i == 0 && (qb == 0 || qb == 1) && Mmq::fits((int) b.q.type, b.q.n_out, b.q.n_in));
+                if (pack_this) {
+                    if (qb == 0)
+                        fused_mix_rms_mmq_prefill<true><<<n, kMixThreads, 0, cs(st_)>>>(
+                            fm, depth_n_ + 1, qptr, fp(*norm[i]), reinterpret_cast<float4*>(input_[i]),
+                            reinterpret_cast<PrefillMmqBlock*>(mqx_), n, rms_eps_, 0.f);
+                    else
+                        fused_mix_rms_mmq_prefill<false><<<n, kMixThreads, 0, cs(st_)>>>(
+                            fm, depth_n_ + 1, qptr, fp(*norm[i]), reinterpret_cast<float4*>(input_[i]),
+                            reinterpret_cast<PrefillMmqBlock*>(mqx_), n, rms_eps_, 0.f);
+                    mqx_src = input_[0];
+                    mqx_bucket = qb;
+                } else {
+                    fused_mix_rms_mmq_prefill<false><<<n, kMixThreads, 0, cs(st_)>>>(
+                        fm, depth_n_ + 1, qptr, fp(*norm[i]), reinterpret_cast<float4*>(input_[i]),
+                        nullptr, n, rms_eps_, 0.f);
+                }
                 continue;
             }
 #endif
@@ -3035,6 +3284,48 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
     const void* shared = three ? s3q8_ : mmv ? xq_ : nullptr;
     if (fused(n) && n == 1) project(b, xq, xk, xv, streams == 1, shared, kq, vq);
     else if (q8_cols_ && fused(n) && n <= 8) project_cols(b, xq, xk, xv, streams == 1, shared, kq, vq, n);
+#if defined(STRATA_HIP_GFX906)
+    else if (can_pfuse) {
+        struct PPart {
+            const Dev* w;
+            const float* x;
+            float* y;
+            bool done;
+        } parts[5] = {{&b.q, xq, q_, false},
+                      {&b.rel, xq, rel_, false},
+                      {&b.gate, xq, gate_, false},
+                      {&b.k, xk, k_, false},
+                      {&b.v, xv, v_, false}};
+        if (mqx_src) {
+            for (PPart& p : parts) {
+                if (p.x == mqx_src && Mmq::fits((int) p.w->type, p.w->n_out, p.w->n_in) &&
+                    mmq_bucket(p.w->type) == mqx_bucket) {
+                    lin(*p.w, p.x, p.y, n, mqx_);
+                    p.done = true;
+                }
+            }
+        }
+        for (int i = 0; i < 5; ++i) {
+            if (parts[i].done) continue;
+            const Dev& w = *parts[i].w;
+            if (Mmq::fits((int) w.type, w.n_out, w.n_in)) {
+                const int bk = mmq_bucket(w.type);
+                Mmq::quantize(parts[i].x, nullptr, mqx_, (int) w.type, w.n_in, w.n_in, n, st_);
+                for (int j = i; j < 5; ++j) {
+                    if (!parts[j].done && parts[j].x == parts[i].x &&
+                        Mmq::fits((int) parts[j].w->type, parts[j].w->n_out, parts[j].w->n_in) &&
+                        parts[j].w->n_in == w.n_in && mmq_bucket(parts[j].w->type) == bk) {
+                        lin(*parts[j].w, parts[j].x, parts[j].y, n, mqx_);
+                        parts[j].done = true;
+                    }
+                }
+            } else {
+                lin(w, parts[i].x, parts[i].y, n);
+                parts[i].done = true;
+            }
+        }
+    }
+#endif
     else {
         lin(b.q, xq, q_, n, shared);
         lin(b.k, xk, k_, n, streams == 1 ? shared : kq);
@@ -3045,6 +3336,13 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
     lin(b.sink, xq, sink_, n);
 
     float* hist = state_ + conv_at(visit_);
+    float* k_cur = k_;
+    float* v_cur = v_;
+#if defined(STRATA_HIP_GFX906)
+    const bool oop_conv = prefill_fuse_ && state_next_ && n > kConvSpan;
+#else
+    constexpr bool oop_conv = false;
+#endif
     const auto kv_conv = [&](float* x, float* state, const Dev& w, const Dev& dyn, const float* input) {
         if (!swa) lin(dyn, input, taps_, n);
         conv(x, state, fp(w), swa ? nullptr : taps_, n_key_, n);
@@ -3087,6 +3385,19 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
             conv2_kernel<<<div_up(2 * n_key_, kThreads), kThreads, 0, cs(st_)>>>(ck, cv, n_key_, n, rec_n_);
             head_norms_kernel<<<dim3(2 * n_heads_ + 2 * n_kv_, n), kThreads, 0, cs(st_)>>>(h, rms_eps_, pos_, alpha_);
         }
+#if defined(STRATA_HIP_GFX906)
+    } else if (oop_conv) {
+        k_cur = att_;
+        v_cur = att_ + (size_t) n * n_key_;
+        float* hist_next = state_next_ + conv_at(visit_);
+        const dim3 gkv(div_up(n_key_, kThreads), div_up(n, kConvSpan));
+        if (!swa) lin(b.kproj, xk, taps_, n);
+        conv_fused_prefill_kernel<<<gkv, kThreads, 0, cs(st_)>>>(
+            k_, hist, fp(b.kconv), swa ? nullptr : taps_, k_cur, hist_next, n_key_, n);
+        if (!swa) lin(b.vproj, xv, taps_, n);
+        conv_fused_prefill_kernel<<<gkv, kThreads, 0, cs(st_)>>>(
+            v_, hist + 3 * n_key_, fp(b.vconv), swa ? nullptr : taps_, v_cur, hist_next + 3 * n_key_, n_key_, n);
+#endif
     } else {
         kv_conv(k_, hist, b.kconv, b.kproj, xk);
         kv_conv(v_, hist + 3 * n_key_, b.vconv, b.vproj, xv);
@@ -3097,13 +3408,13 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
     };
     if (!fused(n)) {
         heads(q_, fp(b.qclip), kHead, n_heads_, qk_clip_, floor);
-        heads(k_, nullptr, kHead, n_kv_, qk_clip_, 0);
-        heads(v_, nullptr, kHead, n_kv_, 0.f, 0);
+        heads(k_cur, nullptr, kHead, n_kv_, qk_clip_, 0);
+        heads(v_cur, nullptr, kHead, n_kv_, 0.f, 0);
         heads(rel_, fp(b.rclip), kRelative, n_heads_, r_clip_, floor);
     }
     dbg("Qcur", visit_, q_, n_query_);
-    dbg("Kcur", visit_, k_, n_key_);
-    attention(b, n);
+    dbg("Kcur", visit_, k_cur, n_key_);
+    attention(b, n, k_cur, v_cur);
 #if defined(STRATA_HIP_GFX906)
     bool o_done = false;
     if (q4_0_dense_cols_ && fused(n) && n >= 2 && n <= 8 && attq_ && b.o.type == GGML_TYPE_Q4_0 && b.o.scale == 1.f) {
@@ -3123,13 +3434,22 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
         conv_add_kernel<<<div_up(kWidth, kThreads), kThreads, 0, cs(st_)>>>(
             ao_, nullptr, hist + 6 * n_key_, fp(b.aconv), r_, il % kBlock == 0 ? depth_[depth_n_++] : nullptr, kWidth,
             n, false, TailSum{}, snap_of(hist + 6 * n_key_), rec_n_);
+#if defined(STRATA_HIP_GFX906)
+    else if (oop_conv) {
+        const dim3 gw(div_up(kWidth, kThreads), div_up(n, kConvSpan));
+        conv_add_prefill_kernel<<<gw, kThreads, 0, cs(st_)>>>(
+            ao_, hist + 6 * n_key_, fp(b.aconv), r_, il % kBlock == 0 ? depth_[depth_n_++] : nullptr,
+            state_next_ + conv_at(visit_) + 6 * n_key_, kWidth, n);
+    }
+#endif
     else conv(ao_, hist + 6 * n_key_, fp(b.aconv), nullptr, kWidth, n);
-    if (fused(n)) {   // conv_add_kernel() did the rest
+    if (fused(n) || oop_conv) {   // conv_add_kernel / conv_add_prefill_kernel did the rest
     } else if (il % kBlock == 0) {
         axpy(r_, 1.f, depth_[depth_n_++], n * kWidth, false, st_);
         axpy(ao_, 1.f, r_, n * kWidth, false, st_);
     } else axpy(ao_, 1.f, r_, n * kWidth, true, st_);
 
+    bool ffn_normed = false;
     if (loop) {
 #if defined(STRATA_HIP_GFX906)
         const Control& fc = b.control[3];
@@ -3155,13 +3475,19 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
 #if defined(STRATA_HIP_GFX906)
     } else if (mix_rms_fuse_ && n <= 8 && depth_n_ + 1 <= 5) {
         depth_mix_norm<true>(fp(b.fquery), fp(L.ffn_norm), xn_, xq_, n);
+        ffn_normed = true;
+    } else if (prefill_fuse_ && n >= kStageRows && depth_n_ + 1 <= 5 && L.gate_inp.type == kTypeF32) {
+        MixInputs fm{};
+        for (int j = 0; j < depth_n_; ++j) fm.x[j] = depth_[j];
+        fm.x[depth_n_] = r_;
+        fused_mix_rms_ffn_prefill<<<n, kMixThreads, 0, cs(st_)>>>(
+            fm, depth_n_ + 1, fp(b.fquery), fp(L.ffn_norm), reinterpret_cast<float4*>(xn_), rms_eps_);
+        ffn_normed = true;
 #endif
     } else {
         depth_mix(fp(b.fquery), cur_, 0, n);
     }
-#if defined(STRATA_HIP_GFX906)
-    if (loop || !mix_rms_fuse_ || n > 8 || depth_n_ + 1 > 5)
-#endif
+    if (!ffn_normed)
         kernels::native_add_rms_norm_q8_1(cur_, nullptr, fp(L.ffn_norm), xn_, xq_, kWidth, n, rms_eps_, 128, st_);
     // with STRATA_INKLING_ROUTE_DUAL and one token, the router's gemv below also writes the host h_rl_ and h_x_,
     // and moe_router() launches no copy2 for them
@@ -3334,6 +3660,16 @@ void Inkling2::layer_tail(Layer&, int il, int n) {
         dbg("l_out", visit_, r_, kWidth);
         return;
     }
+#if defined(STRATA_HIP_GFX906)
+    if (prefill_fuse_ && state_next_ && n > kConvSpan) {
+        const dim3 gw(div_up(kWidth, kThreads), div_up(n, kConvSpan));
+        conv_add_prefill_kernel<<<gw, kThreads, 0, cs(st_)>>>(
+            fo_, hist, fp(blocks_[il].fconv), r_, nullptr,
+            state_next_ + conv_at(visit_) + 6 * n_key_ + 3 * kWidth, kWidth, n);
+        dbg("l_out", visit_, r_, kWidth);
+        return;
+    }
+#endif
     conv(fo_, hist, fp(blocks_[il].fconv), nullptr, kWidth, n);
     axpy(fo_, 1.f, r_, n * kWidth, true, st_);
     dbg("l_out", visit_, r_, kWidth);
