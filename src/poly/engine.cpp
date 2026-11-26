@@ -3493,8 +3493,10 @@ void Engine::load_state(const uint8_t* src, int64_t pos) {
     if (pos < 0 || pos > opt_.max_context) throw std::logic_error("load_state: the position is outside the context");
     OnCard here(device_, split_);
     ck(cudaStreamSynchronize(cs(st_)), "load state");
-    ck(cudaMemcpy(state_, src, state_n_ * sizeof(float), cudaMemcpyHostToDevice), "load state");
-    load_extra(src + state_n_ * sizeof(float), pos);
+    if (!load_card_state_fast(src, pos)) {
+        ck(cudaMemcpy(state_, src, state_n_ * sizeof(float), cudaMemcpyHostToDevice), "load state");
+        load_extra(src + state_n_ * sizeof(float), pos);
+    }
     pos_ = pos;
     ahead_pos_ = -1;
     if (next_) next_->load_state(src + card_state_bytes(), pos);

@@ -55,6 +55,7 @@ protected:
     void save_card_state(uint8_t* dst) override;
     void save_layer(int il, int64_t pos, uint8_t* dst) override;
     void load_extra(const uint8_t* src, int64_t pos) override;
+    bool load_card_state_fast(const uint8_t* src, int64_t pos) override;
     void layer_head(Layer& L, int il, int n) override;
     void layer_tail(Layer& L, int il, int n) override;
     void output_rows(int first, int rows, float* h) override;
@@ -229,6 +230,16 @@ private:
     void attention(const Block& b, int n, const float* k_in = nullptr, const float* v_in = nullptr);
 #if defined(STRATA_HIP_GFX906)
     void copy_swa(const Cache& live, const Cache& stage, int ring_head, int stage_head, int n, bool gather);
+    uint8_t* ckpt_dev_ = nullptr;
+    uint8_t* ckpt_pin_ = nullptr;
+    size_t ckpt_cap_ = 0;
+    uint8_t* park_pin_[2] = {nullptr, nullptr};
+    cudaEvent_t park_ev_[2] = {nullptr, nullptr};
+    void ensure_ckpt_bufs(size_t bytes);
+    void ensure_park_bufs();
+    void free_v7r4_bufs();
+    void save_rows_pinned(int64_t first, int64_t n, uint8_t* dst);
+    void load_rows_pinned(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n);
 #endif
     void depth_mix(const float* query, float* dst, int first, int n);
     void control(const Block& b, int il, int stream, float* in, int n, const float* shared_depth = nullptr);

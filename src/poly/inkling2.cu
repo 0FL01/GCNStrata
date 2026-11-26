@@ -66,6 +66,82 @@ __global__ void swa_copy_kernel(SwaCopyPlanes p, int ring, int ring_head, int st
     else p.ring[j][src] = p.stage[j][dst];
 }
 
+struct SwaPackDesc {
+    uint8_t* base[40];
+    int stride_w[4];
+    int n_visits;
+};
+
+template <bool Pack>
+__global__ void pack_swa_state_kernel(SwaPackDesc d, uint32_t* __restrict__ slab, int ring, int keep, int64_t pos) {
+    const int vi = blockIdx.y;
+    if (vi >= d.n_visits) return;
+    const int total_w = d.stride_w[0] + d.stride_w[1] + d.stride_w[2] + d.stride_w[3];
+    const int visit_w = keep * total_w;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= visit_w) return;
+    const int k0 = keep * d.stride_w[0];
+    const int k1 = k0 + keep * d.stride_w[1];
+    const int k2 = k1 + keep * d.stride_w[2];
+    int j, rem, prev_w;
+    if (idx < k0) { j = 0; rem = idx; prev_w = 0; }
+    else if (idx < k1) { j = 1; rem = idx - k0; prev_w = d.stride_w[0]; }
+    else if (idx < k2) { j = 2; rem = idx - k1; prev_w = d.stride_w[0] + d.stride_w[1]; }
+    else { j = 3; rem = idx - k2; prev_w = d.stride_w[0] + d.stride_w[1] + d.stride_w[2]; }
+    const int sj = d.stride_w[j];
+    const int r = rem / sj, c = rem - r * sj;
+    const int64_t seq_row = pos - keep + r;
+    uint32_t* ring_p = reinterpret_cast<uint32_t*>(d.base[vi]) + (size_t) ring * prev_w;
+    const size_t slab_idx = (size_t) vi * visit_w + idx;
+    if constexpr (Pack) {
+        slab[slab_idx] = (seq_row < 0) ? 0u : ring_p[(size_t) (seq_row % ring) * sj + c];
+    } else {
+        if (seq_row >= 0) ring_p[(size_t) (seq_row % ring) * sj + c] = slab[slab_idx];
+    }
+}
+
+bool fast_ckpt_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_INKLING_FAST_CHECKPOINT");
+        if (v && v[0] == '1' && v[1] == '\0') {
+            std::fputs("strata-poly: STRATA_INKLING_FAST_CHECKPOINT=1: GPU-packed parallel pinned checkpoint I/O\n", stderr);
+            return true;
+        }
+        return false;
+    }();
+    return on;
+}
+
+bool fast_park_enabled() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_INKLING_FAST_PARK");
+        if (v && v[0] == '1' && v[1] == '\0') {
+            std::fputs("strata-poly: STRATA_INKLING_FAST_PARK=1: dual-GPU double-buffered pinned park/restore\n", stderr);
+            return true;
+        }
+        return false;
+    }();
+    return on;
+}
+
+void parallel_copy_bytes(void* dst, const void* src, size_t bytes, Workers* workers) {
+    if (!bytes) return;
+    if (!workers || workers->threads() <= 1 || bytes < (size_t(4) << 20)) {
+        std::memcpy(dst, src, bytes);
+        return;
+    }
+    constexpr size_t kChunk = size_t(2) << 20;
+    const int jobs = (int) ((bytes + kChunk - 1) / kChunk);
+    auto* d = static_cast<uint8_t*>(dst);
+    const auto* s = static_cast<const uint8_t*>(src);
+    workers->run(jobs, [d, s, bytes](int job) {
+        constexpr size_t kC = size_t(2) << 20;
+        const size_t off = (size_t) job * kC;
+        const size_t n = std::min(kC, bytes - off);
+        std::memcpy(d + off, s + off, n);
+    });
+}
+
 bool gpu_route_host_fp() {
 #if defined(__x86_64__) && defined(__GLIBC__)
     // Match the x86 glibc FMA expf, with nearest rounding and no FTZ or DAZ on the CPU.
@@ -1458,6 +1534,7 @@ Inkling2::~Inkling2() {
 #if defined(STRATA_HIP_GFX906)
     stage_b_.reset();
     destroy_phase_dualtp_handles();
+    free_v7r4_bufs();
 #endif
     stop_peer_thread();
     if (df_gpu23_) {
@@ -1639,6 +1716,16 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
     r0->start_peer_thread();
 #if defined(STRATA_HIP_GFX906)
     r0->phase_dualtp_init(o);
+    if (fast_ckpt_enabled() && !r0->ds_on() && r0->q8()) {
+        const size_t keep = (size_t) std::min(r0->opt_.max_context, kWindow - 1);
+        const size_t swa = (size_t) (kVisits - kVisits / kBlock) * keep * r0->kv_bytes();
+        r0->ensure_ckpt_bufs(r0->state_n_ * sizeof(float) + swa);
+        r0->peer_->ensure_ckpt_bufs(r0->peer_->state_n_ * sizeof(float) + swa);
+    }
+    if (fast_park_enabled() && !r0->ds_on()) {
+        r0->ensure_park_bufs();
+        r0->peer_->ensure_park_bufs();
+    }
 #endif
     return r0;
 }
@@ -2366,12 +2453,183 @@ void Inkling2::alloc_caches() {
         }
 }
 
+#if defined(STRATA_HIP_GFX906)
+namespace {
+constexpr size_t kParkChunkBytes = size_t(16) << 20;
+
+template<class CacheArr>
+bool build_swa_pack_desc(const CacheArr& caches, int first_v, int last_v, int ring, SwaPackDesc& d) {
+    d = SwaPackDesc{};
+    int nv = 0;
+    for (int v = first_v; v < last_v; ++v) {
+        if (v % 6 == 5) continue;
+        const auto& pl = caches[v].planes;
+        if (!pl[0].data || pl[0].stride == 0 || (pl[0].stride & 3) || (pl[1].stride & 3) ||
+            (pl[2].stride & 3) || (pl[3].stride & 3))
+            return false;
+        if (nv == 0) {
+            for (int j = 0; j < 4; ++j) d.stride_w[j] = (int) (pl[j].stride / 4);
+        } else {
+            for (int j = 0; j < 4; ++j) if ((int) (pl[j].stride / 4) != d.stride_w[j]) return false;
+        }
+        // Verify contiguous 4-plane ring layout produced by alloc_caches().
+        size_t off = 0;
+        for (int j = 0; j < 4; ++j) {
+            if (pl[j].stride && pl[j].data != pl[0].data + off) return false;
+            off += (size_t) ring * pl[j].stride;
+        }
+        if (nv >= 40) return false;
+        d.base[nv++] = pl[0].data;
+    }
+    d.n_visits = nv;
+    return nv > 0;
+}
+}  // namespace
+
+void Inkling2::ensure_ckpt_bufs(size_t bytes) {
+    if (ckpt_cap_ >= bytes && ckpt_dev_ && ckpt_pin_) return;
+    int prev = 0;
+    ck(cudaGetDevice(&prev), "ckpt getDevice");
+    ck(cudaSetDevice(device_), "ckpt setDevice");
+    if (ckpt_dev_) { (void) cudaFree(ckpt_dev_); ckpt_dev_ = nullptr; }
+    if (ckpt_pin_) { (void) cudaFreeHost(ckpt_pin_); ckpt_pin_ = nullptr; }
+    ckpt_cap_ = 0;
+    ck(cudaMalloc(&ckpt_dev_, bytes), "ckpt alloc dev");
+    ck(cudaHostAlloc(&ckpt_pin_, bytes, cudaHostAllocDefault), "ckpt alloc pin");
+    ckpt_cap_ = bytes;
+    (void) cudaSetDevice(prev);
+}
+
+void Inkling2::ensure_park_bufs() {
+    if (park_pin_[0] && park_pin_[1] && park_ev_[0] && park_ev_[1]) return;
+    int prev = 0;
+    ck(cudaGetDevice(&prev), "park getDevice");
+    ck(cudaSetDevice(device_), "park setDevice");
+    for (int b = 0; b < 2; ++b) {
+        if (!park_pin_[b]) ck(cudaHostAlloc(&park_pin_[b], kParkChunkBytes, cudaHostAllocDefault), "park alloc pin");
+        if (!park_ev_[b]) ck(cudaEventCreateWithFlags(&park_ev_[b], cudaEventDisableTiming), "park alloc ev");
+    }
+    (void) cudaSetDevice(prev);
+}
+
+void Inkling2::free_v7r4_bufs() {
+    int prev = 0;
+    if (cudaGetDevice(&prev) != cudaSuccess) return;
+    if (cudaSetDevice(device_) == cudaSuccess) {
+        if (ckpt_dev_) { (void) cudaFree(ckpt_dev_); ckpt_dev_ = nullptr; }
+        if (ckpt_pin_) { (void) cudaFreeHost(ckpt_pin_); ckpt_pin_ = nullptr; }
+        ckpt_cap_ = 0;
+        for (int b = 0; b < 2; ++b) {
+            if (park_pin_[b]) { (void) cudaFreeHost(park_pin_[b]); park_pin_[b] = nullptr; }
+            if (park_ev_[b]) { (void) cudaEventDestroy(park_ev_[b]); park_ev_[b] = nullptr; }
+        }
+        (void) cudaSetDevice(prev);
+    }
+}
+
+void Inkling2::save_rows_pinned(int64_t first, int64_t n, uint8_t* dst) {
+    ck(cudaSetDevice(device_), "save_rows_pinned dev");
+    ck(cudaStreamSynchronize(cs(st_)), "save_rows_pinned sync");
+    int slot = 0;
+    uint8_t* prev_dst = nullptr;
+    size_t prev_bytes = 0;
+    int prev_slot = 0;
+    for (int i = 0; i < kVisits; ++i) if (!local(i)) {
+        for (const auto& p : caches_[i].planes) if (p.stride) {
+            const size_t total = (size_t) n * p.stride;
+            const uint8_t* dev = p.data + first * p.stride;
+            for (size_t off = 0; off < total;) {
+                const size_t chunk = std::min(kParkChunkBytes, total - off);
+                ck(cudaMemcpyAsync(park_pin_[slot], dev + off, chunk, cudaMemcpyDeviceToHost, cs(st_)),
+                   "save_rows_pinned D2H");
+                ck(cudaEventRecord(park_ev_[slot], cs(st_)), "save_rows_pinned record");
+                if (prev_bytes) {
+                    ck(cudaEventSynchronize(park_ev_[prev_slot]), "save_rows_pinned wait");
+                    std::memcpy(prev_dst, park_pin_[prev_slot], prev_bytes);
+                }
+                prev_dst = dst;
+                prev_bytes = chunk;
+                prev_slot = slot;
+                slot ^= 1;
+                dst += chunk;
+                off += chunk;
+            }
+        }
+    }
+    if (prev_bytes) {
+        ck(cudaEventSynchronize(park_ev_[prev_slot]), "save_rows_pinned drain");
+        std::memcpy(prev_dst, park_pin_[prev_slot], prev_bytes);
+    }
+}
+
+void Inkling2::load_rows_pinned(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) {
+    ck(cudaSetDevice(device_), "load_rows_pinned dev");
+    cover(first + n);
+    ck(cudaStreamSynchronize(cs(st_)), "load_rows_pinned sync");
+    int slot = 0;
+    bool inflight[2] = {false, false};
+    for (int i = 0; i < kVisits; ++i) if (!local(i)) {
+        for (const auto& p : caches_[i].planes) if (p.stride) {
+            const size_t total = (size_t) n * p.stride;
+            uint8_t* dev = p.data + first * p.stride;
+            const uint8_t* host = src + (size_t) (first - from) * p.stride;
+            for (size_t off = 0; off < total;) {
+                const size_t chunk = std::min(kParkChunkBytes, total - off);
+                if (inflight[slot]) ck(cudaEventSynchronize(park_ev_[slot]), "load_rows_pinned wait");
+                std::memcpy(park_pin_[slot], host + off, chunk);
+                ck(cudaMemcpyAsync(dev + off, park_pin_[slot], chunk, cudaMemcpyHostToDevice, cs(st_)),
+                   "load_rows_pinned H2D");
+                ck(cudaEventRecord(park_ev_[slot], cs(st_)), "load_rows_pinned record");
+                inflight[slot] = true;
+                slot ^= 1;
+                off += chunk;
+            }
+            src += (size_t) count * p.stride;
+        }
+    }
+    ck(cudaStreamSynchronize(cs(st_)), "load_rows_pinned drain");
+}
+#endif
+
 void Inkling2::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
 #if defined(STRATA_HIP_GFX906)
     if (gpu_route_failed_) throw std::runtime_error("cannot save rows from a failed Inkling GPU route");
 #endif
     if (first < 0 || n < 0 || first + n > opt_.max_context) throw std::logic_error("save_rows: outside context");
     if (!n) return;
+#if defined(STRATA_HIP_GFX906)
+    if (fast_park_enabled() && peer_ && tp_size_ == 2 && !ds_on()) {
+        ensure_park_bufs();
+        peer_->ensure_park_bufs();
+        const size_t r0_bytes = (size_t) n * owned_full() * kv_bytes();
+        // Pre-fault destination buffer pages in parallel before dual-GPU pinned DMA.
+        if (workers_ && workers_->threads() > 1 && 2 * r0_bytes >= (size_t(4) << 20)) {
+            constexpr size_t kTouch = size_t(2) << 20;
+            const size_t total = 2 * r0_bytes;
+            const int jobs = (int) ((total + kTouch - 1) / kTouch);
+            workers_->run(jobs, [dst, total](int job) {
+                constexpr size_t kT = size_t(2) << 20;
+                const size_t a = (size_t) job * kT, b = std::min(total, a + kT);
+                volatile uint8_t* p = dst;
+                for (size_t x = a; x < b; x += 4096) p[x] = 0;
+                if (a < b) p[b - 1] = 0;
+            });
+        }
+        std::exception_ptr err1;
+        std::thread t1([&] {
+            try { peer_->save_rows_pinned(first, n, dst + r0_bytes); }
+            catch (...) { err1 = std::current_exception(); }
+        });
+        std::exception_ptr err0;
+        try { save_rows_pinned(first, n, dst); }
+        catch (...) { err0 = std::current_exception(); }
+        t1.join();
+        (void) cudaSetDevice(device_);
+        if (err0) std::rethrow_exception(err0);
+        if (err1) std::rethrow_exception(err1);
+        return;
+    }
+#endif
     ck(cudaStreamSynchronize(cs(st_)), "save Inkling rows");
     for (int i = 0; i < kVisits; ++i) if (!local(i)) {
         for (const auto& p : caches_[i].planes) if (p.stride) {
@@ -2401,6 +2659,26 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
 #if defined(STRATA_HIP_GFX906)
     if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, first);
     stage_b_kv_valid_ = std::min(stage_b_kv_valid_, first);
+    if (fast_park_enabled() && peer_ && tp_size_ == 2 && !ds_on()) {
+        if (peer_->kv_helper_) inkling::kv_helpers::invalidate(*peer_->kv_helper_, first);
+        peer_->stage_b_kv_valid_ = std::min(peer_->stage_b_kv_valid_, first);
+        ensure_park_bufs();
+        peer_->ensure_park_bufs();
+        const size_t r0_count_bytes = (size_t) count * owned_full() * kv_bytes();
+        std::exception_ptr err1;
+        std::thread t1([&] {
+            try { peer_->load_rows_pinned(src + r0_count_bytes, from, count, first, n); }
+            catch (...) { err1 = std::current_exception(); }
+        });
+        std::exception_ptr err0;
+        try { load_rows_pinned(src, from, count, first, n); }
+        catch (...) { err0 = std::current_exception(); }
+        t1.join();
+        (void) cudaSetDevice(device_);
+        if (err0) std::rethrow_exception(err0);
+        if (err1) std::rethrow_exception(err1);
+        return;
+    }
 #endif
     cover(first + n);
     ck(cudaStreamSynchronize(cs(st_)), "load Inkling rows");
@@ -2471,6 +2749,48 @@ void Inkling2::ds_ring(int l, int64_t pos, const uint8_t* src, uint8_t* dst) {
 void Inkling2::save_card_state(uint8_t* dst) {
 #if defined(STRATA_HIP_GFX906)
     if (gpu_route_failed_) throw std::runtime_error("cannot save state from a failed Inkling GPU route");
+    if (fast_ckpt_enabled() && peer_ && tp_size_ == 2 && !ds_on() && q8() && !next_ && ring_ > 0 &&
+        peer_->ring_ == ring_ && pos_ >= 0 && pos_ <= opt_.max_context) {
+        SwaPackDesc d0{}, d1{};
+        if (build_swa_pack_desc(caches_, 0, kVisits, ring_, d0) &&
+            build_swa_pack_desc(peer_->caches_, 0, kVisits, peer_->ring_, d1)) {
+            const int keep = (int) std::min(opt_.max_context, kWindow - 1);
+            const size_t one = (size_t) keep * kv_bytes();
+            const size_t swa_bytes = (size_t) d0.n_visits * one;
+            const size_t r0_state = state_n_ * sizeof(float), r1_state = peer_->state_n_ * sizeof(float);
+            const size_t r0_total = r0_state + swa_bytes, r1_total = r1_state + swa_bytes;
+            const int total_w = d0.stride_w[0] + d0.stride_w[1] + d0.stride_w[2] + d0.stride_w[3];
+            const dim3 grid(div_up(keep * total_w, 256), d0.n_visits);
+            ensure_ckpt_bufs(r0_total);
+            peer_->ensure_ckpt_bufs(r1_total);
+            // Enqueue GPU pack + pinned D2H DMA on both GPUs concurrently.
+            ck(cudaSetDevice(device_), "fast_ckpt save dev0");
+            ck(cudaMemcpyAsync(ckpt_dev_, state_, r0_state, cudaMemcpyDeviceToDevice, cs(st_)), "fast_ckpt save s0");
+            pack_swa_state_kernel<true><<<grid, 256, 0, cs(st_)>>>(
+                d0, reinterpret_cast<uint32_t*>(ckpt_dev_ + r0_state), ring_, keep, pos_);
+            ck(cudaGetLastError(), "fast_ckpt save pack0");
+            ck(cudaMemcpyAsync(ckpt_pin_, ckpt_dev_, r0_total, cudaMemcpyDeviceToHost, cs(st_)), "fast_ckpt save d2h0");
+
+            ck(cudaSetDevice(peer_->device_), "fast_ckpt save dev1");
+            ck(cudaMemcpyAsync(peer_->ckpt_dev_, peer_->state_, r1_state, cudaMemcpyDeviceToDevice, cs(peer_->st_)),
+               "fast_ckpt save s1");
+            pack_swa_state_kernel<true><<<grid, 256, 0, cs(peer_->st_)>>>(
+                d1, reinterpret_cast<uint32_t*>(peer_->ckpt_dev_ + r1_state), peer_->ring_, keep, pos_);
+            ck(cudaGetLastError(), "fast_ckpt save pack1");
+            ck(cudaMemcpyAsync(peer_->ckpt_pin_, peer_->ckpt_dev_, r1_total, cudaMemcpyDeviceToHost, cs(peer_->st_)),
+               "fast_ckpt save d2h1");
+
+            ck(cudaSetDevice(device_), "fast_ckpt save sync0");
+            ck(cudaStreamSynchronize(cs(st_)), "fast_ckpt save sync0");
+            parallel_copy_bytes(dst, ckpt_pin_, r0_total, workers_.get());
+            ck(cudaSetDevice(peer_->device_), "fast_ckpt save sync1");
+            ck(cudaStreamSynchronize(cs(peer_->st_)), "fast_ckpt save sync1");
+            peer_->pos_ = pos_;
+            parallel_copy_bytes(dst + r0_total, peer_->ckpt_pin_, r1_total, workers_.get());
+            (void) cudaSetDevice(device_);
+            return;
+        }
+    }
 #endif
     static const bool pack = [] {
         const char* p = std::getenv("STRATA_INKLING_STATE_PACK");
@@ -2580,6 +2900,68 @@ void Inkling2::save_layer(int il, int64_t pos, uint8_t* dst) {
             ring_state(i, pos, nullptr, dst + state_n_ * sizeof(float) + offset);
         }
     }
+}
+
+bool Inkling2::load_card_state_fast(const uint8_t* src, int64_t pos) {
+#if defined(STRATA_HIP_GFX906)
+    if (!fast_ckpt_enabled() || !peer_ || tp_size_ != 2 || ds_on() || !q8() || next_ || ring_ <= 0 ||
+        peer_->ring_ != ring_)
+        return false;
+    SwaPackDesc d0{}, d1{};
+    if (!build_swa_pack_desc(caches_, 0, kVisits, ring_, d0) ||
+        !build_swa_pack_desc(peer_->caches_, 0, kVisits, peer_->ring_, d1))
+        return false;
+    const int64_t keep_valid = (pos <= pos_) ? pos : 0;
+    if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, keep_valid);
+    if (peer_->kv_helper_) inkling::kv_helpers::invalidate(*peer_->kv_helper_, keep_valid);
+    stage_b_kv_valid_ = std::min(stage_b_kv_valid_, keep_valid);
+    peer_->stage_b_kv_valid_ = std::min(peer_->stage_b_kv_valid_, keep_valid);
+    if (df_gpu23_) df_gpu23_->prov_valid = false;
+    df_lo_ = df_hi_ = pos;
+
+    const int keep = (int) std::min(opt_.max_context, kWindow - 1);
+    const size_t one = (size_t) keep * kv_bytes();
+    const size_t swa_bytes = (size_t) d0.n_visits * one;
+    const size_t r0_state = state_n_ * sizeof(float), r1_state = peer_->state_n_ * sizeof(float);
+    const size_t r0_total = r0_state + swa_bytes, r1_total = r1_state + swa_bytes;
+    const int total_w = d0.stride_w[0] + d0.stride_w[1] + d0.stride_w[2] + d0.stride_w[3];
+    const dim3 grid(div_up(keep * total_w, 256), d0.n_visits);
+    ensure_ckpt_bufs(r0_total);
+    peer_->ensure_ckpt_bufs(r1_total);
+
+    parallel_copy_bytes(ckpt_pin_, src, r0_total, workers_.get());
+    // Start rank 0 H2D DMA while CPU copies rank 1 into its pinned bounce buffer.
+    ck(cudaSetDevice(device_), "fast_ckpt load dev0");
+    ck(cudaMemcpyAsync(ckpt_dev_, ckpt_pin_, r0_total, cudaMemcpyHostToDevice, cs(st_)), "fast_ckpt load h2d0");
+    ck(cudaMemcpyAsync(state_, ckpt_dev_, r0_state, cudaMemcpyDeviceToDevice, cs(st_)), "fast_ckpt load s0");
+    pack_swa_state_kernel<false><<<grid, 256, 0, cs(st_)>>>(
+        d0, reinterpret_cast<uint32_t*>(ckpt_dev_ + r0_state), ring_, keep, pos);
+    ck(cudaGetLastError(), "fast_ckpt load unpack0");
+
+    parallel_copy_bytes(peer_->ckpt_pin_, src + r0_total, r1_total, workers_.get());
+    ck(cudaSetDevice(peer_->device_), "fast_ckpt load dev1");
+    ck(cudaStreamSynchronize(cs(peer_->st_)), "fast_ckpt load pre1");
+    ck(cudaMemcpyAsync(peer_->ckpt_dev_, peer_->ckpt_pin_, r1_total, cudaMemcpyHostToDevice, cs(peer_->st_)),
+       "fast_ckpt load h2d1");
+    ck(cudaMemcpyAsync(peer_->state_, peer_->ckpt_dev_, r1_state, cudaMemcpyDeviceToDevice, cs(peer_->st_)),
+       "fast_ckpt load s1");
+    pack_swa_state_kernel<false><<<grid, 256, 0, cs(peer_->st_)>>>(
+        d1, reinterpret_cast<uint32_t*>(peer_->ckpt_dev_ + r1_state), peer_->ring_, keep, pos);
+    ck(cudaGetLastError(), "fast_ckpt load unpack1");
+
+    ck(cudaSetDevice(device_), "fast_ckpt load sync0");
+    ck(cudaStreamSynchronize(cs(st_)), "fast_ckpt load sync0");
+    ck(cudaSetDevice(peer_->device_), "fast_ckpt load sync1");
+    ck(cudaStreamSynchronize(cs(peer_->st_)), "fast_ckpt load sync1");
+    peer_->pos_ = pos;
+    peer_->ahead_pos_ = -1;
+    (void) cudaSetDevice(device_);
+    return true;
+#else
+    (void) src;
+    (void) pos;
+    return false;
+#endif
 }
 
 void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
@@ -4891,6 +5273,48 @@ void Inkling2::phase_dualtp_save_range(int first_v, int last_v, int64_t pos, uin
     uint8_t* dst_rank[2] = {dst, dst + r0_state_n * sizeof(float) + r0_swa_total};
     const size_t state_n_rank[2] = {r0_state_n, r1_state_n};
     Inkling2* ranks[2] = {this, peer_.get()};
+    if (fast_ckpt_enabled() && !ds_on() && q8() && ring_ > 0 && peer_->ring_ == ring_) {
+        SwaPackDesc d[2]{};
+        if (build_swa_pack_desc(ranks[0]->caches_, first_v, last_v, ranks[0]->ring_, d[0]) &&
+            build_swa_pack_desc(ranks[1]->caches_, first_v, last_v, ranks[1]->ring_, d[1])) {
+            const int keep = (int) std::min(opt_.max_context, kWindow - 1);
+            const size_t conv_bytes = (size_t) (last_v - first_v) * conv_floats_ * sizeof(float);
+            const size_t swa_bytes = (size_t) d[0].n_visits * one;
+            const size_t hn_bytes = (first_v == 0 && draft_) ? (size_t) kWidth * sizeof(float) : 0;
+            const int total_w = d[0].stride_w[0] + d[0].stride_w[1] + d[0].stride_w[2] + d[0].stride_w[3];
+            const dim3 grid(div_up(keep * total_w, 256), d[0].n_visits);
+            size_t rank_total[2] = {conv_bytes + swa_bytes + hn_bytes, conv_bytes + swa_bytes};
+            for (int r = 0; r < 2; ++r) {
+                Inkling2& eng = *ranks[r];
+                eng.ensure_ckpt_bufs(rank_total[r]);
+                ck(cudaSetDevice(eng.device_), "PhaseDualTP fast save dev");
+                ck(cudaMemcpyAsync(eng.ckpt_dev_, eng.state_ + eng.conv_at(first_v), conv_bytes,
+                                   cudaMemcpyDeviceToDevice, cs(eng.st_)),
+                   "PhaseDualTP fast save conv");
+                pack_swa_state_kernel<true><<<grid, 256, 0, cs(eng.st_)>>>(
+                    d[r], reinterpret_cast<uint32_t*>(eng.ckpt_dev_ + conv_bytes), eng.ring_, keep, pos);
+                ck(cudaGetLastError(), "PhaseDualTP fast save pack");
+                if (r == 0 && hn_bytes)
+                    ck(cudaMemcpyAsync(eng.ckpt_dev_ + conv_bytes + swa_bytes, hn_, hn_bytes,
+                                       cudaMemcpyDeviceToDevice, cs(eng.st_)),
+                       "PhaseDualTP fast save hn");
+                ck(cudaMemcpyAsync(eng.ckpt_pin_, eng.ckpt_dev_, rank_total[r], cudaMemcpyDeviceToHost, cs(eng.st_)),
+                   "PhaseDualTP fast save d2h");
+            }
+            const size_t first_swa_off = (size_t) (first_v - first_v / kBlock) * one;
+            for (int r = 0; r < 2; ++r) {
+                Inkling2& eng = *ranks[r];
+                ck(cudaSetDevice(eng.device_), "PhaseDualTP fast save sync");
+                ck(cudaStreamSynchronize(cs(eng.st_)), "PhaseDualTP fast save sync");
+                std::memcpy(dst_rank[r] + (size_t) first_v * conv_floats_ * sizeof(float), eng.ckpt_pin_, conv_bytes);
+                parallel_copy_bytes(dst_rank[r] + state_n_rank[r] * sizeof(float) + first_swa_off,
+                                    eng.ckpt_pin_ + conv_bytes, swa_bytes, workers_.get());
+                if (r == 0 && hn_bytes)
+                    std::memcpy(dst + rec_n_ * sizeof(float), eng.ckpt_pin_ + conv_bytes + swa_bytes, hn_bytes);
+            }
+            return;
+        }
+    }
     for (int r = 0; r < 2; ++r) {
         Inkling2& eng = *ranks[r];
         ck(cudaSetDevice(eng.device_), "PhaseDualTP save_range dev");
@@ -5027,8 +5451,51 @@ void Inkling2::phase_dualtp_sync_from_b(int64_t final_pos) {
 
 bool Inkling2::read_custom(const int32_t* tokens, int n, const Mark* marks, int n_marks,
                            const std::function<bool(int, int)>* turn, bool& completed) {
-    const int n_calls = (int) calls_.size();
-    if (!stage_b_ || !peer_ || n_calls < phase_dualtp_min_calls_) return false;
+    if (!stage_b_ || !peer_) return false;
+    static const bool balanced = [] {
+        const char* v = std::getenv("STRATA_INKLING_PHASE_DUALTP_BALANCED");
+        if (v && v[0] == '1' && v[1] == '\0') {
+            std::fputs("strata-poly: STRATA_INKLING_PHASE_DUALTP_BALANCED=1: balanced DualTP microbatching for 768..4096 tok\n",
+                       stderr);
+            return true;
+        }
+        return false;
+    }();
+    std::vector<Call> local_calls;
+    const std::vector<Call>* use_calls = &calls_;
+    if (balanced && n >= 768 && n <= 4096) {
+        // Rebalance mark-free spans of 768..4096 tokens into 2..4 equal 16-aligned microbatches
+        // so both DualTP stages stay saturated without unbalanced tails (e.g., 2564 -> 864+864+836).
+        for (int at = 0, k = 0; at < n;) {
+            const int end = (k < n_marks) ? marks[k].at : n;
+            const int mark_idx = (k < n_marks) ? k : -1;
+            const int span = end - at;
+            int parts = 1;
+            if (span >= 768 && span <= 1536) parts = 2;
+            else if (span > 1536 && span <= 3072) parts = 3;
+            else if (span > 3072) parts = 4;
+            if (parts == 1) {
+                for (int p = at; p < end;) {
+                    const int m = std::min(rows_, end - p);
+                    local_calls.push_back({p, m, (p + m == end) ? mark_idx : -1});
+                    p += m;
+                }
+            } else {
+                const int target = std::min(rows_, ((span / parts + 15) / 16) * 16);
+                for (int p = at, part = 0; p < end; ++part) {
+                    const int rem = end - p;
+                    const int m = (part + 1 == parts || rem <= target) ? std::min(rows_, rem) : target;
+                    local_calls.push_back({p, m, (p + m == end) ? mark_idx : -1});
+                    p += m;
+                }
+            }
+            at = end;
+            if (k < n_marks) ++k;
+        }
+        use_calls = &local_calls;
+    }
+    const int n_calls = (int) use_calls->size();
+    if (n_calls < phase_dualtp_min_calls_) return false;
     (void) n_marks;
     const int64_t pos0 = pos_;
     const size_t r0_state_n = state_n_, r1_state_n = peer_->state_n_;
@@ -5063,7 +5530,7 @@ bool Inkling2::read_custom(const int32_t* tokens, int n, const Mark* marks, int 
     bool cancelled = false;
     int64_t completed_pos = pos0;
     for (int c = 0; c < n_calls; ++c) {
-        const Call& call = calls_[(size_t) c];
+        const Call& call = (*use_calls)[(size_t) c];
         const int64_t chunk_pos = pos0 + call.at;
         uint8_t* const checkpoint = call.mark < 0 ? nullptr : marks[call.mark].state;
         const int df_first = (draft_ && df2_ && df_gpu23_)
