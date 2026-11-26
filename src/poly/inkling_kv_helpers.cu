@@ -97,6 +97,19 @@ __global__ void unpack_answer(const Word* packet, Word* out, Word* q8, int rows)
         (quantized ? q8 : out)[(i / w * 2 + 1) * w + i % w] = packet[(quantized ? kQueryWords * rows : 0) + i];
 }
 
+__global__ void unpack_answer_out(const Word* packet, Word* out, int rows) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < rows * kQueryWords)
+        out[(i / kQueryWords * 2 + 1) * kQueryWords + i % kQueryWords] = packet[i];
+}
+
+__global__ void gather_upper_kv_direct(OwnerPlanes src, CompactKv dst, int rows, int first_row) {
+    const int f = blockIdx.y + K, w = width(f), i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= rows * w) return;
+    const size_t row = i / w + first_row;
+    dst.at(f)[row * w + i % w] = src.field[f][(row * 2 + 1) * w + i % w];
+}
+
 void check(hipError_t rc, const char* operation) {
     if (rc != hipSuccess) throw std::runtime_error(std::string(operation) + ": " + hipGetErrorString(rc));
 }
@@ -167,6 +180,9 @@ struct Mirror {
     Resources owner, helper;
     std::unique_ptr<Resources> bulk;
     bool balance_flash = false;
+    bool mirror_flash = false;
+    Word *mirror_owner_mem = nullptr, *mirror_helper_mem = nullptr;
+    Word *mirror_send = nullptr, *mirror_recv = nullptr, *mirror_packet = nullptr, *mirror_answer = nullptr;
     const int capacity, decode_max_rows;
     const hipStream_t model_stream;
     bool used = false, long_answer = false;
@@ -206,11 +222,18 @@ struct Mirror {
 
     ~Mirror() {
         // All three streams may still reference one of the two allocations. Drain before destroying either bundle.
-        if (!used) return;
-        if (bulk) bulk->wait(bulk->stream);
-        owner.wait(owner.stream);
-        helper.wait(helper.stream);
-        owner.wait(model_stream);
+        if (used) {
+            if (bulk) bulk->wait(bulk->stream);
+            owner.wait(owner.stream);
+            helper.wait(helper.stream);
+            owner.wait(model_stream);
+        }
+        int previous = 0;
+        if (hipGetDevice(&previous) == hipSuccess) {
+            RestoreDevice restore(previous);
+            if (mirror_owner_mem && hipSetDevice(owner.device) == hipSuccess) (void) hipFree(mirror_owner_mem);
+            if (mirror_helper_mem && hipSetDevice(helper.device) == hipSuccess) (void) hipFree(mirror_helper_mem);
+        }
     }
 };
 
@@ -279,6 +302,192 @@ void enable_flash_rows(std::array<MirrorPtr, 2>& mirrors) {
         mirrors[r]->balance_flash = balance;
     }
     if (balance) std::fputs("strata-poly: STRATA_INKLING_FLASH_BALANCE=1: 60 bulk query tiles per helper\n", stderr);
+}
+
+namespace {
+constexpr int kMirrorMaxRows = 2048;
+constexpr size_t kMirrorPacketWords = size_t(kMirrorMaxRows) * offset(Fields);
+constexpr size_t kMirrorAnswerWords = size_t(kMirrorMaxRows) * kQueryWords;
+constexpr size_t kMirrorTotalWords = kMirrorPacketWords + kMirrorAnswerWords;
+}  // namespace
+
+void enable_flash_mirror(std::array<MirrorPtr, 2>& mirrors) {
+    int device = 0;
+    check(hipGetDevice(&device), "get mirror Flash setup device");
+    RestoreDevice restore(device);
+    for (int r : {0, 1}) {
+        Mirror& m = *mirrors[r];
+        check(hipSetDevice(m.owner.device), "select mirror Flash owner device");
+        check(hipMalloc(reinterpret_cast<void**>(&m.mirror_owner_mem), kMirrorTotalWords * sizeof(Word)),
+              "allocate mirror Flash owner buffer");
+        m.mirror_send = m.mirror_owner_mem;
+        m.mirror_recv = m.mirror_owner_mem + kMirrorPacketWords;
+        if (m.bulk && m.bulk->memory) {
+            m.mirror_packet = m.bulk->memory;
+            m.mirror_answer = m.bulk->memory + kMirrorPacketWords;
+        } else {
+            check(hipSetDevice(m.helper.device), "select mirror Flash helper device");
+            check(hipMalloc(reinterpret_cast<void**>(&m.mirror_helper_mem), kMirrorTotalWords * sizeof(Word)),
+                  "allocate mirror Flash helper buffer");
+            m.mirror_packet = m.mirror_helper_mem;
+            m.mirror_answer = m.mirror_helper_mem + kMirrorPacketWords;
+        }
+        m.mirror_flash = true;
+    }
+    std::fputs("strata-poly: STRATA_INKLING_FLASH_MIRROR=1: 4-GPU persistent-mirror head-split Flash (T=64..2048, pos>=8K)\n",
+               stderr);
+}
+
+void seed_slot(Mirror& m, int slot, KvView k, KvView v, const float* table, int src_device, int end_row) {
+    if (!m.mirror_flash || slot < 0 || slot >= kFullVisits || end_row <= 0 || end_row > m.capacity ||
+        !k.scales || !v.scales) return;
+    const int start = m.valid[slot];
+    if (start >= end_row && m.table_ready[slot]) return;
+    int prev = 0;
+    check(hipGetDevice(&prev), "seed_slot getDevice");
+    RestoreDevice restore(prev);
+    m.used = true;
+    const OwnerPlanes src{{nullptr, nullptr, nullptr, nullptr,
+                           reinterpret_cast<const Word*>(k.data), reinterpret_cast<const Word*>(v.data),
+                           reinterpret_cast<const Word*>(k.scales), reinterpret_cast<const Word*>(v.scales)}};
+    const CompactKv kv = m.planes(slot);
+    float* table_dst = m.tables + size_t(slot) * kTableWords;
+    if (src_device == m.helper.device) {
+        check(hipSetDevice(m.helper.device), "seed_slot helper dev");
+        if (start < end_row) {
+            const int rows = end_row - start;
+            gather_upper_kv_direct<<<dim3(blocks(rows * kCodeWords), Fields - K), kThreads, 0, m.helper.stream>>>(
+                src, kv, rows, start);
+            check(hipGetLastError(), "seed_slot local gather");
+        }
+        if (!m.table_ready[slot] && table) {
+            check(hipMemcpyAsync(table_dst, table, kTableWords * sizeof(float), hipMemcpyDeviceToDevice, m.helper.stream),
+                  "seed_slot local table");
+            m.table_ready[slot] = true;
+        }
+        m.valid[slot] = std::max(m.valid[slot], end_row);
+    } else if (src_device == m.owner.device) {
+        check(hipSetDevice(m.owner.device), "seed_slot owner dev");
+        for (int at = start; at < end_row;) {
+            const int n = std::min(kSeedRows, end_row - at);
+            gather_upper<<<dim3(blocks(n * kCodeWords), Fields - K), kThreads, 0, m.owner.stream>>>(
+                src, m.seed, n, K, at);
+            check(hipGetLastError(), "seed_slot owner gather");
+            for (int f = K; f < Fields; ++f) {
+                const int w = width(f);
+                check(hipMemcpyPeerAsync(kv.at(f) + size_t(at) * w, m.helper.device,
+                                         m.seed + (offset(f) - offset(K)) * n, m.owner.device,
+                                         size_t(n) * w * sizeof(Word), m.owner.stream),
+                      "seed_slot owner P2P");
+            }
+            at += n;
+        }
+        if (!m.table_ready[slot] && table) {
+            check(hipMemcpyPeerAsync(table_dst, m.helper.device, table, m.owner.device,
+                                     kTableWords * sizeof(float), m.owner.stream),
+                  "seed_slot owner table");
+            m.table_ready[slot] = true;
+        }
+        m.valid[slot] = std::max(m.valid[slot], end_row);
+    }
+}
+
+void sync_seed(Mirror& m) {
+    if (!m.used) return;
+    m.owner.wait(m.owner.stream);
+    m.helper.wait(m.helper.stream);
+}
+
+bool try_flash_mirror(Mirror& m, const Attend& a, int slot) {
+    if (!m.mirror_flash || a.kv_heads != kOwnerKvHeads || a.window || a.ring || !a.k.scales || !a.v.scales ||
+        slot < 0 || slot >= kFullVisits || a.n < 64 || a.n > kMirrorMaxRows || a.pos < 8192 ||
+        a.pos > m.capacity - a.n)
+        return false;
+    const int pos = static_cast<int>(a.pos), rows = a.n, end = pos + rows;
+    int& valid = m.valid[slot];
+    valid = std::min(valid, pos);
+    const int max_catchup = (rows >= 1024) ? 32768 : 4096;
+    if (pos - valid > max_catchup) return false;
+
+    int current = 0;
+    check(hipGetDevice(&current), "flash mirror getDevice");
+    if (current != m.owner.device) throw std::logic_error("Inkling flash mirror called on wrong TP2 owner");
+    RestoreDevice restore(current);
+    m.used = true;
+    const bool use_h1 = (rows <= 256);
+    try {
+        const OwnerPlanes src{{reinterpret_cast<const Word*>(a.q), reinterpret_cast<const Word*>(a.rel),
+                               reinterpret_cast<const Word*>(a.gate), reinterpret_cast<const Word*>(a.sink),
+                               reinterpret_cast<const Word*>(a.k.data), reinterpret_cast<const Word*>(a.v.data),
+                               reinterpret_cast<const Word*>(a.k.scales), reinterpret_cast<const Word*>(a.v.scales)}};
+        const CompactKv kv = m.planes(slot);
+        const auto comm = m.owner.stream, model = m.model_stream, work = m.helper.stream;
+        check(hipEventRecord(m.owner.ready, model), "mirror record inputs ready");
+        check(hipStreamWaitEvent(comm, m.owner.ready, 0), "mirror wait inputs");
+        for (int at = valid; at < pos;) {
+            const int n = std::min(kSeedRows, pos - at);
+            gather_upper<<<dim3(blocks(n * kCodeWords), Fields - K), kThreads, 0, comm>>>(src, m.seed, n, K, at);
+            check(hipGetLastError(), "mirror gather catchup");
+            for (int f = K; f < Fields; ++f) {
+                const int w = width(f);
+                check(hipMemcpyPeerAsync(kv.at(f) + size_t(at) * w, m.helper.device,
+                                         m.seed + (offset(f) - offset(K)) * n, m.owner.device,
+                                         size_t(n) * w * sizeof(Word), comm),
+                      "mirror send catchup");
+            }
+            at += n;
+        }
+        gather_upper<<<dim3(blocks(rows * kQueryWords), Fields), kThreads, 0, comm>>>(src, m.mirror_send, rows, Q, pos);
+        check(hipGetLastError(), "mirror gather packet");
+        check(hipMemcpyPeerAsync(m.mirror_packet, m.helper.device, m.mirror_send, m.owner.device,
+                                 size_t(rows) * offset(Fields) * sizeof(Word), comm),
+              "mirror send packet");
+        float* table = m.tables + size_t(slot) * kTableWords;
+        if (!m.table_ready[slot])
+            check(hipMemcpyPeerAsync(table, m.helper.device, a.table, m.owner.device,
+                                     kTableWords * sizeof(float), comm),
+                  "mirror send bias table");
+        check(hipEventRecord(m.owner.sent, comm), "mirror record packet sent");
+
+        // Owner computes lower 2 KV heads (query heads 0..5) in parallel with helper.
+        attend_flash_lean_half(a, use_h1, kOwnerKvHeads, model);
+
+        // Helper appends new K/V rows and computes upper 2 KV heads (query heads 6..11).
+        check(hipSetDevice(m.helper.device), "mirror select helper");
+        check(hipStreamWaitEvent(work, m.owner.sent, 0), "mirror wait packet");
+        append_upper<<<dim3(blocks(rows * kCodeWords), Fields - K), kThreads, 0, work>>>(kv, m.mirror_packet, rows, pos);
+        check(hipGetLastError(), "mirror append rows");
+        Attend b = a;
+        b.q = reinterpret_cast<const float*>(m.mirror_packet);
+        b.rel = reinterpret_cast<const float*>(m.mirror_packet + offset(Rel) * rows);
+        b.gate = reinterpret_cast<const float*>(m.mirror_packet + offset(Gate) * rows);
+        b.sink = reinterpret_cast<const float*>(m.mirror_packet + offset(Sink) * rows);
+        b.table = table;
+        b.k = {reinterpret_cast<const uint8_t*>(kv.at(K)), reinterpret_cast<const uint16_t*>(kv.at(KScale))};
+        b.v = {reinterpret_cast<const uint8_t*>(kv.at(V)), reinterpret_cast<const uint16_t*>(kv.at(VScale))};
+        b.kv_heads = kHalfKvHeads;
+        b.out = reinterpret_cast<float*>(m.mirror_answer);
+        attend_flash_lean_half(b, use_h1, kHalfKvHeads, work);
+        check(hipMemcpyPeerAsync(m.mirror_recv, m.owner.device, m.mirror_answer, m.helper.device,
+                                 size_t(rows) * kQueryWords * sizeof(Word), work),
+              "mirror return answer");
+        check(hipEventRecord(m.helper.ready, work), "mirror record answer ready");
+
+        check(hipSetDevice(m.owner.device), "mirror return owner");
+        check(hipStreamWaitEvent(model, m.helper.ready, 0), "mirror wait answer");
+        unpack_answer_out<<<blocks(rows * kQueryWords), kThreads, 0, model>>>(
+            m.mirror_recv, reinterpret_cast<Word*>(a.out), rows);
+        check(hipGetLastError(), "mirror unpack answer");
+        m.table_ready[slot] = true;
+        valid = end;
+        return true;
+    } catch (...) {
+        m.owner.wait(m.owner.stream);
+        m.helper.wait(m.helper.stream);
+        m.valid.fill(0);
+        m.table_ready.fill(false);
+        throw;
+    }
 }
 
 bool try_flash_rows(Mirror& m, const Attend& a) {

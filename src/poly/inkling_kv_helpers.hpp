@@ -24,6 +24,11 @@ std::array<MirrorPtr, 2> create_pair(int capacity, std::array<cudaStream_t, 2> o
 // Optional disposable packet per helper. No replica validity or checkpoint semantics for prompt rows.
 void enable_flash_rows(std::array<MirrorPtr, 2>& mirrors);
 bool try_flash_rows(Mirror& mirror, const Attend& a);
+// Persistent-mirror head-split Flash attention (0-ULP exact, T in [64..2048], pos >= 8192).
+void enable_flash_mirror(std::array<MirrorPtr, 2>& mirrors);
+bool try_flash_mirror(Mirror& mirror, const Attend& a, int slot);
+void seed_slot(Mirror& mirror, int slot, KvView k, KvView v, const float* table, int src_device, int end_row);
+void sync_seed(Mirror& mirror);
 void invalidate(Mirror& mirror, int64_t first);
 void set_budget(Mirror& mirror, int64_t prompt_rows, int64_t max_new);
 

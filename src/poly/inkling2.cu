@@ -1612,6 +1612,16 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
                         std::fprintf(stderr, "strata-poly: bulk Flash helpers unavailable: %s; keeping decode helpers\n", e.what());
                     }
                 }
+                if (enabled("STRATA_INKLING_FLASH_MIRROR") && r0->flash_ && r1->flash_ &&
+                    enabled("STRATA_INKLING_FLASH_LEAN") && enabled("STRATA_INKLING_LANE_PROB") &&
+                    !enabled("STRATA_INKLING_FLASH_H2")) {
+                    try {
+                        inkling::kv_helpers::enable_flash_mirror(mirrors);
+                    } catch (const std::runtime_error& e) {
+                        (void) cudaGetLastError();
+                        std::fprintf(stderr, "strata-poly: mirror Flash helpers unavailable: %s; keeping decode helpers\n", e.what());
+                    }
+                }
                 r0->kv_helper_ = std::move(mirrors[0]);
                 r1->kv_helper_ = std::move(mirrors[1]);
                 std::fputs("strata-poly: STRATA_INKLING_KV_HELPERS=1: TP2 full-attention decode on GPUs 0/2 and 1/3\n",
@@ -2574,9 +2584,11 @@ void Inkling2::save_layer(int il, int64_t pos, uint8_t* dst) {
 
 void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
 #if defined(STRATA_HIP_GFX906)
-    // A restored state can refer to a different prefix at the same position. Rebuild only from canonical rows.
-    if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, 0);
-    stage_b_kv_valid_ = 0;
+    // Conversation switches and resets already invalidated via load_card_rows() / on_reset().
+    // Same-conversation rollbacks (pos <= pos_) preserve canonical full KV rows [0, pos).
+    const int64_t keep_valid = (pos <= pos_) ? pos : 0;
+    if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, keep_valid);
+    stage_b_kv_valid_ = std::min(stage_b_kv_valid_, keep_valid);
 #endif
     const size_t one = (size_t) std::min(opt_.max_context, kWindow - 1) * kv_bytes();
     for (int i = 0; i < kVisits; ++i) if (local(i)) {
@@ -2824,6 +2836,7 @@ void Inkling2::attention(const Block& b, int n, const float* k_in, const float* 
         using namespace inkling::kv_helpers;
         static_assert(kVisits / kBlock == kFullVisits && kKv / 2 == kOwnerKvHeads && kWindow == kTableRows &&
                       kRelative == kRelativeWidth && kHead == kHeadWidth && kMaxDecodeRows < kStageRows);
+        if (n >= 64 && n <= 2048 && try_flash_mirror(*kv_helper_, a, visit_ / kBlock)) return;
         const auto path = try_visit(*kv_helper_, a, visit_ / kBlock, chunks_, scores_,
                                     inkling::plain_score_floats(attend_tiles_), attq_);
         if (path == Visit::Offloaded) return;
@@ -4989,6 +5002,27 @@ void Inkling2::phase_dualtp_sync_from_b(int64_t final_pos) {
         ck(cudaStreamSynchronize(src[r]->kv_ret_st_), "PhaseDualTP sync_from_b wait");
     }
     stage_b_kv_valid_ = final_pos;
+    // Pre-seed persistent KV helper mirrors: slots 0..3 from GPU0/1 (P2P), slots 4..7 locally from Stage B on GPU2/3!
+    if (final_pos >= 8192 && kv_helper_ && peer_->kv_helper_) {
+        for (int r = 0; r < 2; ++r) {
+            Inkling2& owner = *dst[r];
+            Inkling2& sb = *src[r];
+            if (!owner.kv_helper_) continue;
+            for (int v = 0; v < kVisits; ++v) {
+                if (local(v)) continue;
+                const int slot = v / kBlock;
+                const int il = physical(v);
+                Inkling2& ksrc = (v >= 24) ? sb : owner;
+                const Cache& c = ksrc.caches_[v];
+                const inkling::KvView kv_k{c.planes[0].data, (const uint16_t*) c.planes[1].data};
+                const inkling::KvView kv_v{c.planes[2].data, (const uint16_t*) c.planes[3].data};
+                inkling::kv_helpers::seed_slot(*owner.kv_helper_, slot, kv_k, kv_v,
+                                               fp(ksrc.blocks_[il].table), ksrc.device_, (int) final_pos);
+            }
+        }
+        for (int r = 0; r < 2; ++r)
+            if (dst[r]->kv_helper_) inkling::kv_helpers::sync_seed(*dst[r]->kv_helper_);
+    }
 }
 
 bool Inkling2::read_custom(const int32_t* tokens, int n, const Mark* marks, int n_marks,
@@ -5000,6 +5034,8 @@ bool Inkling2::read_custom(const int32_t* tokens, int n, const Mark* marks, int 
     const size_t r0_state_n = state_n_, r1_state_n = peer_->state_n_;
     const int64_t sb_exp_before = stage_b_->stats_.gpu_experts + stage_b_->peer_->stats_.gpu_experts;
 
+    if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, pos0);
+    if (peer_->kv_helper_) inkling::kv_helpers::invalidate(*peer_->kv_helper_, pos0);
     phase_dualtp_sync_to_b(pos0);
 
     struct PhaseGuard {

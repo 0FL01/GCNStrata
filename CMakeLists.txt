@@ -2169,6 +2169,7 @@ if(STRATA_NATIVE_EXPERTS AND STRATA_HIP_GFX906)
                             src/poly/kolibri1.cpp src/poly/cpu_experts.cpp src/poly/kernels.cu src/poly/kernels_dsv4.cu
                             src/poly/spill.cpp src/core/conversation_memory.cpp
                             src/poly/inkling2.cu src/poly/inkling_attend.cu src/poly/inkling_attend_lean.cu
+                            src/poly/inkling_attend_v7.cu
                             src/poly/inkling_attend_h2.cu src/poly/inkling_kv_helpers.cu
                             src/poly/inkling_dspark.cu src/poly/inkling_dflash2.cu src/poly/tp2_comm.cu)
   target_include_directories(strata-poly PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
@@ -2178,7 +2179,7 @@ if(STRATA_NATIVE_EXPERTS AND STRATA_HIP_GFX906)
                                            Threads::Threads)
 
   add_executable(poly_inkling_attend_test src/poly/inkling_attend_test.cu src/poly/inkling_attend.cu
-                 src/poly/inkling_attend_lean.cu src/poly/inkling_attend_h2.cu)
+                 src/poly/inkling_attend_lean.cu src/poly/inkling_attend_v7.cu src/poly/inkling_attend_h2.cu)
   target_include_directories(poly_inkling_attend_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include
                                                              ${_strata_gpu_include_directories})
   target_link_libraries(poly_inkling_attend_test PRIVATE ${_strata_gpu_runtime_target})

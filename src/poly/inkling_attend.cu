@@ -1466,6 +1466,18 @@ void attend_flash(const Attend& a, cudaStream_t st) {
         return;
     }
     if (lean) {
+        static const bool flash_h1 = [] {
+            const char* value = std::getenv("STRATA_INKLING_FLASH_H1");
+            if (!value || value[0] != '1' || value[1] != '\0') return false;
+            std::fputs("strata-poly: STRATA_INKLING_FLASH_H1=1: 1-head-per-CTA narrow flash (SWA<=256, Full<=192)\n",
+                       stderr);
+            return true;
+        }();
+        if (flash_h1 && a.kv_heads == 4 && a.k.scales &&
+            ((a.window > 0 && a.n <= 256) || (a.window == 0 && a.n <= 192))) {
+            attend_flash_lean_h1(a, st);
+            return;
+        }
         attend_flash_lean(a, st);
         return;
     }
