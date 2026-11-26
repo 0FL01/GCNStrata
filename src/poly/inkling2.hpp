@@ -2,6 +2,7 @@
 #pragma once
 
 #include "engine.hpp"
+#include "inkling_dflash2.hpp"
 #include "inkling_kv_helpers.hpp"
 #include "tp2_comm.hpp"
 
@@ -61,6 +62,7 @@ protected:
     void load_drafter() override;
     void draft_step(int32_t token, int i) override;
     void drafter_kept(int n) override;
+    void drafter_guesses(int32_t token) override;
 
 private:
     static constexpr int kPhysical = 24, kVisits = 48;
@@ -74,7 +76,7 @@ private:
     int conv_floats_ = kConvFloats;
     std::shared_ptr<Tp2Comm> tp2_;
     std::unique_ptr<Inkling2> peer_;
-    enum class PeerCmd { kIdle, kRunVisits, kRunGpuVisits, kLogits, kKeepSnap, kReset, kStop };
+    enum class PeerCmd { kIdle, kRunVisits, kRunGpuVisits, kLogits, kKeepSnap, kReset, kStop, kDraftHead };
     int tp2_vocab_lo_ = 0, tp2_vocab_n_ = 0;
     float *tp2_logits_half_ = nullptr, *tp2_logits_peer_ = nullptr;
     std::thread peer_thread_;
@@ -220,6 +222,57 @@ private:
     void ds_base(int to);
     size_t ds_row_bytes() const { return 2 * (kKey + kKey / 32 * sizeof(uint16_t)); }
     void ds_ring(int l, int64_t pos, const uint8_t* src, uint8_t* dst);
+    bool ds_on() const { return draft_ && !df2_; }   // the DSpark drafter (not DFlash2)
+
+    // The DFlash2 drafter (--draft-model, a `dflash` GGUF with selector_hidden; inkling_dflash2.hpp): five non-causal
+    // SWA(2048) layers with dynamic convolutions, its K/V prefix from the same taps as DSpark's (ds_taps_ and
+    // hn_ + n_embd_) concatenated through fc and hidden_norm, the block [anchor, MASK x 7] in one pass, the target's
+    // head on rows 1..7 and the candidate selector's walk (drafter_guesses()).  Its rings are not part of a saved
+    // state: a restored or reset position starts it without context (df_lo_ = df_hi_ = pos).
+    static constexpr int kDfLayers = 5, kDfFfn = 6912, kDfSub = 256, kDfMask = 200056, kDfVocab = 200058;
+    struct DfLayer {
+        Dev attn_norm, ffn_norm, q, k, v, o, q_norm, k_norm, gate, up, down, abase, aproj, fbase, fproj;
+        // STRATA_DFLASH2_GEMV8: repacked int8 rows; q|k|v and gate|up fused (one launch each)
+        dflash2::Mat8 qkv8, gu8, o8, down8, aproj8, fproj8;
+    };
+    bool df_gemv8_ = false;            // STRATA_DFLASH2_GEMV8=1: the block's products with dflash2::gemv8()
+    bool df_attend3_ = false;          // STRATA_DFLASH2_ATTEND3=1: dflash2::attend3()
+    dflash2::Mat8 df_sel8_;
+    // STRATA_DFLASH2_HEAD8=1: a drafter-private int8 copy of this rank's head rows (of the 200,058 real ones), its
+    // logits [7][rows] and top 16 on this card; rank 1's top 16 cross as 7 x 32 floats (on both ranks' objects)
+    bool df_head8_ = false;
+    dflash2::Mat8 df_h8_;
+    int df_h8_lo_ = 0;
+    float *df_hlog_ = nullptr, *df_htop_ = nullptr, *df_hvals_ = nullptr, *df_hpack_ = nullptr, *df_hx_ = nullptr;
+    int32_t *df_hids_ = nullptr, *df_hids1_ = nullptr;
+    float* df_hvals1_ = nullptr;
+    float* df_hxd_ = nullptr;
+    int8_t* df_hxq_ = nullptr;
+    void df_head_load(int lo, int n);   // on this object's card
+    void df_head_run(const float* h);   // h: [7][2304] on this card; leaves df_hids_/df_hvals_ (absolute ids)
+    int8_t* df_xq_ = nullptr;          // gemv8's activations: [8][9216] codes
+    float* df_xd_ = nullptr;           // and [8][288] scales
+    dflash2::Mat8 df_pack(const std::string& name, int n_in, int n_out);
+    dflash2::Mat8 df_pack_rows(const std::vector<std::string>& names, int n_in, const std::vector<int>& n_out);
+    void df_lin(const Dev& w, const dflash2::Mat8& w8, const float* x, float* y, int rows);
+    bool df2_ = false;
+    std::array<DfLayer, kDfLayers> df_;
+    Dev df_fc_, df_hnorm_, df_onorm_, df_selw_;
+    __half *df_pred_ = nullptr, *df_succ_ = nullptr;   // selector codebooks, half [kDfVocab][256]
+    __half *df_kc_ = nullptr, *df_vc_ = nullptr;       // [kDfLayers][2048][1024] K (normed, rotated) and V rings
+    float df_eps_ = 0, df_cap_ = 0, df_theta_ = 0;
+    int64_t df_lo_ = 0, df_hi_ = 0;   // ring rows of positions [df_lo_, df_hi_) are this sequence's
+    int64_t df_skip_ = 0;             // a prompt's rows before this position are never attended: not injected
+    float *df_x_ = nullptr, *df_h_ = nullptr, *df_hp_ = nullptr, *df_dyn_ = nullptr, *df_q_ = nullptr,
+          *df_qr_ = nullptr, *df_k_ = nullptr, *df_kr_ = nullptr, *df_v_ = nullptr, *df_ao_ = nullptr,
+          *df_o_ = nullptr, *df_g_ = nullptr, *df_u_ = nullptr, *df_m_ = nullptr, *df_fin_ = nullptr,
+          *df_logits_ = nullptr, *df_selh_ = nullptr, *df_vals_ = nullptr, *df_edges_ = nullptr, *df_att_ = nullptr,
+          *df_top_ = nullptr, *df_ctx_ = nullptr, *df_c_ = nullptr, *df_cn_ = nullptr, *df_ck_ = nullptr,
+          *df_ckr_ = nullptr, *df_cv_ = nullptr, *df_t_ = nullptr;
+    int32_t* df_ids_ = nullptr;
+    void df_shape(const Shards& g);
+    void df_load();
+    void df_kept(int n);
 };
 
 }  // namespace strata::poly

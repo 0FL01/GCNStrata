@@ -329,7 +329,7 @@ public:
     /// saved (Clover on an 8 GB laptop wrote 57.7 tokens/s after a 32K prompt with its guesses, 61.6 without).
     bool drafts() const { return next_ ? next_->drafts() : draft_ || (block_guess_ && all_cached()); }
     /// The guesses of a window come out of draft(token, 0, &p) together: asking for one more costs nothing.
-    bool guesses_at_once() const { return next_ ? next_->guesses_at_once() : block_guess_; }
+    bool guesses_at_once() const { return next_ ? next_->guesses_at_once() : block_guess_ || drafter_block_; }
     /// Test only: the calls read()'s layer-major path gave the draft block's rows (draft_rows()) on the card that has
     /// the block, since load.  Two or more in one read are back-to-back refills of its pinned input rows.
     int64_t read_draft_calls_for_test() const { return next_ ? next_->read_draft_calls_for_test() : read_draft_calls_; }
@@ -437,6 +437,9 @@ protected:
     /// keep() after a window), at pos() on, and hn_ + n_embd_ still holds their outputs.  Draft_rows() calls it once
     /// it has left hn_'s first row; the guesser may put what it needs of the last of them there instead.
     virtual void drafter_kept(int n) { (void) n; }
+    /// A drafter whose one pass guesses a whole block (drafter_block_): its guesses for the anchor `token` at pos(),
+    /// in h_block_[0 .. block_n_), the stream synchronized.
+    virtual void drafter_guesses(int32_t token) { (void) token; }
     /// The floats of every recurrent layer's state together.  They are state_'s first.
     virtual size_t recurrent_floats() const = 0;
     /// Whether the recurrent layers leave their state after any tokens of a call, and not only after its first
@@ -791,6 +794,7 @@ protected:
     bool draft_ = false;
     bool block_layer_ = false;    ///< what guesses ahead is a block after the model's layers (layers_' last)
     bool block_guess_ = false;    ///< the model guesses a window's tokens itself, in a block (block_mask())
+    bool drafter_block_ = false;  ///< the drafter guesses a whole block in one pass (drafter_guesses())
     bool block_pass_ = false;     ///< the call under way is that block: its tokens see each other, no state changes
     Likeliest* h_block_ = nullptr;   ///< the block's guesses and their probabilities, pinned
     int block_n_ = 0;                ///< how many it holds

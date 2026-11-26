@@ -757,6 +757,28 @@ T4 32.33 -> 26.56 ms, T8 51.42 -> 42.31 ms; at 64K with the KV helpers T4 42.3 -
 Every row bitwise equal to serial T1 at 2K, 18K and 65,528, with all rows kept and with mixed partial `keep()`.
 Kernel bench: `artifacts/specv4-20261126/bench/moe_bench.hip` in the control repository.
 
+### Inkling-2-Mini: native DFlash2 drafter
+
+`--draft-model` with a `dflash` GGUF that has `selector_hidden.weight` (incoai/Inkling-2-Mini-DFlash2 converted with
+matmuls in Q8_0, codebooks F16 trimmed to 200,058 rows) selects the DFlash2 drafter instead of DSpark
+(`src/poly/inkling_dflash2.{hpp,cu}`, `Inkling2::df_*`). Five non-causal SWA(2048) layers with two-tap dynamic
+convolutions read the same target taps as DSpark (visits 5, 23, 41 and the final norm) through `fc` and
+`hidden_norm` into half K/V rings of 2048 positions; only kept rows are injected. One pass over `[anchor, MASK x 7]`
+gives all seven guesses (`Engine::drafter_block_`, `drafter_guesses()`): target head on rows 1..7, top-16 a row,
+the candidate selector's edges and greedy walk, one stream sync. Because the verifier is width invariant, the
+drafter changes only speed, never output.
+
+- `STRATA_DFLASH2_GEMV8=1`: the block's products from int8 rows repacked at load (16 lanes a row, activation K tiles
+  in LDS, fused q|k|v and gate|up).
+- `STRATA_DFLASH2_ATTEND3=1`: 32 keys a CTA, halves in LDS, `v_dot2_f32_f16`.
+- `STRATA_DFLASH2_HEAD8=1` (with GEMV8, TP2): a drafter-private int8 copy of the target head, each owner holding its
+  half; both owners compute logits and a top-16 at once and rank 1 returns 7 x 16 candidates.
+- `guesses.hpp`: for an all-at-once drafter the run is paid once; later guesses carry no ask cost.
+
+A restored or reset state starts the drafter without context (its rings are not saved with a state yet).
+Measured on four MI50 (Q4_0 target, 2K/18K/64K): mean accepted guesses of 7 on one greedy trajectory 4.43 / 3.42 /
+4.70 (DSpark 0.26 / 2.36 / 2.81); a block's first ask 3.46 ms at every context (DSpark 4.9 / 9.0 / 21.6 ms).
+
 ### Inkling-2-Mini: opt-in factored decode attention
 
 `STRATA_INKLING_DECODE_FACTORED=1` applies to Inkling TP2 on gfx906 with Q8_0 KV,

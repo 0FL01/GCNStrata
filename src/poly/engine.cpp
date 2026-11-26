@@ -6334,6 +6334,14 @@ int32_t Engine::draft(int32_t token, int i, float* prob) {
         *prob = i < block_n_ ? h_block_[i].prob : 0.f;
         return i < block_n_ ? h_block_[i].token : 0;
     }
+    if (drafter_block_) {   // one pass for the block; the guesses after the first are the host's copies
+        if (i == 0) {
+            ck(cudaStreamSynchronize(cs(st_)), "draft");
+            drafter_guesses(token);
+        }
+        *prob = i < block_n_ ? h_block_[i].prob : 0.f;
+        return i < block_n_ ? h_block_[i].token : 0;
+    }
     cover(pos_ + i + 1);
     ck(cudaStreamSynchronize(cs(st_)), "draft");
     draft_step(token, i);

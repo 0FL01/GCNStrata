@@ -62,10 +62,13 @@ public:
 
     Gate gate;
 
-    /// A round begins.  `blocks`: the block may be asked in it.  Returns whether it is asked at all.
-    bool begin(bool blocks, const spec::DraftPolicy& policy) {
+    /// A round begins.  `blocks`: the block may be asked in it.  `at_once`: one pass of the block makes all its
+    /// guesses (Engine::guesses_at_once()), so only the first costs a run, and the gate alone decides whether the
+    /// block is run at all.  Returns whether it is asked at all.
+    bool begin(bool blocks, const spec::DraftPolicy& policy, bool at_once = false) {
         ++round_;
         blocks_ = blocks;
+        at_once_ = at_once;
         asked_ = 0;
         sure_ = tokens_ = 1.0;
         one_ = at_[1] ? ms_[1] : policy.cost_ms(1);   // a token alone is the measure, old or not
@@ -74,17 +77,19 @@ public:
 
     /// Whether the block is asked for a guess more, the window having n of them.
     bool wants(int n) {
+        if (at_once_ && n == 0) return true;   // the gate asked the block: its pass is paid for its whole block
         const int to = n + 2;   // the window's tokens with this guess
         more_ = knows(to) ? std::clamp((ms_[to] - round_ms(to - 1)) / one_, 0.2, 0.8) : kUnmeasured;
         // asking takes time too: not when a guess the block were sure of would not pay for it
-        const double ask = measured_ && fresh(asked_at_) ? ask_ms_ : 0.0;
+        const double ask = !at_once_ && measured_ && fresh(asked_at_) ? ask_ms_ : 0.0;
         return sure_ * round_ms(to - 1) > tokens_ * (more_ * one_ + ask);
     }
 
     /// The block's guess after n others, right with probability p; asking took `ms`.  Returns whether it joins
     /// the window.
     bool takes(int n, double p, double ms) {
-        ask_ms_ = fresh(asked_at_) ? ask_ms_ + 0.1 * (std::min(ms, 2.0 * ask_ms_) - ask_ms_) : ms;
+        if (!(at_once_ && n > 0))   // a block's later guesses are its first pass's: no time of their own
+            ask_ms_ = fresh(asked_at_) ? ask_ms_ + 0.1 * (std::min(ms, 2.0 * ask_ms_) - ask_ms_) : ms;
         asked_at_ = round_;
         ++asked_;
         sure_ *= p;
@@ -119,7 +124,7 @@ private:
     long long asked_at_ = 0;
     bool measured_ = false;                          // some round's time is known: asking can be weighed against it
     // of the round
-    bool blocks_ = false;
+    bool blocks_ = false, at_once_ = false;
     int asked_ = 0;
     double one_ = 1.0, more_ = kUnmeasured, sure_ = 1.0, tokens_ = 1.0;
 };

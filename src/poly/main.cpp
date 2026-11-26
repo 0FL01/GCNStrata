@@ -674,7 +674,7 @@ struct Session {
                 // is taken as it is: the block would mostly say the same, and asking it takes time.  Otherwise the
                 // block guesses, each guess from the one before, while a guess more pays (Guesses).
                 const bool blocks = engine.drafts() && room && !(k == widest - 1 && policy.lookup_rate(match) >= 0.9);
-                const bool ask = guesses.begin(blocks, policy);
+                const bool ask = guesses.begin(blocks, policy, engine.guesses_at_once());
                 // the round's time, as the policy counts it: a window of `in` tokens wrote n of them
                 const auto count = [&](int in, int n) {
                     return guesses.end(in, n, ms_since(round), engine.took_record());
