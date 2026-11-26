@@ -5946,6 +5946,8 @@ bool Engine::read(const int32_t* tokens, int n, const Mark* marks, int n_marks,
     const int n_calls = (int) calls_.size();
     OnCard here(device_, split_);
     cover(pos_ + n);
+    bool custom_done = true;
+    if (read_custom(tokens, n, marks, n_marks, turn, custom_done)) return custom_done;
     // On several cards, each reads through its own layers and hands the rows on, and `turn` hears of a card's
     // turns as its share of the model's layers: [lo_, to).
     const std::function<bool(int, int)>* asked = turn;

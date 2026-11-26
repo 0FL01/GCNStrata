@@ -36,6 +36,10 @@ protected:
     void begin_pass() override;
     void load_layer(int il) override;
     void run_visits(int n) override;
+#if defined(STRATA_HIP_GFX906)
+    bool read_custom(const int32_t* tokens, int n, const Mark* marks, int n_marks,
+                     const std::function<bool(int, int)>* turn, bool& completed) override;
+#endif
     void on_loaded() override;
     void on_reset() override;
     void on_keep_snap(size_t snap_idx) override;
@@ -75,6 +79,12 @@ private:
     static constexpr int kCore = 12, kStart = 6, kCoda = 42;
     static constexpr int kConvFloats = (kTaps - 1) * (2 * kKey + 2 * kWidth);
     int tp_size_ = 1, tp_rank_ = 0;
+    int first_visit_ = 0, last_visit_ = kVisits, run_last_visit_ = kVisits;
+    bool prefill_only_ = false;
+    int swa_ring_win_ = 0;
+    int owned_full() const { return last_visit_ / kBlock - first_visit_ / kBlock; }
+    int owned_swa() const { return last_visit_ - first_visit_ - owned_full(); }
+    size_t conv_at(int visit) const { return (size_t) (visit - first_visit_) * conv_floats_; }
     int n_heads_ = kHeads, n_kv_ = kKv, n_query_ = kQuery, n_key_ = kKey;
     int conv_floats_ = kConvFloats;
     std::shared_ptr<Tp2Comm> tp2_;
@@ -114,6 +124,31 @@ private:
     bool compact_swa_asked_ = false;
     int swa_stage_rows_ = 0;   // positive only when the stage fits in input_[0]
     inkling::kv_helpers::MirrorPtr kv_helper_;
+    // Phase-Adaptive Co-Resident DualTP (STRATA_INKLING_PHASE_DUALTP=24): canonical GPU0/1 owns full
+    // state, decode, DFlash2 and KV helpers; co-resident Stage B on GPU2/3 owns blocks 6..23 / visits [24,48)
+    // and accelerates multi-chunk reads with staggered cut-24 packets and async KV delta return.
+    bool phase_dualtp_active_ = false;
+    int phase_dualtp_min_calls_ = 2;
+    std::unique_ptr<Inkling2> stage_b_;
+    int64_t stage_b_kv_valid_ = 0;
+    cudaStream_t cut_st_ = nullptr;
+    cudaEvent_t cut_ev_ = nullptr;
+    Inkling2* cut_dst_ = nullptr;
+    float *cut_depth0_ = nullptr, *cut_prelude_ = nullptr, *cut_bank0_ = nullptr, *cut_bank1_ = nullptr;
+    cudaStream_t kv_ret_st_ = nullptr;
+    cudaEvent_t kv_ret_ev_ = nullptr, inbox_free_ev_ = nullptr;
+    bool stage_b_want_df2_ = false, sb_capture_df2_ = false;
+    float *sb_tap0_ = nullptr, *sb_tap1_ = nullptr, *sb_tap2_ = nullptr, *sb_hn_ = nullptr;
+    void phase_dualtp_init(const Options& o);
+    void destroy_phase_dualtp_handles();
+    void phase_dualtp_sync_to_b(int64_t pos);
+    void phase_dualtp_handoff_cut(int n, bool send_df_taps, int df_first);
+    void phase_dualtp_run_b(int64_t chunk_pos, int n, bool do_df_taps, int df_first, uint8_t* checkpoint,
+                            size_t r0_state_n, size_t r1_state_n);
+    void phase_dualtp_save_range(int first_v, int last_v, int64_t pos, uint8_t* dst,
+                                 size_t r0_state_n, size_t r1_state_n);
+    void phase_dualtp_sync_from_b(int64_t final_pos);
+    void phase_dualtp_df_kept(int64_t chunk_pos, int m, int first);
     bool gpu_route_supported() const;
     bool gpu_decode_supported() const;
     void init_gpu_route(bool decode, bool prefill);

@@ -473,6 +473,13 @@ protected:
     virtual void layer_tail(Layer& L, int il, int n) = 0;
     /// The looped model visits a physical layer more than once, and keeps token state between those visits.
     virtual void run_visits(int n) { (void) n; }
+    /// Optional architecture-specific multi-call prompt reader (e.g. phase-adaptive DualTP).
+    /// Returns true if handled, setting `completed` to false when cancelled via `turn`.
+    virtual bool read_custom(const int32_t* tokens, int n, const Mark* marks, int n_marks,
+                             const std::function<bool(int, int)>* turn, bool& completed) {
+        (void) tokens, (void) n, (void) marks, (void) n_marks, (void) turn, (void) completed;
+        return false;
+    }
     virtual void on_loaded() {}
     virtual void on_reset() {}
     virtual void on_keep_snap(size_t snap_idx) { (void) snap_idx; }

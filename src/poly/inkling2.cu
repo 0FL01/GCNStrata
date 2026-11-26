@@ -1279,6 +1279,10 @@ Inkling2::Inkling2() = default;
 cudaStream_t Inkling2::df_stream() const { return df_gpu23_ ? df_gpu23_->s2 : cs(st_); }
 
 Inkling2::~Inkling2() {
+#if defined(STRATA_HIP_GFX906)
+    stage_b_.reset();
+    destroy_phase_dualtp_handles();
+#endif
     stop_peer_thread();
     if (df_gpu23_) {
         int previous = 0;
@@ -1444,6 +1448,9 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
     ck(cudaSetDevice(0), "tp2 setDevice 0");
     r0->peer_ = std::move(r1);
     r0->start_peer_thread();
+#if defined(STRATA_HIP_GFX906)
+    r0->phase_dualtp_init(o);
+#endif
     return r0;
 }
 
@@ -1485,11 +1492,12 @@ void Inkling2::start_peer_thread() {
             try {
                 if (cmd == PeerCmd::kRunVisits || cmd == PeerCmd::kRunGpuVisits) {
                     peer_->pos_ = pos_;
+                    peer_->run_last_visit_ = run_last_visit_;
                     peer_->windowed_ = windowed_;
                     peer_->snap_bits_ = snap_bits_;
                     peer_->snap_at_ = windowed_ && snap_bits_ ? peer_->snap_ + (snap_at_ - snap_) : nullptr;
                     peer_->cover(pos_ + n);
-                    tp2_->broadcast_from_0(1, peer_->r_, n * kWidth, peer_->st_);
+                    if (!first_visit_) tp2_->broadcast_from_0(1, peer_->r_, n * kWidth, peer_->st_);
                     peer_->run_visits_local(n, cmd == PeerCmd::kRunGpuVisits);
                 } else if (cmd == PeerCmd::kLogits) {
                     tp2_->broadcast_from_0(1, peer_->xn_, n * kWidth, peer_->st_);
@@ -1589,14 +1597,15 @@ void Inkling2::on_loaded() {
 #if defined(STRATA_HIP_GFX906)
 bool Inkling2::gpu_route_supported() const {
     using namespace inkling_route;
+    const bool valid_range = (lo_ == 0 || (prefill_only_ && lo_ == kStart)) && hi_ == n_layer_;
     if (!all_cached() || !opt_.gpu_experts || opt_.dump || opt_.cache_bias != 0.f || expert_scale_ != 8.f ||
-        n_layer_ != kPhysical || lo_ != 0 || hi_ != n_layer_ ||
+        n_layer_ != kPhysical || !valid_range ||
         n_embd_ != kWidth || n_ff_exp_ != 576 || n_expert_ != kExperts || n_used_ != kPicks)
         return false;
     cudaDeviceProp props{};
     ck(cudaGetDeviceProperties(&props, device_), "Inkling GPU route device properties");
     if (!kernels::gfx_arch_is(props.gcnArchName, "gfx906")) return false;
-    for (int il = 0; il < n_layer_; ++il) {
+    for (int il = lo_; il < hi_; ++il) {
         const Layer& L = layers_[il];
         const auto& bias = blocks_[il].bias;
         if (!L.moe || L.gate_inp.type != kTypeF32 || bias.size() != kExperts ||
@@ -1608,9 +1617,9 @@ bool Inkling2::gpu_route_supported() const {
 
 bool Inkling2::gpu_decode_supported() const {
     using namespace inkling_route;
-    if (!decode_ || !situ_q8_ || moe_tail_ || !(situ_.beta > 0.f) || prefetch_k_ > 0) return false;
+    if (prefill_only_ || !decode_ || !situ_q8_ || moe_tail_ || !(situ_.beta > 0.f) || prefetch_k_ > 0) return false;
     const auto q4 = [](uint32_t type) { return type == GGML_TYPE_Q4_0 || type == GGML_TYPE_Q4_1; };
-    for (int il = 0; il < n_layer_; ++il) {
+    for (int il = lo_; il < hi_; ++il) {
         const Layer& L = layers_[il];
         if (L.mixed() || L.gu_bytes != L.u_bytes || !q4(L.gu_type) || !q4(L.d_type) ||
             L.gu_bytes != (size_t) n_ff_exp_ * ggml_row_size((ggml_type) L.gu_type, n_embd_) ||
@@ -1624,9 +1633,9 @@ bool Inkling2::gpu_decode_supported() const {
 
 void Inkling2::init_gpu_route(bool decode, bool prefill) {
     using namespace inkling_route;
-    std::vector<float> bias;
-    bias.reserve((size_t) kPhysical * kExperts);
-    for (const Block& b : blocks_) bias.insert(bias.end(), b.bias.begin(), b.bias.end());
+    std::vector<float> bias((size_t) kPhysical * kExperts, 0.f);
+    for (int il = lo_; il < hi_; ++il)
+        std::copy(blocks_[il].bias.begin(), blocks_[il].bias.end(), bias.begin() + (size_t) il * kExperts);
     gpu_route_bias_ = (float*) dmalloc(bias.size() * sizeof(float), "Inkling GPU route bias");
     ck(cudaMemcpy(gpu_route_bias_, bias.data(), bias.size() * sizeof(float), cudaMemcpyHostToDevice),
        "Inkling GPU route bias");
@@ -1729,6 +1738,13 @@ void Inkling2::on_reset() {
     df_lo_ = df_hi_ = df_skip_ = 0;
 #if defined(STRATA_HIP_GFX906)
     if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, 0);
+    stage_b_kv_valid_ = 0;
+    if (stage_b_) {
+        int prev = 0; (void) cudaGetDevice(&prev);
+        ck(cudaSetDevice(stage_b_->device_), "PhaseDualTP reset dev 2");
+        stage_b_->reset();
+        (void) cudaSetDevice(prev);
+    }
 #endif
     if (!peer_) return;
     peer_dispatch(PeerCmd::kReset);
@@ -1747,12 +1763,16 @@ __global__ void interleave_logits_kernel(const float* __restrict__ h0, const flo
 }
 
 void Inkling2::on_keep_snap(size_t snap_idx) {
+#if defined(STRATA_HIP_GFX906)
+    stage_b_kv_valid_ = std::min(stage_b_kv_valid_, pos_);
+#endif
     if (!peer_) return;
     peer_dispatch(PeerCmd::kKeepSnap, 0, snap_idx);
     peer_wait();
 }
 
 Dev Inkling2::load_output_matrix(const TensorInfo* t, int64_t file_vocab) {
+    if (prefill_only_) return Dev{};
     if (tp_size_ != 2) return Engine::load_output_matrix(t, file_vocab);
     const int half0 = n_vocab_ / 2;
     tp2_vocab_lo_ = tp_rank_ == 0 ? 0 : half0;
@@ -2093,29 +2113,30 @@ void Inkling2::load_drafter() {
     }
 }
 
-size_t Inkling2::recurrent_floats() const { return (size_t) kVisits * conv_floats_; }
+size_t Inkling2::recurrent_floats() const { return (size_t) (last_visit_ - first_visit_) * conv_floats_; }
 size_t Inkling2::kv_bytes() const {
     return 2 * (q8() ? n_key_ + (n_key_ / 32) * sizeof(uint16_t) : n_key_ * sizeof(uint16_t));
 }
 size_t Inkling2::card_row_bytes() const {
-    return kVisits / kBlock * kv_bytes() * (peer_ ? 2 : 1) + (ds_on() ? ds_row_bytes() : 0);
+    return owned_full() * kv_bytes() * (peer_ ? 2 : 1) + (ds_on() ? ds_row_bytes() : 0);
 }
 
 void Inkling2::alloc_caches() {
-    constexpr int local_visits = kVisits - kVisits / kBlock;
+    const int local_visits = owned_swa();
     ring_ = std::min(opt_.max_context, kWindow + rows_ - 1);
 #if defined(STRATA_HIP_GFX906)
     if (compact_swa_asked_) {
-        const auto plan = inkling::plan_swa(opt_.max_context, kWindow, rows_, std::min(opt_.window, rows_),
+        const int swa_win = std::min(std::max(opt_.window, swa_ring_win_), rows_);
+        const auto plan = inkling::plan_swa(opt_.max_context, kWindow, rows_, swa_win,
                                             local_visits, kv_bytes(), (size_t) rows_ * kWidth * sizeof(float),
                                             tp_size_ == 2 && n_key_ == 512 && q8());
         if (plan.stage_rows)
-            std::fprintf(stderr, "strata-poly: STRATA_INKLING_COMPACT_SWA=1 rank %d: %d -> %d rows per SWA visit; "
-                         "%zu-byte borrowed stage, %zu bytes saved\n", tp_rank_, ring_, plan.ring_rows,
+            std::fprintf(stderr, "strata-poly: STRATA_INKLING_COMPACT_SWA=1 rank %d (dev %d): %d -> %d rows per SWA visit; "
+                         "%zu-byte borrowed stage, %zu bytes saved\n", tp_rank_, device_, ring_, plan.ring_rows,
                          (size_t) plan.stage_rows * kv_bytes(), plan.saved_bytes);
         else
-            std::fprintf(stderr, "strata-poly: STRATA_INKLING_COMPACT_SWA=1 rank %d: no borrowable savings; "
-                         "using stock rings\n", tp_rank_);
+            std::fprintf(stderr, "strata-poly: STRATA_INKLING_COMPACT_SWA=1 rank %d (dev %d): no borrowable savings; "
+                         "using stock rings\n", tp_rank_, device_);
         ring_ = plan.ring_rows;
         swa_stage_rows_ = plan.stage_rows;
     }
@@ -2123,7 +2144,7 @@ void Inkling2::alloc_caches() {
     auto* rings = (uint8_t*) seq_alloc((size_t) local_visits * ring_ * kv_bytes(), "Inkling SWA KV");
     const size_t wide = n_key_ * (q8() ? 1 : sizeof(uint16_t));
     const size_t scale = q8() ? n_key_ / 32 * sizeof(uint16_t) : 0;
-    for (int i = 0; i < kVisits; ++i) {
+    for (int i = first_visit_; i < last_visit_; ++i) {
         for (int j = 0; j < 4; ++j) {
             const size_t stride = j % 2 ? scale : wide;
             auto& p = caches_[i].planes[j];
@@ -2190,6 +2211,7 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
     if (!n) return;
 #if defined(STRATA_HIP_GFX906)
     if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, first);
+    stage_b_kv_valid_ = std::min(stage_b_kv_valid_, first);
 #endif
     cover(first + n);
     ck(cudaStreamSynchronize(cs(st_)), "load Inkling rows");
@@ -2375,6 +2397,7 @@ void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
 #if defined(STRATA_HIP_GFX906)
     // A restored state can refer to a different prefix at the same position. Rebuild only from canonical rows.
     if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, 0);
+    stage_b_kv_valid_ = 0;
 #endif
     const size_t one = (size_t) std::min(opt_.max_context, kWindow - 1) * kv_bytes();
     for (int i = 0; i < kVisits; ++i) if (local(i)) {
@@ -2440,11 +2463,25 @@ void Inkling2::assign_scratch() {
     rank_ = fbuf(n * kRank);
     gain_ = fbuf(width);
     forget_ = fbuf(width);
-    if (tp_size_ == 2) {
+    if (tp_size_ == 2 && !prefill_only_) {
         const size_t max_r = (size_t) std::max(kDsBlock, opt_.window);
         tp2_logits_half_ = fbuf(max_r * (size_t) tp2_vocab_n_);
         if (tp_rank_ == 0) tp2_logits_peer_ = fbuf(max_r * (size_t) (n_vocab_ - tp2_vocab_n_));
     }
+#if defined(STRATA_HIP_GFX906)
+    if (prefill_only_) {
+        cut_depth0_ = fbuf(width);
+        cut_prelude_ = fbuf(width);
+        cut_bank0_ = fbuf(width);
+        cut_bank1_ = fbuf(width);
+        if (stage_b_want_df2_) {
+            sb_tap0_ = fbuf(width);
+            sb_tap1_ = fbuf(width);
+            sb_tap2_ = fbuf(width);
+            sb_hn_ = fbuf(width);
+        }
+    }
+#endif
     if (!draft_) return;
     ds_taps_ = fbuf(3 * width);
     if (df2_) {
@@ -2590,7 +2627,8 @@ void Inkling2::attention(const Block& b, int n) {
     a.out = att_;
     const auto attend_local = [&] {
 #if defined(STRATA_HIP_GFX906)
-        if (n >= 2047 && !swa && kv_helper_ && inkling::kv_helpers::try_flash_rows(*kv_helper_, a)) return;
+        if (n >= 2047 && !swa && kv_helper_ && !phase_dualtp_active_ &&
+            inkling::kv_helpers::try_flash_rows(*kv_helper_, a)) return;
 #endif
         // Prompt batches only: a token's answer and short calls keep the usual kernels and their sums.
         if (flash_ && n >= kStageRows) inkling::attend_flash(a, cs(st_));
@@ -2600,7 +2638,7 @@ void Inkling2::attention(const Block& b, int n) {
         } else inkling::attend_plain(a, scores_, partial_, attend_tiles_, cs(st_));
     };
 #if defined(STRATA_HIP_GFX906)
-    if (kv_helper_ && !swa) {
+    if (kv_helper_ && !swa && !phase_dualtp_active_) {
         using namespace inkling::kv_helpers;
         static_assert(kVisits / kBlock == kFullVisits && kKv / 2 == kOwnerKvHeads && kWindow == kTableRows &&
                       kRelative == kRelativeWidth && kHead == kHeadWidth && kMaxDecodeRows < kStageRows);
@@ -2786,23 +2824,31 @@ void Inkling2::run_visits(int n) {
         rms_norm(r_ + at, fp(token_norm_), cur_ + at, kWidth, count, rms_eps_, st_);
         axpy(cur_ + at, 1.f, r_ + at, count * kWidth, false, st_);
     };
-    int first = 0;
-    for (const Image& im : images_) {   // sorted, non-overlapping; a prompt chunk can cut through a picture
-        if (im.at >= pos_ + n) break;
-        if (im.at + im.n <= pos_) continue;
-        if (im.at > pos_ + first) norm_text(first, (int) (im.at - pos_) - first);
-        first = (int) std::min<int64_t>(n, im.at + im.n - pos_);
+    if (!first_visit_) {
+        int first = 0;
+        for (const Image& im : images_) {   // sorted, non-overlapping; a prompt chunk can cut through a picture
+            if (im.at >= pos_ + n) break;
+            if (im.at + im.n <= pos_) continue;
+            if (im.at > pos_ + first) norm_text(first, (int) (im.at - pos_) - first);
+            first = (int) std::min<int64_t>(n, im.at + im.n - pos_);
+        }
+        if (first < n) norm_text(first, n - first);
     }
-    if (first < n) norm_text(first, n - first);
     // half a warp an NVFP4 expert row for this call's few tokens only (iq_set_slot_lanes() is the process's)
-    kernels::iq_set_slot_lanes(fused(n));
+#if defined(STRATA_HIP_GFX906)
+    const bool own_lanes = !phase_dualtp_active_ && !prefill_only_;
+#else
+    const bool own_lanes = true;
+#endif
+    if (own_lanes) kernels::iq_set_slot_lanes(fused(n));
     struct Lanes {
-        ~Lanes() { kernels::iq_set_slot_lanes(false); }
-    } lanes;
+        bool enabled;
+        ~Lanes() { if (enabled) kernels::iq_set_slot_lanes(false); }
+    } lanes{own_lanes};
     if (peer_) {
         peer_dispatch(gpu_route ? PeerCmd::kRunGpuVisits : PeerCmd::kRunVisits, n);
         try {
-            tp2_->broadcast_from_0(0, r_, n * kWidth, st_);
+            if (!first_visit_) tp2_->broadcast_from_0(0, r_, n * kWidth, st_);
             run_visits_local(n, gpu_route);
 #if defined(STRATA_HIP_GFX906)
             if (gpu_route) {
@@ -2850,13 +2896,36 @@ void Inkling2::run_visits_local(int n, [[maybe_unused]] bool gpu_route) {
     }
 #endif
     fo_clean_ = false;   // fo_ is what the last call left
-    depth_n_ = 0;
-    for (visit_ = 0; visit_ < kVisits; ++visit_) {
-        if (visit_ == kStart) axpy(r_, 1.f, prelude_, n * kWidth, false, st_);
+    if (!first_visit_) depth_n_ = 0;
+#if defined(STRATA_HIP_GFX906)
+    const size_t cut_bytes = (size_t) n * kWidth * sizeof(float);
+    const auto push_cut_async = [&](const float* src, float* dst) {
+        ck(cudaEventRecord(cut_ev_, cs(st_)), "PhaseDualTP cut ready");
+        ck(cudaStreamWaitEvent(cut_st_, cut_ev_, 0), "PhaseDualTP cut wait");
+        ck(cudaMemcpyPeerAsync(dst, cut_dst_->device_, src, device_, cut_bytes, cut_st_), "PhaseDualTP stagger P2P");
+    };
+#endif
+    for (visit_ = first_visit_; visit_ < run_last_visit_; ++visit_) {
+        if (visit_ == kStart) {
+            axpy(r_, 1.f, prelude_, n * kWidth, false, st_);
+#if defined(STRATA_HIP_GFX906)
+            if (cut_dst_) push_cut_async(prelude_, cut_dst_->cut_prelude_);
+#endif
+        }
         if (visit_ == kStart + kCore || visit_ == kStart + 2 * kCore) {
             // The old partial and the one just before it are the previous pass's two core blocks.
             axpy(depth_[2], 1.f, bank0_, n * kWidth, false, st_);
             axpy(r_, 1.f, bank1_, n * kWidth, false, st_);
+#if defined(STRATA_HIP_GFX906)
+            if (cut_dst_ && visit_ == kStart + kCore) {
+                ck(cudaEventRecord(cut_ev_, cs(st_)), "PhaseDualTP banks ready");
+                ck(cudaStreamWaitEvent(cut_st_, cut_ev_, 0), "PhaseDualTP banks wait");
+                ck(cudaMemcpyPeerAsync(cut_dst_->cut_bank0_, cut_dst_->device_, bank0_, device_, cut_bytes, cut_st_),
+                   "PhaseDualTP stagger bank0");
+                ck(cudaMemcpyPeerAsync(cut_dst_->cut_bank1_, cut_dst_->device_, bank1_, device_, cut_bytes, cut_st_),
+                   "PhaseDualTP stagger bank1");
+            }
+#endif
             axpy(prelude_, 1.f, r_, n * kWidth, false, st_);
             depth_n_ = 1;
         }
@@ -2866,6 +2935,11 @@ void Inkling2::run_visits_local(int n, [[maybe_unused]] bool gpu_route) {
                     ck(cudaMemcpyAsync(ds_taps_ + (size_t) j * rows_ * kWidth, r_, (size_t) n * kWidth * sizeof(float),
                                        cudaMemcpyDeviceToDevice, cs(st_)),
                        "DSpark taps");
+#if defined(STRATA_HIP_GFX906)
+        if (sb_capture_df2_ && sb_tap2_ && visit_ == kTap[2])
+            ck(cudaMemcpyAsync(sb_tap2_, r_, (size_t) n * kWidth * sizeof(float), cudaMemcpyDeviceToDevice, cs(st_)),
+               "PhaseDualTP Stage B tap41");
+#endif
         const int il = physical(visit_);
 #if defined(STRATA_HIP_GFX906)
         if (gpu_route) {
@@ -2874,10 +2948,12 @@ void Inkling2::run_visits_local(int n, [[maybe_unused]] bool gpu_route) {
             moe_shared(L, il, n);
             gpu_route_moe(L, il, n);
             layer_tail(L, il, n);
-            continue;
-        }
+        } else
 #endif
-        layer(il, n);
+            layer(il, n);
+#if defined(STRATA_HIP_GFX906)
+        if (cut_dst_ && visit_ == 0) push_cut_async(depth_[0], cut_dst_->cut_depth0_);
+#endif
     }
 #if defined(STRATA_HIP_GFX906)
     if (gpu_route) {
@@ -2968,7 +3044,7 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
     }
     lin(b.sink, xq, sink_, n);
 
-    float* hist = state_ + (size_t) visit_ * conv_floats_;
+    float* hist = state_ + conv_at(visit_);
     const auto kv_conv = [&](float* x, float* state, const Dev& w, const Dev& dyn, const float* input) {
         if (!swa) lin(dyn, input, taps_, n);
         conv(x, state, fp(w), swa ? nullptr : taps_, n_key_, n);
@@ -3246,7 +3322,7 @@ void Inkling2::moe_add(int n) {
 
 void Inkling2::layer_tail(Layer&, int il, int n) {
     if (tp2_) tp2_->all_reduce(tp_rank_, fo_, n * kWidth, st_);
-    float* hist = state_ + (size_t) visit_ * conv_floats_ + 6 * n_key_ + 3 * kWidth;
+    float* hist = state_ + conv_at(visit_) + 6 * n_key_ + 3 * kWidth;
     if (fused(n)) {
         // with the record's experts summed here (STRATA_INKLING_TAIL_MOE), moe() launched nothing for them
         conv_add_kernel<<<div_up(kWidth, kThreads), kThreads, 0, cs(st_)>>>(
@@ -4187,5 +4263,467 @@ void Inkling2::output_rows(int first, int rows, float* h) {
 }
 
 void Inkling2::finish_logits(float* logits, int rows) { softcap(logits, (size_t) rows * n_vocab_, cap_, st_); }
+
+#if defined(STRATA_HIP_GFX906)
+namespace {
+struct StageBehind {
+    std::thread t;
+    std::exception_ptr err;
+    void wait() {
+        if (t.joinable()) t.join();
+        if (err) {
+            std::exception_ptr e = err;
+            err = nullptr;
+            std::rethrow_exception(e);
+        }
+    }
+    template<class F>
+    void go(F&& fn) {
+        wait();
+        t = std::thread([this, f = std::forward<F>(fn)]() mutable {
+            try {
+                f();
+            } catch (...) {
+                err = std::current_exception();
+            }
+        });
+    }
+    ~StageBehind() {
+        if (t.joinable()) t.join();
+    }
+};
+}  // namespace
+
+void Inkling2::destroy_phase_dualtp_handles() {
+    int prev = 0;
+    const bool ok = (cudaGetDevice(&prev) == cudaSuccess);
+    if (ok && cudaSetDevice(device_) == cudaSuccess) {
+        if (cut_st_) { (void) cudaStreamDestroy(cut_st_); cut_st_ = nullptr; }
+        if (cut_ev_) { (void) cudaEventDestroy(cut_ev_); cut_ev_ = nullptr; }
+        if (kv_ret_st_) { (void) cudaStreamDestroy(kv_ret_st_); kv_ret_st_ = nullptr; }
+        if (kv_ret_ev_) { (void) cudaEventDestroy(kv_ret_ev_); kv_ret_ev_ = nullptr; }
+        if (inbox_free_ev_) { (void) cudaEventDestroy(inbox_free_ev_); inbox_free_ev_ = nullptr; }
+        (void) cudaSetDevice(prev);
+    }
+}
+
+void Inkling2::phase_dualtp_init(const Options& o) {
+    const char* env = std::getenv("STRATA_INKLING_PHASE_DUALTP");
+    if (!env || !*env || std::strcmp(env, "0") == 0) return;
+    char* end = nullptr;
+    const long cut = std::strtol(env, &end, 10);
+    if (*end || cut != 24)
+        throw std::runtime_error("STRATA_INKLING_PHASE_DUALTP supports only cut 24");
+    if (const char* mc = std::getenv("STRATA_INKLING_PHASE_DUALTP_MIN_CALLS"); mc && *mc) {
+        const int v = std::atoi(mc);
+        if (v >= 1) phase_dualtp_min_calls_ = v;
+    }
+    int devices = 0;
+    ck(cudaGetDeviceCount(&devices), "PhaseDualTP device count");
+    if (devices < 4 || o.kv_grow || o.dump || o.batch || !o.layer_split.empty() || o.kv_format != KvFmt::kQ8_0)
+        throw std::runtime_error("STRATA_INKLING_PHASE_DUALTP=24 requires 4 GPUs, Q8_0 --kv-whole, single sequence");
+    for (int d = 0; d < 4; ++d) {
+        cudaDeviceProp p{};
+        ck(cudaGetDeviceProperties(&p, d), "PhaseDualTP device props");
+        if (p.warpSize != 64 || !kernels::gfx_arch_is(p.gcnArchName, "gfx906"))
+            throw std::runtime_error("STRATA_INKLING_PHASE_DUALTP=24 requires 4 gfx906 wave64 GPUs");
+    }
+    if (!all_cached() || !peer_ || !peer_->all_cached())
+        throw std::runtime_error("STRATA_INKLING_PHASE_DUALTP=24 requires fully resident canonical TP2");
+
+    struct DevGuard { int prev = 0; ~DevGuard() { (void) cudaSetDevice(prev); } } guard;
+    ck(cudaGetDevice(&guard.prev), "PhaseDualTP getDevice");
+    const auto enable_p2p = [](int src, int dst) {
+        ck(cudaSetDevice(src), "PhaseDualTP setDevice P2P");
+        int can = 0;
+        ck(cudaDeviceCanAccessPeer(&can, src, dst), "PhaseDualTP canAccessPeer");
+        if (!can) throw std::runtime_error("PhaseDualTP requires bidirectional P2P between 0<->2 and 1<->3");
+        cudaError_t st = cudaDeviceEnablePeerAccess(dst, 0);
+        if (st != cudaErrorPeerAccessAlreadyEnabled) ck(st, "PhaseDualTP enablePeerAccess");
+        (void) cudaGetLastError();
+    };
+    enable_p2p(0, 2); enable_p2p(2, 0);
+    enable_p2p(1, 3); enable_p2p(3, 1);
+
+    const int max_floats = std::max(o.prompt_batch, 8) * kWidth;
+    auto comm_b = Tp2Comm::create(2, 3, max_floats);
+    auto b0 = std::make_unique<Inkling2>();
+    auto b1 = std::make_unique<Inkling2>();
+    for (int r = 0; r < 2; ++r) {
+        Inkling2* b = r == 0 ? b0.get() : b1.get();
+        b->device_ = 2 + r;
+        b->split_ = true;
+        b->tp_size_ = 2;
+        b->tp_rank_ = r;
+        b->tp2_ = comm_b;
+        b->first_visit_ = (int) cut;
+        b->last_visit_ = kVisits;
+        b->run_last_visit_ = kVisits;
+        b->lo_ = kStart;
+        b->end_ = -1;
+        b->prefill_only_ = true;
+        b->swa_ring_win_ = opt_.window;
+        b->compact_swa_asked_ = compact_swa_asked_;
+        b->prefill_depth_share_ = prefill_depth_share_;
+    }
+    b0->stage_b_want_df2_ = (df2_ && df_gpu23_ != nullptr);
+
+    Options ob = o;
+    ob.tp = 2;
+    ob.draft = false;
+    ob.draft_model.clear();
+    ob.window = 1;
+    ob.vram_reserve_mib = std::min(o.vram_reserve_mib, 512);
+
+    ck(cudaSetDevice(2), "PhaseDualTP setDevice 2");
+    b0->load(ob);
+    ck(cudaSetDevice(3), "PhaseDualTP setDevice 3");
+    b1->load(ob);
+
+    if (gpu_prefill_route_) {
+        if (!b0->gpu_route_supported() || !b1->gpu_route_supported())
+            throw std::runtime_error("PhaseDualTP Stage B failed gpu_route_supported()");
+        ck(cudaSetDevice(3), "PhaseDualTP route dev 3");
+        b1->init_gpu_route(false, true);
+        ck(cudaSetDevice(2), "PhaseDualTP route dev 2");
+        b0->init_gpu_route(false, true);
+    }
+    if (!b0->all_cached() || !b1->all_cached() || b0->ring_ != ring_ || b1->ring_ != peer_->ring_ ||
+        b0->rows_ != rows_ || b1->rows_ != peer_->rows_)
+        throw std::runtime_error("PhaseDualTP Stage B geometry or residency mismatch");
+    // Verify identical contiguous SWA ring layout for visits [24, 48) so sync is one P2P copy per rank.
+    for (int r = 0; r < 2; ++r) {
+        const Inkling2* a = r == 0 ? this : peer_.get();
+        const Inkling2* b = r == 0 ? b0.get() : b1.get();
+        const uint8_t* a_base = a->caches_[24].planes[0].data;
+        const uint8_t* b_base = b->caches_[24].planes[0].data;
+        for (int v = 24; v < kVisits; ++v) if (local(v)) {
+            for (int j = 0; j < 4; ++j) if (a->caches_[v].planes[j].stride) {
+                if ((a->caches_[v].planes[j].data - a_base) != (b->caches_[v].planes[j].data - b_base))
+                    throw std::runtime_error("PhaseDualTP Stage B SWA ring layout mismatch");
+            }
+        }
+    }
+    // Create dedicated async P2P streams and events on all 4 cards.
+    for (int r = 0; r < 2; ++r) {
+        Inkling2* a = r == 0 ? this : peer_.get();
+        Inkling2* b = r == 0 ? b0.get() : b1.get();
+        ck(cudaSetDevice(a->device_), "PhaseDualTP stream dev A");
+        ck(cudaStreamCreateWithFlags(&a->cut_st_, cudaStreamNonBlocking), "PhaseDualTP cut_st");
+        ck(cudaEventCreateWithFlags(&a->cut_ev_, cudaEventDisableTiming), "PhaseDualTP cut_ev");
+        ck(cudaSetDevice(b->device_), "PhaseDualTP stream dev B");
+        ck(cudaStreamCreateWithFlags(&b->kv_ret_st_, cudaStreamNonBlocking), "PhaseDualTP kv_ret_st");
+        ck(cudaEventCreateWithFlags(&b->kv_ret_ev_, cudaEventDisableTiming), "PhaseDualTP kv_ret_ev");
+        ck(cudaEventCreateWithFlags(&b->inbox_free_ev_, cudaEventDisableTiming), "PhaseDualTP inbox_free_ev");
+    }
+
+    ck(cudaSetDevice(2), "PhaseDualTP peer thread dev 2");
+    b0->peer_ = std::move(b1);
+    b0->start_peer_thread();
+    size_t f2 = 0, t2 = 0, f3 = 0, t3 = 0;
+    ck(cudaSetDevice(2), "PhaseDualTP meminfo 2"); ck(cudaMemGetInfo(&f2, &t2), "PhaseDualTP meminfo 2");
+    ck(cudaSetDevice(3), "PhaseDualTP meminfo 3"); ck(cudaMemGetInfo(&f3, &t3), "PhaseDualTP meminfo 3");
+    std::fprintf(stderr,
+                 "strata-poly: STRATA_INKLING_PHASE_DUALTP=24: co-resident Stage B on GPUs 2/3 "
+                 "(blocks 6..23, visits [24,48), %d experts/rank, staggered cut + overlapped KV return; "
+                 "GPU2 free=%zu MiB, GPU3 free=%zu MiB)\n",
+                 b0->cached_, f2 >> 20, f3 >> 20);
+    stage_b_ = std::move(b0);
+    stage_b_kv_valid_ = 0;
+}
+
+void Inkling2::phase_dualtp_sync_to_b(int64_t pos) {
+    struct DevGuard { int prev = 0; ~DevGuard() { (void) cudaSetDevice(prev); } } guard;
+    ck(cudaGetDevice(&guard.prev), "PhaseDualTP sync_to_b getDevice");
+    Inkling2* src[2] = {this, peer_.get()};
+    Inkling2* dst[2] = {stage_b_.get(), stage_b_->peer_.get()};
+    if (pos == 0) {
+        const size_t conv_bytes = (size_t) (kVisits - 24) * conv_floats_ * sizeof(float);
+        for (int r = 0; r < 2; ++r) {
+            ck(cudaSetDevice(dst[r]->device_), "PhaseDualTP zero B state");
+            ck(cudaMemsetAsync(dst[r]->state_, 0, conv_bytes, cs(dst[r]->st_)), "PhaseDualTP zero B ShortConv");
+        }
+        stage_b_->pos_ = stage_b_->peer_->pos_ = 0;
+        stage_b_kv_valid_ = 0;
+        return;
+    }
+    const size_t swa_slab_bytes = (size_t) stage_b_->owned_swa() * ring_ * kv_bytes();
+    const size_t conv_bytes = (size_t) (kVisits - 24) * conv_floats_ * sizeof(float);
+    for (int r = 0; r < 2; ++r) {
+        Inkling2& a = *src[r];
+        Inkling2& b = *dst[r];
+        ck(cudaSetDevice(a.device_), "PhaseDualTP sync_to_b dev");
+        ck(cudaStreamSynchronize(cs(a.st_)), "PhaseDualTP sync_to_b drain A");
+        // Sync missing full KV rows [stage_b_kv_valid_, pos) for Stage B's 4 full visits.
+        if (stage_b_kv_valid_ < pos) {
+            const int64_t rows = pos - stage_b_kv_valid_;
+            for (int v = 24; v < kVisits; ++v) if (!local(v)) {
+                for (int j = 0; j < 4; ++j) if (a.caches_[v].planes[j].stride) {
+                    const size_t stride = a.caches_[v].planes[j].stride;
+                    ck(cudaMemcpyPeerAsync(b.caches_[v].planes[j].data + stage_b_kv_valid_ * stride, b.device_,
+                                           a.caches_[v].planes[j].data + stage_b_kv_valid_ * stride, a.device_,
+                                           (size_t) rows * stride, a.cut_st_),
+                       "PhaseDualTP sync KV to B");
+                }
+            }
+        }
+        // Sync all 20 SWA rings in one contiguous P2P copy + 24 ShortConv states.
+        ck(cudaMemcpyPeerAsync(b.caches_[24].planes[0].data, b.device_,
+                               a.caches_[24].planes[0].data, a.device_, swa_slab_bytes, a.cut_st_),
+           "PhaseDualTP sync SWA to B");
+        ck(cudaMemcpyPeerAsync(b.state_, b.device_,
+                               a.state_ + (size_t) 24 * conv_floats_, a.device_, conv_bytes, a.cut_st_),
+           "PhaseDualTP sync ShortConv to B");
+    }
+    for (int r = 0; r < 2; ++r) {
+        ck(cudaSetDevice(src[r]->device_), "PhaseDualTP sync_to_b wait");
+        ck(cudaStreamSynchronize(src[r]->cut_st_), "PhaseDualTP sync_to_b wait");
+    }
+    stage_b_->pos_ = stage_b_->peer_->pos_ = pos;
+    stage_b_kv_valid_ = pos;
+}
+
+void Inkling2::phase_dualtp_handoff_cut(int n, bool send_df_taps, int df_first) {
+    struct DevGuard { int prev = 0; ~DevGuard() { (void) cudaSetDevice(prev); } } guard;
+    ck(cudaGetDevice(&guard.prev), "PhaseDualTP handoff getDevice");
+    Inkling2* src[2] = {this, peer_.get()};
+    Inkling2* dst[2] = {stage_b_.get(), stage_b_->peer_.get()};
+    const size_t bytes = (size_t) n * kWidth * sizeof(float);
+
+    // Ensure Stage B's previous chunk finished reading its live buffers.
+    for (int r = 0; r < 2; ++r) {
+        ck(cudaSetDevice(dst[r]->device_), "PhaseDualTP handoff drain B");
+        ck(cudaStreamSynchronize(cs(dst[r]->st_)), "PhaseDualTP handoff drain B");
+    }
+    // Wait for Stage A's staggered cut_st_ (already done behind visits 1..23) and send only r_ (18 MiB) + optional taps.
+    for (int r = 0; r < 2; ++r) {
+        Inkling2& a = *src[r];
+        Inkling2& b = *dst[r];
+        ck(cudaSetDevice(a.device_), "PhaseDualTP handoff send r_");
+        ck(cudaMemcpyPeerAsync(b.r_, b.device_, a.r_, a.device_, bytes, cs(a.st_)), "PhaseDualTP send r_");
+        if (r == 0 && send_df_taps && b.sb_tap0_ && b.sb_tap1_) {
+            const size_t off = (size_t) df_first * kWidth;
+            const size_t tbytes = (size_t) (n - df_first) * kWidth * sizeof(float);
+            const size_t plane = (size_t) rows_ * kWidth;
+            ck(cudaMemcpyPeerAsync(b.sb_tap0_ + off, b.device_, a.ds_taps_ + off, a.device_, tbytes, cs(a.st_)),
+               "PhaseDualTP send tap0");
+            ck(cudaMemcpyPeerAsync(b.sb_tap1_ + off, b.device_, a.ds_taps_ + plane + off, a.device_, tbytes, cs(a.st_)),
+               "PhaseDualTP send tap1");
+        }
+    }
+    for (int r = 0; r < 2; ++r) {
+        ck(cudaSetDevice(src[r]->device_), "PhaseDualTP handoff sync A");
+        ck(cudaStreamSynchronize(src[r]->cut_st_), "PhaseDualTP handoff sync cut_st");
+        ck(cudaStreamSynchronize(cs(src[r]->st_)), "PhaseDualTP handoff sync A st");
+    }
+    // Materialize Stage B's live buffers from its inbox (~0.08 ms D2D on HBM2); depth_[1] == prelude_ (0 PCIe bytes!).
+    for (int r = 0; r < 2; ++r) {
+        Inkling2& a = *src[r];
+        Inkling2& b = *dst[r];
+        ck(cudaSetDevice(b.device_), "PhaseDualTP handoff unpack B");
+        ck(cudaMemcpyAsync(b.depth_[0], b.cut_depth0_, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP d0");
+        ck(cudaMemcpyAsync(b.prelude_, b.cut_prelude_, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP pre");
+        ck(cudaMemcpyAsync(b.depth_[1], b.cut_prelude_, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP d1");
+        ck(cudaMemcpyAsync(b.bank0_, b.cut_bank0_, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP b0");
+        ck(cudaMemcpyAsync(b.bank1_, b.cut_bank1_, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP b1");
+        b.depth_n_ = 2;
+        ck(cudaEventRecord(b.inbox_free_ev_, cs(b.st_)), "PhaseDualTP inbox_free");
+        ck(cudaSetDevice(a.device_), "PhaseDualTP handoff wait inbox_free");
+        ck(cudaStreamWaitEvent(a.cut_st_, b.inbox_free_ev_, 0), "PhaseDualTP cut_st wait inbox_free");
+    }
+}
+
+void Inkling2::phase_dualtp_save_range(int first_v, int last_v, int64_t pos, uint8_t* dst,
+                                       size_t r0_state_n, size_t r1_state_n) {
+    struct DevGuard { int prev = 0; ~DevGuard() { (void) cudaSetDevice(prev); } } guard;
+    ck(cudaGetDevice(&guard.prev), "PhaseDualTP save_range getDevice");
+    const size_t one = (size_t) std::min(opt_.max_context, kWindow - 1) * kv_bytes();
+    const size_t r0_swa_total = (kVisits - kVisits / kBlock) * one;
+    uint8_t* dst_rank[2] = {dst, dst + r0_state_n * sizeof(float) + r0_swa_total};
+    const size_t state_n_rank[2] = {r0_state_n, r1_state_n};
+    Inkling2* ranks[2] = {this, peer_.get()};
+    for (int r = 0; r < 2; ++r) {
+        Inkling2& eng = *ranks[r];
+        ck(cudaSetDevice(eng.device_), "PhaseDualTP save_range dev");
+        ck(cudaStreamSynchronize(cs(eng.st_)), "PhaseDualTP save_range drain");
+        for (int v = first_v; v < last_v; ++v) {
+            const size_t dst_conv = (size_t) v * conv_floats_;
+            const size_t src_conv = eng.conv_at(v);
+            ck(cudaMemcpy(dst_rank[r] + dst_conv * sizeof(float), eng.state_ + src_conv,
+                          conv_floats_ * sizeof(float), cudaMemcpyDeviceToHost),
+               "PhaseDualTP save ShortConv");
+            if (local(v)) {
+                const size_t off = (size_t) (v - v / kBlock) * one;
+                eng.ring_state(v, pos, nullptr, dst_rank[r] + state_n_rank[r] * sizeof(float) + off);
+            }
+        }
+        if (r == 0 && first_v == 0 && draft_) save_last(dst);
+    }
+}
+
+void Inkling2::phase_dualtp_df_kept(int64_t chunk_pos, int m, int first) {
+    namespace d2 = dflash2;
+    auto* gpu = df_gpu23_.get();
+    if (!gpu || !stage_b_ || !stage_b_->sb_tap0_) return;
+    gpu->prov_valid = false;
+    // Drain any prior decode-turn tap transfers before reusing df_ctx_.
+    {
+        DfOnDevice on2(2);
+        for (auto& ev : gpu->taps) {
+            if (ev.used) {
+                ck(cudaEventSynchronize(ev.done2), "PhaseDualTP drain df_taps");
+                ev.used = false;
+            }
+        }
+        gpu->last_taps[0] = gpu->last_taps[1] = nullptr;
+        const int64_t at = chunk_pos + first;
+        if (at > df_hi_ || at < df_lo_) df_lo_ = at;
+        ck(cudaStreamSynchronize(cs(stage_b_->st_)), "PhaseDualTP Stage B taps ready");
+        const d2::Taps taps{{stage_b_->sb_tap0_, stage_b_->sb_tap1_, stage_b_->sb_tap2_, stage_b_->sb_hn_}};
+        for (int done = first; done < m;) {
+            const int sub = std::min(kDfSub, m - done);
+            d2::gather_taps(taps, done, sub, df_ctx_, gpu->s2);
+            df_context(df_ctx_, chunk_pos + done, sub, false);
+            done += sub;
+        }
+        ck(cudaStreamSynchronize(gpu->s2), "PhaseDualTP df_context done");
+        df_hi_ = chunk_pos + m;
+    }
+}
+
+void Inkling2::phase_dualtp_run_b(int64_t chunk_pos, int n, bool do_df_taps, int df_first, uint8_t* checkpoint,
+                                  size_t r0_state_n, size_t r1_state_n) {
+    Inkling2& b0 = *stage_b_;
+    Inkling2& b1 = *b0.peer_;
+    ck(cudaSetDevice(b0.device_), "PhaseDualTP run_b dev 2");
+    b0.cover(chunk_pos + n);
+    b0.pos_ = chunk_pos;
+    b0.tok_ = nullptr;
+    b0.windowed_ = false;
+    b0.snap_bits_ = 0;
+    b0.sb_capture_df2_ = do_df_taps;
+    b0.run_visits(n);
+    if (do_df_taps && b0.sb_hn_) b0.output_rows(0, n, b0.sb_hn_);
+    // Async overlapped KV delta return: 4 full visits x n rows (<=8.5 MiB/rank) back to canonical GPU0/1!
+    Inkling2* src[2] = {&b0, &b1};
+    Inkling2* dst[2] = {this, peer_.get()};
+    for (int r = 0; r < 2; ++r) {
+        Inkling2& s = *src[r];
+        Inkling2& d = *dst[r];
+        ck(cudaSetDevice(s.device_), "PhaseDualTP kv_ret dev");
+        ck(cudaEventRecord(s.kv_ret_ev_, cs(s.st_)), "PhaseDualTP kv_ret record");
+        ck(cudaStreamWaitEvent(s.kv_ret_st_, s.kv_ret_ev_, 0), "PhaseDualTP kv_ret wait");
+        for (int v = 24; v < kVisits; ++v) if (!local(v)) {
+            for (int j = 0; j < 4; ++j) if (s.caches_[v].planes[j].stride) {
+                const size_t stride = s.caches_[v].planes[j].stride;
+                ck(cudaMemcpyPeerAsync(d.caches_[v].planes[j].data + chunk_pos * stride, d.device_,
+                                       s.caches_[v].planes[j].data + chunk_pos * stride, s.device_,
+                                       (size_t) n * stride, s.kv_ret_st_),
+                   "PhaseDualTP kv_ret P2P");
+            }
+        }
+    }
+    b0.pos_ = b1.pos_ = chunk_pos + n;
+    if (do_df_taps) phase_dualtp_df_kept(chunk_pos, n, df_first);
+    if (checkpoint) b0.phase_dualtp_save_range(24, kVisits, chunk_pos + n, checkpoint, r0_state_n, r1_state_n);
+}
+
+void Inkling2::phase_dualtp_sync_from_b(int64_t final_pos) {
+    struct DevGuard { int prev = 0; ~DevGuard() { (void) cudaSetDevice(prev); } } guard;
+    ck(cudaGetDevice(&guard.prev), "PhaseDualTP sync_from_b getDevice");
+    Inkling2* src[2] = {stage_b_.get(), stage_b_->peer_.get()};
+    Inkling2* dst[2] = {this, peer_.get()};
+    const size_t swa_slab_bytes = (size_t) stage_b_->owned_swa() * ring_ * kv_bytes();
+    const size_t conv_bytes = (size_t) (kVisits - 24) * conv_floats_ * sizeof(float);
+    for (int r = 0; r < 2; ++r) {
+        Inkling2& s = *src[r];
+        Inkling2& d = *dst[r];
+        ck(cudaSetDevice(s.device_), "PhaseDualTP sync_from_b dev");
+        ck(cudaStreamSynchronize(cs(s.st_)), "PhaseDualTP sync_from_b drain st");
+        // Enqueue final SWA rings + ShortConv right behind the final chunk's KV delta on kv_ret_st_.
+        ck(cudaMemcpyPeerAsync(d.caches_[24].planes[0].data, d.device_,
+                               s.caches_[24].planes[0].data, s.device_, swa_slab_bytes, s.kv_ret_st_),
+           "PhaseDualTP return SWA");
+        ck(cudaMemcpyPeerAsync(d.state_ + (size_t) 24 * conv_floats_, d.device_,
+                               s.state_, s.device_, conv_bytes, s.kv_ret_st_),
+           "PhaseDualTP return ShortConv");
+    }
+    for (int r = 0; r < 2; ++r) {
+        ck(cudaSetDevice(src[r]->device_), "PhaseDualTP sync_from_b wait");
+        ck(cudaStreamSynchronize(src[r]->kv_ret_st_), "PhaseDualTP sync_from_b wait");
+    }
+    stage_b_kv_valid_ = final_pos;
+}
+
+bool Inkling2::read_custom(const int32_t* tokens, int n, const Mark* marks, int n_marks,
+                           const std::function<bool(int, int)>* turn, bool& completed) {
+    const int n_calls = (int) calls_.size();
+    if (!stage_b_ || !peer_ || n_calls < phase_dualtp_min_calls_) return false;
+    (void) n_marks;
+    const int64_t pos0 = pos_;
+    const size_t r0_state_n = state_n_, r1_state_n = peer_->state_n_;
+    const int64_t sb_exp_before = stage_b_->stats_.gpu_experts + stage_b_->peer_->stats_.gpu_experts;
+
+    phase_dualtp_sync_to_b(pos0);
+
+    struct PhaseGuard {
+        Inkling2* r0;
+        Inkling2* r1;
+        ~PhaseGuard() {
+            r0->run_last_visit_ = kVisits;
+            r1->run_last_visit_ = kVisits;
+            r0->phase_dualtp_active_ = false;
+            r1->phase_dualtp_active_ = false;
+            r0->cut_dst_ = nullptr;
+            r1->cut_dst_ = nullptr;
+            (void) cudaSetDevice(r0->device_);
+        }
+    } guard{this, peer_.get()};
+
+    run_last_visit_ = 24;
+    peer_->run_last_visit_ = 24;
+    phase_dualtp_active_ = true;
+    peer_->phase_dualtp_active_ = true;
+    cut_dst_ = stage_b_.get();
+    peer_->cut_dst_ = stage_b_->peer_.get();
+
+    StageBehind behind;
+    bool cancelled = false;
+    int64_t completed_pos = pos0;
+    for (int c = 0; c < n_calls; ++c) {
+        const Call& call = calls_[(size_t) c];
+        const int64_t chunk_pos = pos0 + call.at;
+        uint8_t* const checkpoint = call.mark < 0 ? nullptr : marks[call.mark].state;
+        const int df_first = (draft_ && df2_ && df_gpu23_)
+                                 ? (int) std::max<int64_t>(std::clamp<int64_t>(df_skip_ - chunk_pos, 0, call.m),
+                                                           call.m - dflash2::kWindow)
+                                 : call.m;
+        const bool do_df = (draft_ && df2_ && df_gpu23_ && df_first < call.m);
+
+        ck(cudaSetDevice(device_), "PhaseDualTP Stage A dev");
+        run(tokens + call.at, call.m);
+        behind.wait();
+        phase_dualtp_handoff_cut(call.m, do_df, df_first);
+        behind.go([this, chunk_pos, m = call.m, do_df, df_first, checkpoint, r0_state_n, r1_state_n] {
+            phase_dualtp_run_b(chunk_pos, m, do_df, df_first, checkpoint, r0_state_n, r1_state_n);
+        });
+        pos_ = chunk_pos + call.m;
+        peer_->pos_ = pos_;
+        stats_.tokens += call.m;
+        completed_pos = pos_;
+        if (checkpoint) phase_dualtp_save_range(0, 24, pos_, checkpoint, r0_state_n, r1_state_n);
+        if (turn && c + 1 < n_calls && !(*turn)(c + 1, n_calls)) {
+            cancelled = true;
+            break;
+        }
+    }
+    behind.wait();
+    phase_dualtp_sync_from_b(completed_pos);
+    const int64_t sb_exp_after = stage_b_->stats_.gpu_experts + stage_b_->peer_->stats_.gpu_experts;
+    stats_.gpu_experts += (sb_exp_after - sb_exp_before);
+    completed = !cancelled;
+    return true;
+}
+#endif
 
 }  // namespace strata::poly
