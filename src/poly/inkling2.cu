@@ -722,6 +722,133 @@ __global__ void control_in3_kernel(const float* bank0, const float* bank1, Contr
     control_in_row(bank0, bank1, c.query[s], c.cur[s], c.msg[s], c.pair[s], (size_t) blockIdx.x * kRowWidth);
 }
 
+#ifdef STRATA_HIP_GFX906
+// STRATA_INKLING_MIX_CTRL_FUSE=1: fuse mix_row() + control_in_row() on loop visits (exact same 576-thread
+// float4 ownership, keeps cur in register without a second launch or global round-trip; bitwise identical).
+__device__ __forceinline__ void mix_control_in_row(const MixInputs& in, int count, const float* mquery, float* cur_out,
+                                                   const float* bank0, const float* bank1, const float* cquery,
+                                                   float* msg, float* pair, size_t row) {
+    constexpr int kMost = 5, kW = kMixThreads / 64;
+    const int tid = threadIdx.x;
+    const int lane = tid & 63, wave = tid >> 6;
+    __shared__ float waves[2 * kMost][kW];
+    __shared__ float cwaves[6][kW];
+
+    // 1. Exact mix_row()
+    const float4 mq = reinterpret_cast<const float4*>(mquery)[tid];
+    float4 xv[kMost];
+    for (int j = 0; j < count; ++j) {
+        const float4 xj = reinterpret_cast<const float4*>(in.x[j] + row)[tid];
+        xv[j] = xj;
+        float ss = __fmaf_rn(xj.x, xj.x, __fmaf_rn(xj.y, xj.y, __fmaf_rn(xj.z, xj.z, xj.w * xj.w)));
+        float dot = __fmaf_rn(xj.x, mq.x, __fmaf_rn(xj.y, mq.y, __fmaf_rn(xj.z, mq.z, xj.w * mq.w)));
+        ss = wave64_sum_mix(ss);
+        dot = wave64_sum_mix(dot);
+        if (lane == 0) {
+            waves[2 * j][wave] = ss;
+            waves[2 * j + 1][wave] = dot;
+        }
+    }
+    __syncthreads();
+    if (wave == 0 && lane < 2 * count) {
+        float s = 0.f;
+#pragma unroll
+        for (int w = 0; w < kW; ++w) s += waves[lane][w];
+        waves[lane][0] = s;
+    }
+    __syncthreads();
+    float scale[kMost], wm[kMost], mtop = -INFINITY;
+    for (int j = 0; j < count; ++j) {
+        scale[j] = rsqrtf(waves[2 * j][0] / kRowWidth + 1.e-6f);
+        wm[j] = waves[2 * j + 1][0] * scale[j] * rsqrtf((float) kRowWidth);
+        mtop = fmaxf(mtop, wm[j]);
+    }
+    float msum = 0.f;
+    for (int j = 0; j < count; ++j) msum += (wm[j] = expf(wm[j] - mtop));
+    const float minv_sum = 1.f / msum;
+    float4 x = make_float4(0.f, 0.f, 0.f, 0.f);
+    for (int j = 0; j < count; ++j) {
+        const float c = wm[j] * scale[j] * minv_sum;
+        x.x = __fmaf_rn(c, xv[j].x, x.x);
+        x.y = __fmaf_rn(c, xv[j].y, x.y);
+        x.z = __fmaf_rn(c, xv[j].z, x.z);
+        x.w = __fmaf_rn(c, xv[j].w, x.w);
+    }
+    reinterpret_cast<float4*>(cur_out + row)[tid] = x;
+
+    // 2. Exact control_in_row() with x already in register
+    const float4 q = reinterpret_cast<const float4*>(cquery)[tid];
+    const float4 b0 = reinterpret_cast<const float4*>(bank0 + row)[tid];
+    const float4 b1 = reinterpret_cast<const float4*>(bank1 + row)[tid];
+
+    float s[5];
+    s[0] = __fmaf_rn(b0.x, b0.x, __fmaf_rn(b0.y, b0.y, __fmaf_rn(b0.z, b0.z, b0.w * b0.w)));
+    s[1] = __fmaf_rn(b0.x, q.x, __fmaf_rn(b0.y, q.y, __fmaf_rn(b0.z, q.z, b0.w * q.w)));
+    s[2] = __fmaf_rn(b1.x, b1.x, __fmaf_rn(b1.y, b1.y, __fmaf_rn(b1.z, b1.z, b1.w * b1.w)));
+    s[3] = __fmaf_rn(b1.x, q.x, __fmaf_rn(b1.y, q.y, __fmaf_rn(b1.z, q.z, b1.w * q.w)));
+    s[4] = __fmaf_rn(x.x, x.x, __fmaf_rn(x.y, x.y, __fmaf_rn(x.z, x.z, x.w * x.w)));
+#pragma unroll
+    for (int j = 0; j < 5; ++j) {
+        const float y = wave64_sum_mix(s[j]);
+        if (lane == 0) cwaves[j][wave] = y;
+    }
+    __syncthreads();
+    if (wave == 0 && lane < 5) {
+        float acc = 0.f;
+#pragma unroll
+        for (int w = 0; w < kW; ++w) acc += cwaves[lane][w];
+        cwaves[lane][0] = acc;
+    }
+    __syncthreads();
+    const float s0 = rsqrtf(cwaves[0][0] / kRowWidth + 1.e-6f);
+    const float s1 = rsqrtf(cwaves[2][0] / kRowWidth + 1.e-6f);
+    float w0 = cwaves[1][0] * s0 * rsqrtf((float) kRowWidth);
+    float w1 = cwaves[3][0] * s1 * rsqrtf((float) kRowWidth);
+    const float top = fmaxf(w0, w1);
+    w0 = expf(w0 - top);
+    w1 = expf(w1 - top);
+    const float inv_sum = 1.f / (w0 + w1);
+    const float c0 = w0 * s0 * inv_sum, c1 = w1 * s1 * inv_sum;
+
+    float4 m;
+    m.x = __fmaf_rn(c1, b1.x, c0 * b0.x);
+    m.y = __fmaf_rn(c1, b1.y, c0 * b0.y);
+    m.z = __fmaf_rn(c1, b1.z, c0 * b0.z);
+    m.w = __fmaf_rn(c1, b1.w, c0 * b0.w);
+    reinterpret_cast<float4*>(msg + row)[tid] = m;
+
+    float ms = __fmaf_rn(m.x, m.x, __fmaf_rn(m.y, m.y, __fmaf_rn(m.z, m.z, m.w * m.w)));
+    ms = wave64_sum_mix(ms);
+    if (lane == 0) cwaves[5][wave] = ms;
+    __syncthreads();
+    if (wave == 0 && lane == 0) {
+        float acc = 0.f;
+#pragma unroll
+        for (int w = 0; w < kW; ++w) acc += cwaves[5][w];
+        cwaves[5][0] = acc;
+    }
+    __syncthreads();
+    const float sx = rsqrtf(cwaves[4][0] / float(kRowWidth) + 1.e-6f);
+    const float sm = rsqrtf(cwaves[5][0] / float(kRowWidth) + 1.e-6f);
+    float4* out4 = reinterpret_cast<float4*>(pair + 2 * row);
+    out4[tid] = make_float4(x.x * sx, x.y * sx, x.z * sx, x.w * sx);
+    out4[kRowWidth / 4 + tid] = make_float4(m.x * sm, m.y * sm, m.z * sm, m.w * sm);
+}
+
+__global__ void mix_control_in_kernel(MixInputs in, int count, const float* mquery, float* cur_out,
+                                      const float* bank0, const float* bank1, const float* cquery,
+                                      float* msg, float* pair) {
+    mix_control_in_row(in, count, mquery, cur_out, bank0, bank1, cquery, msg, pair, (size_t) blockIdx.x * kRowWidth);
+}
+
+__global__ void mix_control_in3_kernel(MixInputs in, int count, Streams3 ms,
+                                       const float* bank0, const float* bank1, Control3 c) {
+    const int s = blockIdx.y;
+    mix_control_in_row(in, count, ms.query[s], ms.out[s], bank0, bank1, c.query[s], c.msg[s], c.pair[s],
+                       (size_t) blockIdx.x * kRowWidth);
+}
+#endif
+
 // The third: the gain and the forget gate of each value from the rank, eight lanes an output, applied to the stream.
 __device__ __forceinline__ void control_out_body(const float* gain, const float* forget, const float* rank,
                                                  const float* msg, float* cur, int ranks) {
@@ -827,6 +954,15 @@ void Inkling2::load_geometry() {
     if (q4_0_dense_cols_)
         std::fputs("strata-poly: STRATA_INKLING_Q4_0_DENSE_COLS=1: grouped multi-row Q4_0 dense projections\n",
                    stderr);
+    const char* mix_ctrl = std::getenv("STRATA_INKLING_MIX_CTRL_FUSE");
+    mix_ctrl_fuse_ = decode_ && mix_ctrl && mix_ctrl[0] == '1' && mix_ctrl[1] == '\0';
+    if (mix_ctrl_fuse_)
+        std::fputs("strata-poly: STRATA_INKLING_MIX_CTRL_FUSE=1: fused depth_mix + control_in on loop visits\n",
+                   stderr);
+    const char* gemv_opt = std::getenv("STRATA_GEMV_ROWS_SHARED_OPT");
+    kvproj_fuse_ = decode_ && gemv_opt && gemv_opt[0] == '1' && gemv_opt[1] == '\0';
+    const char* df_fast = std::getenv("STRATA_DFLASH2_FAST");
+    df_fast_ = df_fast && df_fast[0] == '1' && df_fast[1] == '\0';
     if (!q8() && opt_.kv_format != KvFmt::kFp16)
         throw std::runtime_error("Inkling-2-Mini supports Q8_0 or FP16 KV");
     const int window = opt_.window;
@@ -2329,7 +2465,6 @@ bool Inkling2::heads(const Block& b, int il, bool swa, bool loop, int n, const D
         ms.query[i] = fp(b.aquery) + (swa ? 0 : i * kWidth);
         ms.out[i] = s3cur_ + i * w;
     }
-    mix3_kernel<<<dim3(n, 3), kMixThreads, 0, cs(st_)>>>(m, depth_n_ + 1, ms);
     if (loop) {
         Control3 c{};
         F32Segments down;
@@ -2347,10 +2482,20 @@ bool Inkling2::heads(const Block& b, int il, bool swa, bool loop, int n, const D
             down.x[i] = c.pair[i];
             down.y[i] = s3rank_ + (size_t) i * n * kRank;
         }
-        control_in3_kernel<<<dim3(n, 3), kMixThreads, 0, cs(st_)>>>(bank0_, bank1_, c);
+#if defined(STRATA_HIP_GFX906)
+        if (mix_ctrl_fuse_) {
+            mix_control_in3_kernel<<<dim3(n, 3), kMixThreads, 0, cs(st_)>>>(m, depth_n_ + 1, ms, bank0_, bank1_, c);
+        } else
+#endif
+        {
+            mix3_kernel<<<dim3(n, 3), kMixThreads, 0, cs(st_)>>>(m, depth_n_ + 1, ms);
+            control_in3_kernel<<<dim3(n, 3), kMixThreads, 0, cs(st_)>>>(bank0_, bank1_, c);
+        }
         // lin(c.down, pair_, rank_, n) of each stream: gemv_f32_waves() with a row of outputs to its input
         gemv_f32_waves_segments(down, 3, 2 * kWidth, kRank, kRank, n, st_);
         control_out3_kernel<<<dim3(kWidth / 32, n, 3), 256, 0, cs(st_)>>>(c, kRank);
+    } else {
+        mix3_kernel<<<dim3(n, 3), kMixThreads, 0, cs(st_)>>>(m, depth_n_ + 1, ms);
     }
     if (norm_q8_) {   // the three stream norms and their Q8_1 in one launch (s3in_ then already Q8_1 in s3q8_)
         kernels::NormQ8Row rs[3];
@@ -2569,8 +2714,17 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
     const int floor = swa ? 0 : floor_;
     if (fused(n)) {
         if (!swa) {
-            lin(b.kproj, xk, taps_, n);
-            lin(b.vproj, xv, taps2_, n);
+            if (kvproj_fuse_ && b.kproj.type == kTypeF32 && b.vproj.type == kTypeF32 &&
+                b.kproj.scale == 1.f && b.vproj.scale == 1.f &&
+                b.kproj.n_in == b.vproj.n_in && b.kproj.n_out == b.vproj.n_out) {
+                F32Segments kvp;
+                kvp.w[0] = fp(b.kproj); kvp.x[0] = xk; kvp.y[0] = taps_;
+                kvp.w[1] = fp(b.vproj); kvp.x[1] = xv; kvp.y[1] = taps2_;
+                gemv_f32_waves_segments(kvp, 2, b.kproj.n_in, b.kproj.n_out, b.kproj.n_out, n, st_);
+            } else {
+                lin(b.kproj, xk, taps_, n);
+                lin(b.vproj, xv, taps2_, n);
+            }
         }
         const Conv ck{k_, hist, fp(b.kconv), swa ? nullptr : taps_, snap_of(hist)};
         const Conv cv{v_, hist + 3 * n_key_, fp(b.vconv), swa ? nullptr : taps2_, snap_of(hist + 3 * n_key_)};
@@ -2638,8 +2792,31 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
         axpy(ao_, 1.f, r_, n * kWidth, false, st_);
     } else axpy(ao_, 1.f, r_, n * kWidth, true, st_);
 
-    depth_mix(fp(b.fquery), cur_, 0, n);
-    if (loop) control(b, il, 3, cur_, n);
+    if (loop) {
+#if defined(STRATA_HIP_GFX906)
+        const Control& fc = b.control[3];
+        if (mix_ctrl_fuse_ && fused(n) && depth_n_ + 1 <= 5 && fc.gain.type == kTypeF32 && fc.forget.type == kTypeF32 &&
+            fc.gain.scale == 1.f && fc.forget.scale == 1.f) {
+            MixInputs fm{};
+            for (int i = 0; i < depth_n_; ++i) fm.x[i] = depth_[i];
+            fm.x[depth_n_] = r_;
+            const size_t row = 2 * (size_t) (il - kStart) + 1;
+            const float* cquery = b.msg_query.p ? fp(b.msg_query) + 3 * (size_t) kWidth
+                                                : fp(loop_query_) + row * kWidth;
+            mix_control_in_kernel<<<n, kMixThreads, 0, cs(st_)>>>(fm, depth_n_ + 1, fp(b.fquery), cur_,
+                                                                  bank0_, bank1_, cquery, msg_, pair_);
+            lin(fc.down, pair_, rank_, n);
+            control_out_kernel<<<dim3(kWidth / 32, n), 256, 0, cs(st_)>>>(fp(fc.gain), fp(fc.forget), rank_, msg_, cur_,
+                                                                          kRank);
+        } else
+#endif
+        {
+            depth_mix(fp(b.fquery), cur_, 0, n);
+            control(b, il, 3, cur_, n);
+        }
+    } else {
+        depth_mix(fp(b.fquery), cur_, 0, n);
+    }
     kernels::native_add_rms_norm_q8_1(cur_, nullptr, fp(L.ffn_norm), xn_, xq_, kWidth, n, rms_eps_, 128, st_);
     // with STRATA_INKLING_ROUTE_DUAL and one token, the router's gemv below also writes the host h_rl_ and h_x_,
     // and moe_router() launches no copy2 for them
@@ -3248,16 +3425,23 @@ void Inkling2::drafter_guesses(int32_t token) {
     constexpr int b = d2::kBlock;
     for (int l = 0; l < kDfLayers; ++l) {
         const DfLayer& L = df_[(size_t) l];
-        rms_norm(df_x_, fp(L.attn_norm), df_h_, kWidth, b, df_eps_, st_);
-        df_lin(L.aproj, L.aproj8, df_h_, df_dyn_, b);
-        d2::conv(df_h_, df_dyn_, fp(L.abase), 0, df_hp_, b, false, cs(st_));
-        if (df_gemv8_) {   // one launch for q, k and v
-            d2::quantize(df_hp_, kWidth, b, df_xq_, df_xd_, cs(st_));
+        if (df_fast_ && df_gemv8_) {
+            d2::rms_norm_quantize(df_x_, fp(L.attn_norm), df_h_, df_xq_, df_xd_, kWidth, b, df_eps_, cs(st_));
+            d2::gemv8(L.aproj8, df_xq_, df_xd_, df_dyn_, b, cs(st_));
+            d2::conv_quantize(df_h_, df_dyn_, fp(L.abase), 0, b, df_xq_, df_xd_, cs(st_));
             d2::gemv8_split(L.qkv8, df_xq_, df_xd_, df_q_, d2::kQuery, df_k_, d2::kKey, df_v_, d2::kKey, b, cs(st_));
         } else {
-            lin(L.q, df_hp_, df_q_, b);
-            lin(L.k, df_hp_, df_k_, b);
-            lin(L.v, df_hp_, df_v_, b);
+            rms_norm(df_x_, fp(L.attn_norm), df_h_, kWidth, b, df_eps_, st_);
+            df_lin(L.aproj, L.aproj8, df_h_, df_dyn_, b);
+            d2::conv(df_h_, df_dyn_, fp(L.abase), 0, df_hp_, b, false, cs(st_));
+            if (df_gemv8_) {   // one launch for q, k and v
+                d2::quantize(df_hp_, kWidth, b, df_xq_, df_xd_, cs(st_));
+                d2::gemv8_split(L.qkv8, df_xq_, df_xd_, df_q_, d2::kQuery, df_k_, d2::kKey, df_v_, d2::kKey, b, cs(st_));
+            } else {
+                lin(L.q, df_hp_, df_q_, b);
+                lin(L.k, df_hp_, df_k_, b);
+                lin(L.v, df_hp_, df_v_, b);
+            }
         }
         head_norm_rope(df_q_, kHead, fp(L.q_norm), df_qr_, kHead, d2::kHeads, kHead, df_theta_, a, b, df_eps_, st_);
         head_norm_rope(df_k_, kHead, fp(L.k_norm), df_kr_, kHead, d2::kKv, kHead, df_theta_, a, b, df_eps_, st_);
@@ -3265,18 +3449,27 @@ void Inkling2::drafter_guesses(int32_t token) {
             df_qr_, df_kr_, df_v_, df_kc_ + l * ring, df_vc_ + l * ring, lo, a, df_att_, df_ao_, cs(st_));
         df_lin(L.o, L.o8, df_ao_, df_o_, b);
         d2::conv(df_o_, df_dyn_, fp(L.abase), 1, df_x_, b, true, cs(st_));
-        rms_norm(df_x_, fp(L.ffn_norm), df_h_, kWidth, b, df_eps_, st_);
-        df_lin(L.fproj, L.fproj8, df_h_, df_dyn_, b);
-        d2::conv(df_h_, df_dyn_, fp(L.fbase), 0, df_hp_, b, false, cs(st_));
-        if (df_gemv8_) {
-            d2::quantize(df_hp_, kWidth, b, df_xq_, df_xd_, cs(st_));
+        if (df_fast_ && df_gemv8_) {
+            d2::rms_norm_quantize(df_x_, fp(L.ffn_norm), df_h_, df_xq_, df_xd_, kWidth, b, df_eps_, cs(st_));
+            d2::gemv8(L.fproj8, df_xq_, df_xd_, df_dyn_, b, cs(st_));
+            d2::conv_quantize(df_h_, df_dyn_, fp(L.fbase), 0, b, df_xq_, df_xd_, cs(st_));
             d2::gemv8_split(L.gu8, df_xq_, df_xd_, df_g_, kDfFfn, df_u_, kDfFfn, nullptr, 0, b, cs(st_));
+            d2::swiglu_quantize(df_g_, df_u_, kDfFfn, b, df_xq_, df_xd_, cs(st_));
+            d2::gemv8(L.down8, df_xq_, df_xd_, df_o_, b, cs(st_));
         } else {
-            lin(L.gate, df_hp_, df_g_, b);
-            lin(L.up, df_hp_, df_u_, b);
+            rms_norm(df_x_, fp(L.ffn_norm), df_h_, kWidth, b, df_eps_, st_);
+            df_lin(L.fproj, L.fproj8, df_h_, df_dyn_, b);
+            d2::conv(df_h_, df_dyn_, fp(L.fbase), 0, df_hp_, b, false, cs(st_));
+            if (df_gemv8_) {
+                d2::quantize(df_hp_, kWidth, b, df_xq_, df_xd_, cs(st_));
+                d2::gemv8_split(L.gu8, df_xq_, df_xd_, df_g_, kDfFfn, df_u_, kDfFfn, nullptr, 0, b, cs(st_));
+            } else {
+                lin(L.gate, df_hp_, df_g_, b);
+                lin(L.up, df_hp_, df_u_, b);
+            }
+            swiglu_clamp(df_g_, df_u_, df_m_, b * kDfFfn, INFINITY, st_);
+            df_lin(L.down, L.down8, df_m_, df_o_, b);
         }
-        swiglu_clamp(df_g_, df_u_, df_m_, b * kDfFfn, INFINITY, st_);
-        df_lin(L.down, L.down8, df_m_, df_o_, b);
         d2::conv(df_o_, df_dyn_, fp(L.fbase), 1, df_x_, b, true, cs(st_));
     }
     rms_norm(df_x_, fp(df_onorm_), df_fin_, kWidth, b, df_eps_, st_);
@@ -3286,6 +3479,7 @@ void Inkling2::drafter_guesses(int32_t token) {
         try {
             tp2_->broadcast_from_0(0, df_fin_ + kWidth, d2::kGuess * kWidth, st_);
             df_head_run(df_fin_ + kWidth);
+            if (df_fast_ && df_sel8_.q) d2::gemv8(df_sel8_, df_hxq_, df_hxd_, df_selh_, d2::kGuess, cs(st_));
             tp2_->gather_from_1(0, df_hpack_, nullptr, d2::kGuess * 2 * d2::kTop, st_);
             d2::unpack_top(df_hpack_, d2::kGuess, df_hids1_, df_hvals1_, cs(st_));
             d2::merge2(df_hids_, df_hvals_, df_hids1_, df_hvals1_, d2::kGuess, df_ids_, df_vals_, cs(st_));
@@ -3299,7 +3493,8 @@ void Inkling2::drafter_guesses(int32_t token) {
         project_logits(df_fin_ + kWidth, df_logits_, d2::kGuess);
         d2::topk(df_logits_, d2::kGuess, n_vocab_, kDfVocab, df_top_, df_ids_, df_vals_, cs(st_));
     }
-    df_lin(df_selw_, df_sel8_, df_fin_ + kWidth, df_selh_, d2::kGuess);
+    if (!df_fast_ || !df_head8_ || !df_sel8_.q)
+        df_lin(df_selw_, df_sel8_, df_fin_ + kWidth, df_selh_, d2::kGuess);
     static_assert(sizeof(d2::Guess) == sizeof(Likeliest));
     d2::select(df_ids_, df_vals_, df_selh_, df_pred_, df_succ_, token, df_cap_, df_edges_,
                reinterpret_cast<d2::Guess*>(h_block_), cs(st_));

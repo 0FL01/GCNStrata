@@ -3789,6 +3789,113 @@ __global__ void native_q8_0_segments_cols_grouped_kernel(MmvqSegments s, int n_i
     }
 }
 
+#if defined(STRATA_HIP_GFX906)
+// STRATA_INKLING_Q8_0_DENSE_COLS=1 (SV5 lds_r2_u2): 256 threads (8 x 32-lane subwarps),
+// 2 rows per subwarp (16 rows/CTA), s.x[seg] staged once into LDS via int4 loads, 2x kb unroll,
+// unaligned 4-byte weight load. Preserves native_q8_0_segments_kernel's exact 32-lane dot order
+// and warp_sum() reduction bitwise.
+struct Q80ColsSegs {
+    const Q80Block* w[MmvqSegments::kMost];
+    const Q81Block* x[MmvqSegments::kMost];
+    float* y[MmvqSegments::kMost];
+    int rows[MmvqSegments::kMost];
+    int end_cta[MmvqSegments::kMost];
+    int count;
+};
+
+__device__ __forceinline__ int load_int_u4_q80(const void* ptr, int i32) {
+    int v;
+    __builtin_memcpy(&v, static_cast<const uint8_t*>(ptr) + 4 * i32, 4);
+    return v;
+}
+
+template<int NC>
+__launch_bounds__(256)
+__global__ void native_q8_0_segments_cols_lds_kernel(Q80ColsSegs s, int n_in) {
+    extern __shared__ int4 s_q8_xw[];
+    const int nb = n_in / 32;
+    const int cta = int(blockIdx.x);
+    int seg = 0;
+    while (seg < s.count - 1 && cta >= s.end_cta[seg]) ++seg;
+    const int local_cta = cta - (seg == 0 ? 0 : s.end_cta[seg - 1]);
+
+    const int words = NC * nb * int(sizeof(Q81Block)) / 16;
+    const int4* src = reinterpret_cast<const int4*>(s.x[seg]);
+    for (int i = int(threadIdx.x); i < words; i += 256) s_q8_xw[i] = src[i];
+    __syncthreads();
+    const Q81Block* xs = reinterpret_cast<const Q81Block*>(s_q8_xw);
+
+    const int lane = int(threadIdx.x) & 31;
+    const int sw = int(threadIdx.x) >> 5;
+    const int part = lane & 7;
+    const int sub = lane >> 3;
+    const int row0 = (local_cta * 8 + sw) * 2;
+    const int nrows = s.rows[seg];
+    if (row0 >= nrows) return;
+    const Q80Block* w = s.w[seg];
+
+    float acc[NC][2] = {};
+    int kb = sub;
+    for (; kb + 4 < nb; kb += 8) {
+        int v0[2], v1[2];
+        float dw0[2], dw1[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const Q80Block* b0 = w + std::size_t(row0 + r) * nb + kb;
+            const Q80Block* b1 = b0 + 4;
+            v0[r] = load_int_u4_q80(b0->qs, part);
+            dw0[r] = __half2float(b0->d);
+            v1[r] = load_int_u4_q80(b1->qs, part);
+            dw1[r] = __half2float(b1->d);
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const Q81Block* xb0 = xs + c * nb + kb;
+            const Q81Block* xb1 = xb0 + 4;
+            const int u0 = reinterpret_cast<const int*>(xb0->qs)[part];
+            const float dx0 = __low2float(xb0->ds);
+            const int u1 = reinterpret_cast<const int*>(xb1->qs)[part];
+            const float dx1 = __low2float(xb1->ds);
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                acc[c][r] += dw0[r] * dx0 * float(STRATA_DP4A(v0[r], u0, 0));
+                acc[c][r] += dw1[r] * dx1 * float(STRATA_DP4A(v1[r], u1, 0));
+            }
+        }
+    }
+    for (; kb < nb; kb += 4) {
+        int v[2];
+        float dw[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const Q80Block* b = w + std::size_t(row0 + r) * nb + kb;
+            v[r] = load_int_u4_q80(b->qs, part);
+            dw[r] = __half2float(b->d);
+        }
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            const Q81Block* xb = xs + c * nb + kb;
+            const int u = reinterpret_cast<const int*>(xb->qs)[part];
+            const float dx = __low2float(xb->ds);
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                acc[c][r] += dw[r] * dx * float(STRATA_DP4A(v[r], u, 0));
+            }
+        }
+    }
+
+    float* y = s.y[seg];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+#pragma unroll
+        for (int r = 0; r < 2; ++r) {
+            const float t = warp_sum(acc[c][r]);
+            if (lane == 0) y[std::size_t(c) * nrows + row0 + r] = t;
+        }
+    }
+}
+#endif
+
 // native_q8_0_segments_kernel's sum, for NC columns that share each weight load.  Keep the expression identical.
 template<int NC>
 __launch_bounds__(4 * WARP, 1)
@@ -3850,12 +3957,48 @@ bool native_mmvq_segments(int ggml_type, const MmvqSegments& s, int n_in, void* 
 bool native_q8_0_segments_cols_grouped(const MmvqSegments& s, int n_in, int ncols, void* stream) {
     if (s.count < 1 || s.count > MmvqSegments::kMost || n_in <= 0 || n_in % 128 || ncols < 1 || ncols > 8) return false;
     int total_rows = 0;
+    bool aligned16 = true;
     for (int j = 0; j < s.count; ++j) {
         if (s.rows[j] <= 0) return false;
+        if (s.rows[j] % 16 != 0) aligned16 = false;
         total_rows += s.rows[j];
     }
     validate_stream(stream);
     const auto st = static_cast<cudaStream_t>(stream);
+#if defined(STRATA_HIP_GFX906)
+    static const bool q8_0_lds = [] {
+        const char* v = std::getenv("STRATA_INKLING_Q8_0_DENSE_COLS");
+        const bool on = v && v[0] == '1' && !v[1];
+        if (on) std::fputs("strata-poly: STRATA_INKLING_Q8_0_DENSE_COLS=1: LDS-staged R2/U2 multi-row Q8_0 projections\n", stderr);
+        return on;
+    }();
+    const std::size_t lds_bytes = std::size_t(ncols) * (n_in / 32) * sizeof(Q81Block);
+    if (q8_0_lds && ncols >= 2 && aligned16 && lds_bytes <= kColsLds) {
+        Q80ColsSegs qs{};
+        qs.count = s.count;
+        int acc_cta = 0;
+        for (int j = 0; j < s.count; ++j) {
+            qs.w[j] = static_cast<const Q80Block*>(s.w[j]);
+            qs.x[j] = static_cast<const Q81Block*>(s.x[j]);
+            qs.y[j] = s.y[j];
+            qs.rows[j] = s.rows[j];
+            acc_cta += s.rows[j] / 16;
+            qs.end_cta[j] = acc_cta;
+        }
+        const dim3 grid{unsigned(acc_cta)}, block{256};
+        switch (ncols) {
+        case 2: native_q8_0_segments_cols_lds_kernel<2><<<grid, block, lds_bytes, st>>>(qs, n_in); break;
+        case 3: native_q8_0_segments_cols_lds_kernel<3><<<grid, block, lds_bytes, st>>>(qs, n_in); break;
+        case 4: native_q8_0_segments_cols_lds_kernel<4><<<grid, block, lds_bytes, st>>>(qs, n_in); break;
+        case 5: native_q8_0_segments_cols_lds_kernel<5><<<grid, block, lds_bytes, st>>>(qs, n_in); break;
+        case 6: native_q8_0_segments_cols_lds_kernel<6><<<grid, block, lds_bytes, st>>>(qs, n_in); break;
+        case 7: native_q8_0_segments_cols_lds_kernel<7><<<grid, block, lds_bytes, st>>>(qs, n_in); break;
+        case 8: native_q8_0_segments_cols_lds_kernel<8><<<grid, block, lds_bytes, st>>>(qs, n_in); break;
+        }
+        launch_check();
+        return true;
+    }
+#endif
     const dim3 grid(unsigned((total_rows + 3) / 4)), block(WARP, 4);
     switch (ncols) {
     case 1: native_q8_0_segments_cols_grouped_kernel<1><<<grid, block, 0, st>>>(s, n_in); break;

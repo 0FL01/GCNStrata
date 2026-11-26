@@ -83,4 +83,11 @@ void gemv8_split(const Mat8& w, const int8_t* xq, const float* xd, float* y0, in
 /// attend() with 32 keys a CTA, halves in LDS and dot2 (two CTAs a CU).
 void attend3(const float* q, const float* kb, const float* vb, const __half* kc, const __half* vc, int64_t lo,
              int64_t pos, float* scratch, float* out, cudaStream_t st);
+
+/// Fused drafter helpers (STRATA_DFLASH2_FAST=1): eliminate intermediate FP32 round-trips and quantize launches.
+void rms_norm_quantize(const float* x, const float* w, float* y_out, int8_t* q, float* d, int n_in, int rows, float eps,
+                       cudaStream_t st);
+void conv_quantize(const float* x, const float* dyn, const float* base, int stage, int rows, int8_t* q, float* d,
+                   cudaStream_t st);
+void swiglu_quantize(const float* g, const float* u, int n_in, int rows, int8_t* q, float* d, cudaStream_t st);
 }  // namespace strata::poly::dflash2

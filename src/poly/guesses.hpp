@@ -19,6 +19,8 @@
 #include "strata/spec/draft_policy.hpp"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 
 namespace strata::poly {
 
@@ -70,15 +72,23 @@ public:
         blocks_ = blocks;
         at_once_ = at_once;
         asked_ = 0;
+        round_ask_ms_ = 0.0;
         sure_ = tokens_ = 1.0;
         one_ = at_[1] ? ms_[1] : policy.cost_ms(1);   // a token alone is the measure, old or not
+        v_one_ = at_[1] ? v_ms_[1] : one_;
         return blocks && gate.ask();
     }
 
     /// Whether the block is asked for a guess more, the window having n of them.
     bool wants(int n) {
-        if (at_once_ && n == 0) return true;   // the gate asked the block: its pass is paid for its whole block
         const int to = n + 2;   // the window's tokens with this guess
+        if (at_once_ && at_once_v2()) {
+            const double prev_v = verify_ms(to - 1);
+            step_ms_ = knows(to) ? std::clamp(v_ms_[to] - prev_v, 0.15 * v_one_, 0.8 * v_one_) : kUnmeasured * v_one_;
+            if (n == 0) return true;   // the gate asked the block: its pass is paid for its whole block
+            return sure_ * total_ms(to - 1) > tokens_ * step_ms_;
+        }
+        if (at_once_ && n == 0) return true;   // the gate asked the block: its pass is paid for its whole block
         more_ = knows(to) ? std::clamp((ms_[to] - round_ms(to - 1)) / one_, 0.2, 0.8) : kUnmeasured;
         // asking takes time too: not when a guess the block were sure of would not pay for it
         const double ask = !at_once_ && measured_ && fresh(asked_at_) ? ask_ms_ : 0.0;
@@ -88,11 +98,18 @@ public:
     /// The block's guess after n others, right with probability p; asking took `ms`.  Returns whether it joins
     /// the window.
     bool takes(int n, double p, double ms) {
-        if (!(at_once_ && n > 0))   // a block's later guesses are its first pass's: no time of their own
+        if (!(at_once_ && n > 0)) {   // a block's later guesses are its first pass's: no time of their own
+            round_ask_ms_ = ms;
             ask_ms_ = fresh(asked_at_) ? ask_ms_ + 0.1 * (std::min(ms, 2.0 * ask_ms_) - ask_ms_) : ms;
+        }
         asked_at_ = round_;
         ++asked_;
         sure_ *= p;
+        if (at_once_ && at_once_v2()) {
+            if (sure_ * total_ms(n + 1) <= tokens_ * step_ms_) return false;
+            tokens_ += sure_;
+            return true;
+        }
         if (sure_ * round_ms(n + 1) <= tokens_ * more_ * one_) return false;
         tokens_ += sure_;
         return true;
@@ -105,6 +122,9 @@ public:
         t = std::clamp(t, 1, spec::DraftPolicy::kMaxT);
         if (knows(t)) ms = std::min(ms, 2.0 * ms_[t]);
         ms_[t] = knows(t) ? ms_[t] + 0.1 * (ms - ms_[t]) : ms;
+        double v = std::max(1.0, ms - (at_once_ && asked_ > 0 ? round_ask_ms_ : 0.0));
+        if (knows(t)) v = std::min(v, 2.0 * v_ms_[t]);
+        v_ms_[t] = knows(t) ? v_ms_[t] + 0.1 * (v - v_ms_[t]) : v;
         at_[t] = round_;
         measured_ = true;
         if (blocks_) gate.saw(asked_ > 0, wrote, ms);
@@ -112,13 +132,25 @@ public:
     }
 
 private:
+    static bool at_once_v2() {
+        static const bool on = [] {
+            const char* e = std::getenv("STRATA_GUESSES_ATONCE_V2");
+            const bool v = e && e[0] == '1' && e[1] == '\0';
+            if (v) std::fputs("strata-poly: STRATA_GUESSES_ATONCE_V2=1: separate ask/verify cost model for all-at-once drafter\n", stderr);
+            return v;
+        }();
+        return on;
+    }
     bool fresh(long long at) const { return at && round_ - at <= kFresh; }
     bool knows(int t) const { return fresh(at_[t]); }
     // what a round with a window of t tokens takes: as measured, or a token more than the next shorter one
     double round_ms(int t) const { return t <= 1 ? one_ : knows(t) ? ms_[t] : round_ms(t - 1) + kUnmeasured * one_; }
+    double verify_ms(int t) const { return t <= 1 ? v_one_ : knows(t) ? v_ms_[t] : verify_ms(t - 1) + kUnmeasured * v_one_; }
+    double total_ms(int t) const { return verify_ms(t) + (fresh(asked_at_) ? ask_ms_ : 0.0); }
 
     long long round_ = 0;                            // the first is 1
     double ms_[spec::DraftPolicy::kMaxT + 1] = {};   // a round's time by its window's tokens
+    double v_ms_[spec::DraftPolicy::kMaxT + 1] = {}; // verify-only time by window tokens (excluding ask_ms)
     long long at_[spec::DraftPolicy::kMaxT + 1] = {};   // the round that time is of; 0: none yet
     double ask_ms_ = 0.0;                            // what one guess of the block takes
     long long asked_at_ = 0;
@@ -126,7 +158,7 @@ private:
     // of the round
     bool blocks_ = false, at_once_ = false;
     int asked_ = 0;
-    double one_ = 1.0, more_ = kUnmeasured, sure_ = 1.0, tokens_ = 1.0;
+    double one_ = 1.0, v_one_ = 1.0, more_ = kUnmeasured, step_ms_ = 0.0, round_ask_ms_ = 0.0, sure_ = 1.0, tokens_ = 1.0;
 };
 
 }  // namespace strata::poly

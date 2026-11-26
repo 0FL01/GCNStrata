@@ -5,6 +5,8 @@
 
 #include <cfloat>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 
 namespace strata::poly::dflash2 {
 namespace {
@@ -257,7 +259,8 @@ __global__ void __launch_bounds__(256) edges_kernel(const int32_t* __restrict__ 
     for (int r = 0; r < kRank; ++r) pair += ps[a][r] * qs[b][r];
     edges[(size_t) t * kTop * kTop + a * kTop + b] = cap * tanhf((vals[t * kTop + b] + pair) / cap);
 }
-__global__ void walk_kernel(const int32_t* __restrict__ ids, const float* __restrict__ edges, Guess* out) {
+__global__ void walk_kernel(const int32_t* __restrict__ ids, const float* __restrict__ edges, float inv_temp,
+                            Guess* out) {
     if (threadIdx.x != 0) return;
     int prev = 0;
     for (int t = 0; t < kGuess; ++t) {
@@ -266,7 +269,7 @@ __global__ void walk_kernel(const int32_t* __restrict__ ids, const float* __rest
         for (int b = 1; b < kTop; ++b)
             if (e[b] > e[best]) best = b;
         float sum = 0.f;
-        for (int b = 0; b < kTop; ++b) sum += __expf(e[b] - e[best]);
+        for (int b = 0; b < kTop; ++b) sum += __expf((e[b] - e[best]) * inv_temp);
         out[t].token = ids[t * kTop + best];
         out[t].prob = 1.f / sum;
         prev = best;
@@ -357,6 +360,149 @@ __global__ void __launch_bounds__(256) gemv8_kernel(const int8_t* __restrict__ w
         for (int o = 8; o > 0; o >>= 1) v += __shfl_xor(v, o, 16);
         if (j == 0) out.y[seg][(size_t) k * out.n[seg] + at] = v;
     }
+}
+
+// STRATA_DFLASH2_FAST=1: 8 lanes/row, 2 rows/subwarp (64 rows/CTA), full 32B block (8x sdot4 per scale).
+// Used when n_out >= 4096 (qkv8, gu8, head8) where 64 rows/CTA saturates all 60 CUs and halves LDS & FP32 work.
+template <int NC>
+__global__ void __launch_bounds__(256) gemv8_l8_r2_kernel(const int8_t* __restrict__ wq, const float* __restrict__ wd,
+                                                          const int8_t* __restrict__ xq, const float* __restrict__ xd,
+                                                          Outs out, int n_in, int n_out) {
+    __shared__ int4 xs[NC * (kTileK / 16)];
+    __shared__ float xds[NC * (kTileK / 32)];
+    const int j = int(threadIdx.x) & 7;
+    const int row0 = (int(blockIdx.x) * 32 + (int(threadIdx.x) >> 3)) * 2;
+    const int blocks = n_in / 32;
+    float acc[2][NC] = {};
+    for (int k0 = 0; k0 < n_in; k0 += kTileK) {
+        const int blks = min(kTileK, n_in - k0) / 32;
+        const int chunks = blks * 2;
+        __syncthreads();
+        for (int i = int(threadIdx.x); i < NC * chunks; i += 256) {
+            const int k = i / chunks, c = i % chunks;
+            xs[k * (kTileK / 16) + c] = reinterpret_cast<const int4*>(xq + (size_t) k * n_in + k0)[c];
+        }
+        for (int i = int(threadIdx.x); i < NC * blks; i += 256) {
+            const int k = i / blks, b = i % blks;
+            xds[k * (kTileK / 32) + b] = xd[(size_t) k * blocks + k0 / 32 + b];
+        }
+        __syncthreads();
+        if (row0 >= n_out) continue;
+        for (int blk = j; blk < blks; blk += 8) {
+            int4 a0[2], a1[2];
+            float ws[2];
+#pragma unroll
+            for (int r = 0; r < 2; ++r) {
+                const int rr = row0 + r;
+                if (rr < n_out) {
+                    const int4* w = reinterpret_cast<const int4*>(wq + (size_t) rr * n_in + k0);
+                    a0[r] = w[2 * blk];
+                    a1[r] = w[2 * blk + 1];
+                    ws[r] = wd[(size_t) rr * blocks + k0 / 32 + blk];
+                } else {
+                    a0[r] = make_int4(0, 0, 0, 0);
+                    a1[r] = make_int4(0, 0, 0, 0);
+                    ws[r] = 0.f;
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < NC; ++k) {
+                const int4 b0 = xs[k * (kTileK / 16) + 2 * blk];
+                const int4 b1 = xs[k * (kTileK / 16) + 2 * blk + 1];
+                const float xscale = xds[k * (kTileK / 32) + blk];
+#pragma unroll
+                for (int r = 0; r < 2; ++r) {
+                    int t = __builtin_amdgcn_sdot4(a0[r].x, b0.x, 0, false);
+                    t = __builtin_amdgcn_sdot4(a0[r].y, b0.y, t, false);
+                    t = __builtin_amdgcn_sdot4(a0[r].z, b0.z, t, false);
+                    t = __builtin_amdgcn_sdot4(a0[r].w, b0.w, t, false);
+                    t = __builtin_amdgcn_sdot4(a1[r].x, b1.x, t, false);
+                    t = __builtin_amdgcn_sdot4(a1[r].y, b1.y, t, false);
+                    t = __builtin_amdgcn_sdot4(a1[r].z, b1.z, t, false);
+                    t = __builtin_amdgcn_sdot4(a1[r].w, b1.w, t, false);
+                    acc[r][k] += float(t) * (ws[r] * xscale);
+                }
+            }
+        }
+    }
+    if (row0 >= n_out) return;
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+        const int rr = row0 + r;
+        if (rr >= n_out) break;
+        int seg = 0, at = rr;
+        while (seg < 2 && at >= out.n[seg]) at -= out.n[seg++];
+#pragma unroll
+        for (int k = 0; k < NC; ++k) {
+            float v = acc[r][k];
+            for (int o = 4; o > 0; o >>= 1) v += __shfl_xor(v, o, 8);
+            if (j == 0) out.y[seg][(size_t) k * out.n[seg] + at] = v;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256) rms_norm_quantize_kernel(const float* __restrict__ x, const float* __restrict__ w,
+                                                                float* __restrict__ y_out, int8_t* __restrict__ q,
+                                                                float* __restrict__ d, int n_in, float eps) {
+    __shared__ float sw[4];
+    const int r = int(blockIdx.x), tid = int(threadIdx.x);
+    const float* xr = x + (size_t) r * n_in;
+    float ss = 0.f;
+    for (int i = tid; i < n_in; i += 256) {
+        const float v = xr[i];
+        ss += v * v;
+    }
+    for (int o = 32; o > 0; o >>= 1) ss += __shfl_xor(ss, o, 64);
+    if ((tid & 63) == 0) sw[tid >> 6] = ss;
+    __syncthreads();
+    const float total = sw[0] + sw[1] + sw[2] + sw[3];
+    const float scale = rsqrtf(total / float(n_in) + eps);
+    const int sub = tid >> 5, lane = tid & 31, blocks = n_in / 32;
+    float* yr = y_out ? y_out + (size_t) r * n_in : nullptr;
+    int8_t* qr = q + (size_t) r * n_in;
+    float* dr = d + (size_t) r * blocks;
+    for (int b = sub; b < blocks; b += 8) {
+        const int c = b * 32 + lane;
+        const float val = xr[c] * scale * w[c];
+        if (yr) yr[c] = val;
+        float a = fabsf(val);
+        for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
+        const float s = a / 127.f;
+        qr[c] = (int8_t) (s > 0.f ? __float2int_rn(val / s) : 0);
+        if (lane == 0) dr[b] = s;
+    }
+}
+
+__global__ void __launch_bounds__(256) conv_quantize_kernel(const float* __restrict__ x, const float* __restrict__ dyn,
+                                                            const float* __restrict__ base, int stage,
+                                                            int8_t* __restrict__ q, float* __restrict__ d) {
+    const int r = int(blockIdx.y), b = int(blockIdx.x) * 8 + (int(threadIdx.x) >> 5), j = int(threadIdx.x) & 31;
+    const int c = b * 32 + j;
+    if (c >= kWidth) return;
+    const int g = c / 16;
+    const float* dn = dyn + (size_t) r * kDyn + stage * 2 * kGroups;
+    float val = (base[(stage * 2 + 0) * kWidth + c] + dn[g]) * x[(size_t) r * kWidth + c];
+    if (r) val += (base[(stage * 2 + 1) * kWidth + c] + dn[kGroups + g]) * x[(size_t) (r - 1) * kWidth + c];
+    float a = fabsf(val);
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
+    const float s = a / 127.f;
+    q[(size_t) r * kWidth + c] = (int8_t) (s > 0.f ? __float2int_rn(val / s) : 0);
+    if (j == 0) d[(size_t) r * (kWidth / 32) + b] = s;
+}
+
+__global__ void __launch_bounds__(256) swiglu_quantize_kernel(const float* __restrict__ g, const float* __restrict__ u,
+                                                              int n_in, int8_t* __restrict__ q, float* __restrict__ d) {
+    const int r = int(blockIdx.y), b = int(blockIdx.x) * 8 + (int(threadIdx.x) >> 5), j = int(threadIdx.x) & 31;
+    const int c = b * 32 + j;
+    if (c >= n_in) return;
+    const size_t at = (size_t) r * n_in + c;
+    const float gv = g[at];
+    const float val = (gv / (1.0f + expf(-gv))) * u[at];
+    float a = fabsf(val);
+    for (int o = 16; o > 0; o >>= 1) a = fmaxf(a, __shfl_xor(a, o, 32));
+    const float s = a / 127.f;
+    q[at] = (int8_t) (s > 0.f ? __float2int_rn(val / s) : 0);
+    if (j == 0) d[(size_t) r * (n_in / 32) + b] = s;
 }
 
 // ---- attention v3: 32 keys a CTA, halves in LDS (~29 KB: two CTAs a CU), dot2, four independent sums a thread ----
@@ -520,7 +666,23 @@ void gemv8(const Mat8& w, const int8_t* xq, const float* xd, float* y, int rows,
 
 void gemv8_split(const Mat8& w, const int8_t* xq, const float* xd, float* y0, int n0, float* y1, int n1, float* y2,
                  int n2, int rows, cudaStream_t st) {
+    static const bool fast = [] {
+        const char* e = std::getenv("STRATA_DFLASH2_FAST");
+        const bool on = e && e[0] == '1' && !e[1];
+        if (on) std::fputs("strata-poly: STRATA_DFLASH2_FAST=1: 32B-block L8/R2 gemv8 and fused drafter quantize\n", stderr);
+        return on;
+    }();
     const Outs out{{y0, y1, y2}, {n0, n1 ? n1 : 1 << 30, n2 ? n2 : 1 << 30}};
+    if (fast && w.n_out >= 4096 && w.n_in % 32 == 0) {
+        const dim3 grid(div_up(w.n_out, 64));
+        switch (rows) {
+#define DF2_G2(N) case N: gemv8_l8_r2_kernel<N><<<grid, 256, 0, st>>>(w.q, w.d, xq, xd, out, w.n_in, w.n_out); break;
+            DF2_G2(1) DF2_G2(2) DF2_G2(3) DF2_G2(4) DF2_G2(5) DF2_G2(6) DF2_G2(7) DF2_G2(8)
+#undef DF2_G2
+            default: break;
+        }
+        return;
+    }
     const dim3 grid(div_up(w.n_out, 16));
     switch (rows) {
 #define DF2_G(N) case N: gemv8_kernel<N><<<grid, 256, 0, st>>>(w.q, w.d, xq, xd, out, w.n_in, w.n_out); break;
@@ -528,6 +690,20 @@ void gemv8_split(const Mat8& w, const int8_t* xq, const float* xd, float* y0, in
 #undef DF2_G
         default: break;
     }
+}
+
+void rms_norm_quantize(const float* x, const float* w, float* y_out, int8_t* q, float* d, int n_in, int rows, float eps,
+                       cudaStream_t st) {
+    rms_norm_quantize_kernel<<<rows, 256, 0, st>>>(x, w, y_out, q, d, n_in, eps);
+}
+
+void conv_quantize(const float* x, const float* dyn, const float* base, int stage, int rows, int8_t* q, float* d,
+                   cudaStream_t st) {
+    conv_quantize_kernel<<<dim3(div_up(kWidth / 32, 8), rows), 256, 0, st>>>(x, dyn, base, stage, q, d);
+}
+
+void swiglu_quantize(const float* g, const float* u, int n_in, int rows, int8_t* q, float* d, cudaStream_t st) {
+    swiglu_quantize_kernel<<<dim3(div_up(n_in / 32, 8), rows), 256, 0, st>>>(g, u, n_in, q, d);
 }
 
 void attend3(const float* q, const float* kb, const float* vb, const __half* kc, const __half* vc, int64_t lo,
@@ -552,8 +728,19 @@ void unpack_top(const float* in, int rows, int32_t* ids, float* vals, cudaStream
 
 void select(const int32_t* ids, const float* vals, const float* h, const __half* pred, const __half* succ,
             int32_t anchor, float cap, float* edges, Guess* out, cudaStream_t st) {
+    static const float inv_temp = [] {
+        const char* e = std::getenv("STRATA_DFLASH2_PROB_TEMP");
+        if (!e || !*e) return 1.f;
+        const double t = std::strtod(e, nullptr);
+        if (t > 0.1 && t <= 10.0) {
+            std::fprintf(stderr, "strata-poly: STRATA_DFLASH2_PROB_TEMP=%.3f: calibrated DFlash2 walk probabilities\n",
+                         t);
+            return (float) (1.0 / t);
+        }
+        return 1.f;
+    }();
     edges_kernel<<<kGuess, 256, 0, st>>>(ids, vals, h, pred, succ, anchor, cap, edges);
-    walk_kernel<<<1, 64, 0, st>>>(ids, edges, out);
+    walk_kernel<<<1, 64, 0, st>>>(ids, edges, inv_temp, out);
 }
 
 }  // namespace strata::poly::dflash2
