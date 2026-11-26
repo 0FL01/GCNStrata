@@ -706,6 +706,11 @@ it works but is not part of this build).
 
 The vector loop preserves the FP32 polynomial operations, the order of the four FP64 mass sums and the RNG draw. Equal logits and RNG therefore do not require similar wall times. Conversely the **speculative policy uses wall time**: even a repeat of the old engine with the same seed can take different verifier windows. Compare the sampled-from logits and picks at matched windows before attributing a different live transcript to sampling.
 
+`STRATA_POLY_MT_SAMPLE=1` enables the same AVX2 draw with four host threads (including the caller); `2`–`8`
+select the exact number. It does not require `STRATA_POLY_AVX2_SAMPLE=1`. The threads share whole runs without
+changing their weights, sums, the maximum's signed-zero tie break, or the draw order. The pool starts only for a
+large enough, unfiltered AVX2 draw. Omit the flag to keep the existing sampler selection.
+
 ### Inkling-2-Mini: width-invariant verifier (opt-in)
 
 Four flags together make every logical row of a verifier window (2–8 rows, including the rows a `keep()` rollback

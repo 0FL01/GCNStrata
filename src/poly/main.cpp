@@ -23,6 +23,7 @@
 #include <deque>
 #include <functional>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -111,9 +112,10 @@ public:
 #if defined(STRATA_POLY_HAVE_AVX2_SAMPLE)
             static const bool avx2 = [] {
                 const char* value = std::getenv("STRATA_POLY_AVX2_SAMPLE");
-                return value && std::strcmp(value, "1") == 0 && __builtin_cpu_supports("avx2");
+                return ((value && std::strcmp(value, "1") == 0) || mt_sample_threads() > 0) &&
+                       __builtin_cpu_supports("avx2");
             }();
-            if (avx2) return draw_all<true>(logits, n_vocab, s, rng);
+            if (avx2) return draw_all<true>(logits, n_vocab, s, rng, sample_pool(n_runs(n_vocab)));
 #endif
             return draw_all(logits, n_vocab, s, rng);
         }
@@ -195,6 +197,20 @@ private:
     }
 
 #if defined(STRATA_POLY_HAVE_AVX2_SAMPLE)
+    friend struct SamplerHostTest;
+
+    static int n_runs(int n) { return n / kSumRun + (n % kSumRun != 0); }
+
+    static int mt_sample_threads() {
+        static const int threads = [] {
+            const char* e = std::getenv("STRATA_POLY_MT_SAMPLE");
+            if (!e || !*e || e[1] != '\0') return 0;
+            if (*e == '1') return 4;
+            return *e >= '2' && *e <= '8' ? *e - '0' : 0;
+        }();
+        return threads;
+    }
+
     __attribute__((target("avx2,no-fma")))
     static float max_avx2(const float* logits, int n) {
         float mx = -INFINITY;
@@ -246,15 +262,147 @@ private:
         _mm256_storeu_pd(lane, sums);
         return finish_run(q, i, n, lane);
     }
+    // The caller is thread 0. Publish each job with a generation; each worker publishes its own result with
+    // the same generation. Only idle workers park, so successive passes need not wait for an OS wakeup.
+    class SamplePool {
+    public:
+        explicit SamplePool(int threads) : threads_(threads) {
+            try {
+                for (int i = 1; i < threads_; ++i) workers_[i].thread = std::thread([this, i] { work(i); });
+            } catch (...) {
+                stop();
+                throw;
+            }
+        }
+        ~SamplePool() { stop(); }
+
+        float max(const float* logits, int n, int nr) {
+            dispatch({logits, nullptr, nullptr, n, nr});
+            float mx = workers_[0].mx;
+            // Slices are in token order. Each max_avx2 already chose its first zero on a tie;
+            // std::max keeps the first of those slice maxima, even if its zero has a different sign.
+            for (int i = 1; i < threads_; ++i) mx = std::max(mx, workers_[i].mx);
+            return mx;
+        }
+        void weights(const float* logits, float* q, double* runs, int n, int nr, float mx, float inv) {
+            dispatch({logits, q, runs, n, nr, mx, inv});
+        }
+
+    private:
+        struct Job {
+            const float* logits;
+            float* q;
+            double* runs;   // null for the max pass
+            int n, nr;
+            float mx = 0.f, inv = 0.f;
+        };
+        struct alignas(64) Worker {
+            std::thread thread;
+            std::atomic<uint64_t> done{0};
+            float mx = 0.f;
+        };
+        static constexpr uint64_t kStop = UINT64_MAX;
+        static constexpr auto kSpin = std::chrono::microseconds(50);
+
+        void slice(int i) {
+            const int first = job_.nr * i / threads_, last = job_.nr * (i + 1) / threads_;
+            const int at = first * kSumRun, end = last == job_.nr ? job_.n : last * kSumRun;
+            if (!job_.runs) {
+                workers_[i].mx = max_avx2(job_.logits + at, end - at);
+            } else {
+                for (int r = first; r < last; ++r) {
+                    const int off = r * kSumRun;
+                    job_.runs[r] = weight_run_avx2(job_.logits + off, job_.q + off,
+                                                   std::min(kSumRun, end - off), job_.mx, job_.inv);
+                }
+            }
+        }
+
+        void work(int i) {
+            uint64_t seen = 0;
+            for (;;) {
+                uint64_t next = generation_.load(std::memory_order_acquire);
+                if (next == seen) {
+                    const auto until = Clock::now() + kSpin;
+                    do {
+                        _mm_pause();
+                        next = generation_.load(std::memory_order_acquire);
+                    } while (next == seen && Clock::now() < until);
+                    if (next == seen) {
+                        std::unique_lock<std::mutex> lk(mu_);
+                        ++sleeping_;
+                        wake_.wait(lk, [&] { return (next = generation_.load(std::memory_order_acquire)) != seen; });
+                        --sleeping_;
+                    }
+                }
+                if (next == kStop) return;
+                // Inherit the caller's floating-point controls even if they changed since the pool started.
+                _mm_setcsr(mxcsr_);
+                slice(i);
+                workers_[i].done.store(seen = next, std::memory_order_release);
+            }
+        }
+
+        void publish(uint64_t next) {
+            bool notify;
+            {
+                std::lock_guard<std::mutex> lk(mu_);   // no lost wakeup between a worker's predicate and its wait
+                generation_.store(next, std::memory_order_release);
+                notify = sleeping_ != 0;
+            }
+            if (notify) wake_.notify_all();
+        }
+
+        void dispatch(Job job) {
+            job_ = job;
+            mxcsr_ = _mm_getcsr();
+            const uint64_t next = generation_.load(std::memory_order_relaxed) + 1;
+            publish(next);
+            slice(0);
+            const auto until = Clock::now() + kSpin;
+            for (int i = 1; i < threads_; ++i)
+                while (workers_[i].done.load(std::memory_order_acquire) != next) {
+                    if (Clock::now() < until) _mm_pause();
+                    else std::this_thread::yield();   // also let an oversubscribed worker run
+                }
+        }
+
+        void stop() {
+            publish(kStop);
+            for (int i = 1; i < threads_; ++i)
+                if (workers_[i].thread.joinable()) workers_[i].thread.join();
+        }
+
+        const int threads_;
+        Worker workers_[8];
+        Job job_{};
+        unsigned mxcsr_ = 0;
+        alignas(64) std::atomic<uint64_t> generation_{0};
+        std::mutex mu_;
+        std::condition_variable wake_;
+        int sleeping_ = 0;
+    };
+    std::unique_ptr<SamplePool> sample_pool_;
+
+    SamplePool* sample_pool(int nr) {
+        const int threads = mt_sample_threads();
+        if (threads == 0 || nr < threads) return nullptr;
+        if (!sample_pool_) sample_pool_ = std::make_unique<SamplePool>(threads);
+        return sample_pool_.get();
+    }
+#else
+    class SamplePool;
 #endif
 
     // A token with probability softmax(logits / temperature): runs of kSumRun weights and their sums, the draw's run
     // by the runs' sums, its token by the sums in id order inside it.
     template <bool UseAvx2 = false>
-    int draw_all(const float* logits, int n_vocab, const Sampling& s, std::mt19937_64& rng) {
+    int draw_all(const float* logits, int n_vocab, const Sampling& s, std::mt19937_64& rng,
+                 [[maybe_unused]] SamplePool* pool = nullptr) {
         float mx = -INFINITY;
 #if defined(STRATA_POLY_HAVE_AVX2_SAMPLE)
-        if constexpr (UseAvx2) mx = max_avx2(logits, n_vocab);
+        const int nr = n_runs(n_vocab);
+        if constexpr (UseAvx2) mx = pool ? pool->max(logits, n_vocab, nr) : max_avx2(logits, n_vocab);
         else
 #endif
             for (int i = 0; i < n_vocab; ++i) mx = std::max(mx, logits[i]);
@@ -262,28 +410,38 @@ private:
         // nothing to draw from (every token taken out), or a temperature so small its scale overflows: the most likely
         if (!std::isfinite(mx) || !std::isfinite(inv)) return strata::poly::most_likely(logits, n_vocab);
         q_.resize((size_t) n_vocab);
-        runs_.clear();
         float* q = q_.data();
         double sum = 0.0;
-        for (int at = 0; at < n_vocab; at += kSumRun) {
-            const int end = std::min(n_vocab, at + kSumRun);
-            double run;
 #if defined(STRATA_POLY_HAVE_AVX2_SAMPLE)
-            if constexpr (UseAvx2) run = weight_run_avx2(logits + at, q + at, end - at, mx, inv);
-            else
+        if (pool) {
+            runs_.resize(nr);
+            pool->weights(logits, q, runs_.data(), n_vocab, nr, mx, inv);
+            // Keep the same order as the single-threaded path, regardless of worker completion order.
+            for (double run : runs_) sum += run;
+        } else
 #endif
-            {
-                for (int i = at; i < end; ++i) q[i] = exp_below_0((logits[i] - mx) * inv);
-                // in doubles, as the scan below adds them: a run's sum is the mass the scan finds in it.  Four sums
-                // the loop can keep apart: one would wait on each add.
-                double lane[4] = {};
-                int i = at;
-                for (; i + 4 <= end; i += 4)
-                    for (int j = 0; j < 4; ++j) lane[j] += q[i + j];
-                run = finish_run(q, i, end, lane);
+        {
+            runs_.clear();
+            for (int at = 0; at < n_vocab; at += kSumRun) {
+                const int end = std::min(n_vocab, at + kSumRun);
+                double run;
+#if defined(STRATA_POLY_HAVE_AVX2_SAMPLE)
+                if constexpr (UseAvx2) run = weight_run_avx2(logits + at, q + at, end - at, mx, inv);
+                else
+#endif
+                {
+                    for (int i = at; i < end; ++i) q[i] = exp_below_0((logits[i] - mx) * inv);
+                    // in doubles, as the scan below adds them: a run's sum is the mass the scan finds in it.  Four sums
+                    // the loop can keep apart: one would wait on each add.
+                    double lane[4] = {};
+                    int i = at;
+                    for (; i + 4 <= end; i += 4)
+                        for (int j = 0; j < 4; ++j) lane[j] += q[i + j];
+                    run = finish_run(q, i, end, lane);
+                }
+                runs_.push_back(run);
+                sum += run;
             }
-            runs_.push_back(run);
-            sum += run;
         }
         double u = std::uniform_real_distribution<double>(0.0, 1.0)(rng) * sum;
         size_t r = 0;
