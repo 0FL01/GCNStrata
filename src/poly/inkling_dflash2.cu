@@ -41,6 +41,15 @@ __global__ void store_kernel(const float* k, const float* v, __half* kc, __half*
     for (int i = threadIdx.x; i < kKey; i += 256) dst[i] = __float2half(src[(size_t) r * kKey + i]);
 }
 
+// Provisional slots use the same half conversion as store(), but start at slot zero and have a separate lifetime.
+__global__ void commit_prov_kv_kernel(const __half* k, const __half* v, __half* kc, __half* vc, int64_t pos) {
+    const int r = blockIdx.x, l = blockIdx.z;
+    const size_t slot = (size_t) ((pos + r) & (kWindow - 1));
+    const __half* src = (blockIdx.y ? v : k) + ((size_t) l * kBlock + r) * kKey;
+    __half* dst = (blockIdx.y ? vc : kc) + ((size_t) l * kWindow + slot) * kKey;
+    for (int i = threadIdx.x; i < kKey; i += 256) dst[i] = src[i];
+}
+
 // Attention: a CTA takes one K/V group's 32 queries (8 rows x 4 heads) over kChunk keys; partial max, sum and output
 // a query; a second launch adds the chunks.  Keys: ring positions lo0 .. pos - 1 (n_ring), then the block's 8.
 constexpr int kQ = kBlock * (kHeads / kKv);   // 32
@@ -836,6 +845,11 @@ void conv(const float* x, const float* dyn, const float* base, int stage, float*
 void store(const float* k, const float* v, __half* kc, __half* vc, int64_t pos, int n, cudaStream_t st) {
     if (n <= 0) return;
     store_kernel<<<dim3(n, 2), 256, 0, st>>>(k, v, kc, vc, pos);
+}
+
+void commit_prov_kv(const __half* k, const __half* v, __half* kc, __half* vc, int64_t pos, int n, int layers,
+                    cudaStream_t st) {
+    commit_prov_kv_kernel<<<dim3(n, 2, layers), 256, 0, st>>>(k, v, kc, vc, pos);
 }
 
 size_t attend_floats() { return (size_t) kKv * kMaxChunks * kQ * (kHead + 2); }

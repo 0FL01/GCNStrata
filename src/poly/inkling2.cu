@@ -6,6 +6,7 @@
 #include "inkling_dspark.hpp"
 #include "inkling_dflash2.hpp"
 #include "inkling_swa_layout.hpp"
+#include "mmq.hpp"
 #include "runtime.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/kernels/iq_kernels.hpp"
@@ -1195,7 +1196,99 @@ void Inkling2::load_geometry() {
     }
 }
 
-Inkling2::~Inkling2() { stop_peer_thread(); }
+namespace {
+// All draft launches switch devices on the calling thread. The target stream and its workspace never move.
+struct DfOnDevice {
+    int previous = 0;
+    explicit DfOnDevice(int device) {
+        ck(cudaGetDevice(&previous), "DFlash2 current device");
+        if (device != previous) ck(cudaSetDevice(device), "DFlash2 select device");
+    }
+    ~DfOnDevice() { (void) cudaSetDevice(previous); }
+};
+
+// upload() uses the Engine's two-pass dense arena and stream. Point it at a separate arena during startup only.
+struct DfWeightArena {
+    uint8_t* data = nullptr;
+    size_t bytes = 0, at = 0, bf16_max = 0;
+};
+}  // namespace
+
+struct Inkling2::DfGpu23 {
+    cudaStream_t s2 = nullptr, s3 = nullptr, tx0 = nullptr;
+    struct TapsEvents {
+        cudaEvent_t ready0 = nullptr, pushed = nullptr, read2 = nullptr, done2 = nullptr;
+        bool used = false;
+    };
+    // A 2048-row tail uses up to eight 256-row pushes per call. Do not re-record a HIP event while it is pending.
+    std::array<TapsEvents, 16> taps;
+    size_t next_taps = 0;
+    std::array<const TapsEvents*, 2> last_taps{};  // each staging pair has its own lifetime (kept, provisional)
+    cudaEvent_t h2_ready = nullptr, h3_done = nullptr;
+    DfWeightArena weights;
+    LinWorkspace lin{};
+    std::unique_ptr<Mmq> mmq;
+    // On their allocating devices, independent of the target Engine's allocation list.
+    std::array<std::vector<void*>, 4> memory;
+    float *tap_stage0 = nullptr, *prov_taps0 = nullptr, *prov_taps2 = nullptr;
+    __half *prov_k2 = nullptr, *prov_v2 = nullptr;
+    bool async_ctx = false, prov_valid = false;
+    int64_t prov_pos = -1;
+    int prov_n = 0;
+
+    void* alloc(size_t bytes, const char* what) {
+        int device = 0;
+        ck(cudaGetDevice(&device), "DFlash2 allocation device");
+        auto& owned = memory.at((size_t) device);
+        owned.push_back(nullptr);
+        ck(cudaMalloc(&owned.back(), std::max<size_t>(bytes, 256)), what);
+        return owned.back();
+    }
+
+    ~DfGpu23() {
+        int previous = 0;
+        if (cudaGetDevice(&previous) != cudaSuccess) return;
+        // Drain the entire dependency chain before releasing any peer-visible storage or pinned results.
+        for (auto [device, stream] : {std::pair{0, tx0}, std::pair{2, s2}, std::pair{3, s3}})
+            if (stream && cudaSetDevice(device) == cudaSuccess) (void) cudaStreamSynchronize(stream);
+        for (int device : {0, 2, 3}) {
+            if (cudaSetDevice(device) != cudaSuccess) continue;
+            if (device == 0) {
+                for (const auto& t : taps)
+                    for (auto ev : {t.ready0, t.pushed}) if (ev) (void) cudaEventDestroy(ev);
+                if (tx0) (void) cudaStreamDestroy(tx0);
+            } else if (device == 2) {
+                for (const auto& t : taps)
+                    for (auto ev : {t.read2, t.done2}) if (ev) (void) cudaEventDestroy(ev);
+                if (h2_ready) (void) cudaEventDestroy(h2_ready);
+                mmq.reset();
+                blas_destroy(lin.blas);
+                if (s2) (void) cudaStreamDestroy(s2);
+            } else {
+                if (h3_done) (void) cudaEventDestroy(h3_done);
+                if (s3) (void) cudaStreamDestroy(s3);
+            }
+            for (void* ptr : memory[(size_t) device]) if (ptr) (void) cudaFree(ptr);
+        }
+        (void) cudaSetDevice(previous);
+    }
+};
+
+Inkling2::Inkling2() = default;
+
+cudaStream_t Inkling2::df_stream() const { return df_gpu23_ ? df_gpu23_->s2 : cs(st_); }
+
+Inkling2::~Inkling2() {
+    stop_peer_thread();
+    if (df_gpu23_) {
+        int previous = 0;
+        if (cudaGetDevice(&previous) == cudaSuccess && cudaSetDevice(device_) == cudaSuccess) {
+            if (st_) (void) cudaStreamSynchronize(cs(st_));
+            df_gpu23_.reset();
+            (void) cudaSetDevice(previous);
+        }
+    }
+}
 
 std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
     struct DevGuard {
@@ -1254,9 +1347,15 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
         const int lo1 = r1->tp2_vocab_lo_;
         r1->df_head_q4_ = r0->df_head_q4_;
         r1->df_head_fuse_ = r0->df_head_fuse_;
-        r1->df_head_load(lo1, kDfVocab - lo1);
+        if (r0->df_gpu23_) {
+            { DfOnDevice on3(3); r1->df_head_load(lo1, kDfVocab - lo1, r0.get()); }
+            { DfOnDevice on2(2); r0->df_head_load(0, lo1, r0.get()); }
+        } else {
+            r1->df_head_load(lo1, kDfVocab - lo1);
+            ck(cudaSetDevice(0), "tp2 setDevice 0");
+            r0->df_head_load(0, lo1);
+        }
         ck(cudaSetDevice(0), "tp2 setDevice 0");
-        r0->df_head_load(0, lo1);
         std::fprintf(stderr, "strata-poly: DFlash2 private head rows [0, %d) and [%d, %d) as %s%s\n",
                      lo1, lo1, kDfVocab, r0->df_head_q4_ ? "Q4_0" : "int8", r0->df_head_fuse_ ? " with fused top-16" : "");
         ck(cudaSetDevice(1), "tp2 setDevice 1");
@@ -1398,7 +1497,7 @@ void Inkling2::start_peer_thread() {
                     tp2_->gather_from_1(1, nullptr, peer_->tp2_logits_half_, n * peer_->tp2_vocab_n_, peer_->st_);
                 } else if (cmd == PeerCmd::kDraftHead) {
                     tp2_->broadcast_from_0(1, peer_->df_hx_, n * kWidth, peer_->st_);
-                    peer_->df_head_run(peer_->df_hx_);
+                    peer_->df_head_run(peer_->df_hx_, cs(peer_->st_));
                     dflash2::pack_top(peer_->df_hids_, peer_->df_hvals_, n, peer_->df_head_lo_, peer_->df_hpack_,
                                       cs(peer_->st_));
                     tp2_->gather_from_1(1, nullptr, peer_->df_hpack_, n * 2 * dflash2::kTop, peer_->st_);
@@ -1468,6 +1567,7 @@ void Inkling2::peer_wait() {
 }
 
 void Inkling2::on_loaded() {
+    if (df_gpu23_) df_gpu23_scratch();
 #if defined(STRATA_HIP_GFX906)
     if (tp_size_ != 2) {
         const char* helpers = std::getenv("STRATA_INKLING_KV_HELPERS");
@@ -1625,6 +1725,7 @@ void Inkling2::request_budget(int64_t prompt_rows, int64_t max_new) {
 #endif
 
 void Inkling2::on_reset() {
+    if (df_gpu23_) df_gpu23_->prov_valid = false;
     df_lo_ = df_hi_ = df_skip_ = 0;
 #if defined(STRATA_HIP_GFX906)
     if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, 0);
@@ -2036,9 +2137,11 @@ void Inkling2::alloc_caches() {
     }
     if (!draft_) return;
     if (df2_) {   // DFlash2: five half rings of 2048 positions, K and V
-        const size_t ring = (size_t) kDfLayers * dflash2::kWindow * dflash2::kKey * sizeof(__half);
-        df_kc_ = (__half*) seq_alloc(ring, "DFlash2 K rings");
-        df_vc_ = (__half*) seq_alloc(ring, "DFlash2 V rings");
+        if (!df_gpu23_) {
+            const size_t ring = (size_t) kDfLayers * dflash2::kWindow * dflash2::kKey * sizeof(__half);
+            df_kc_ = (__half*) seq_alloc(ring, "DFlash2 K rings");
+            df_vc_ = (__half*) seq_alloc(ring, "DFlash2 V rings");
+        }
         df_lo_ = df_hi_ = 0;
         return;
     }
@@ -2278,6 +2381,7 @@ void Inkling2::load_extra(const uint8_t* src, int64_t pos) {
         ring_state(i, pos, src, nullptr);
         src += one;
     }
+    if (df_gpu23_) df_gpu23_->prov_valid = false;
     df_lo_ = df_hi_ = pos;   // DFlash2: no context for a restored state
     if (ds_on())
         for (int l = 0; l < kDsLayers; ++l)
@@ -2344,41 +2448,9 @@ void Inkling2::assign_scratch() {
     if (!draft_) return;
     ds_taps_ = fbuf(3 * width);
     if (df2_) {
-        namespace d2 = dflash2;
-        const size_t b = d2::kBlock, c = kDfSub;
-        df_t_ = fbuf(2 * kWidth);
-        df_x_ = fbuf(b * kWidth);
-        df_h_ = fbuf(b * kWidth);
-        df_hp_ = fbuf(b * kWidth);
-        df_dyn_ = fbuf(b * d2::kDyn);
-        df_q_ = fbuf(b * d2::kQuery);
-        df_qr_ = fbuf(b * d2::kQuery);
-        df_k_ = fbuf(b * d2::kKey);
-        df_kr_ = fbuf(b * d2::kKey);
-        df_v_ = fbuf(b * d2::kKey);
-        df_ao_ = fbuf(b * d2::kQuery);
-        df_o_ = fbuf(b * kWidth);
-        df_g_ = fbuf(b * kDfFfn);
-        df_u_ = fbuf(b * kDfFfn);
-        df_m_ = fbuf(b * kDfFfn);
-        df_fin_ = fbuf(b * kWidth);
-        if (!df_head_fuse_) df_logits_ = fbuf((b - 1) * (size_t) n_vocab_);
-        df_selh_ = fbuf((b - 1) * d2::kRank);
-        df_vals_ = fbuf((b - 1) * d2::kTop);
-        df_ids_ = (int32_t*) fbuf((b - 1) * d2::kTop);
-        df_edges_ = fbuf((b - 1) * d2::kTop * d2::kTop);
-        df_att_ = fbuf(d2::attend_floats());
-        if (!df_head_fuse_) df_top_ = fbuf(d2::topk_floats((int) b - 1));
-        df_ctx_ = fbuf(c * 4 * kWidth);
-        df_c_ = fbuf(c * kWidth);
-        df_cn_ = fbuf(c * kWidth);
-        df_ck_ = fbuf(c * d2::kKey);
-        df_ckr_ = fbuf(c * d2::kKey);
-        df_cv_ = fbuf(c * d2::kKey);
-        df_xq_ = (int8_t*) fbuf(b * 4 * kWidth / 4);
-        df_xd_ = fbuf(b * 4 * kWidth / 32);
+        if (!df_gpu23_) df_scratch();
         if (!ds_host_) ds_host_ = (float*) hmalloc(2 * kWidth * sizeof(float), "pinned memory");
-        if (!h_block_) h_block_ = (Likeliest*) hmalloc(d2::kBlock * sizeof(Likeliest), "pinned memory");
+        if (!h_block_) h_block_ = (Likeliest*) hmalloc(dflash2::kBlock * sizeof(Likeliest), "pinned memory");
         return;
     }
     const size_t b = kDsBlock;
@@ -2697,6 +2769,8 @@ bool Inkling2::heads(const Block& b, int il, bool swa, bool loop, int n, const D
 }
 
 void Inkling2::run_visits(int n) {
+    // Includes a keep() that needs to replay a prefix: its taps supersede the provisional window.
+    if (df_gpu23_) df_gpu23_->prov_valid = false;
 #if defined(STRATA_HIP_GFX906)
     if (gpu_route_failed_) throw std::runtime_error("Inkling GPU route failed; reopen the TP2 engine");
     if (gpu_route_dev_ && (!all_cached() || !peer_->all_cached()))
@@ -3428,7 +3502,180 @@ void Inkling2::df_shape(const Shards& g) {
     df2_ = true;
 }
 
-void Inkling2::df_load() {
+void Inkling2::df_gpu23_init() {
+    const auto on = [](const char* k) { const char* v = std::getenv(k); return v && v[0] == '1' && !v[1]; };
+    const bool async_ctx = on("STRATA_DFLASH2_ASYNC_CTX");
+    if (!on("STRATA_DFLASH2_GPU23")) {
+        if (async_ctx) std::fputs("strata-poly: DFlash2 ASYNC_CTX requires GPU23; using ordinary context\n", stderr);
+        return;
+    }
+#if defined(STRATA_HIP_GFX906)
+    try {
+        if (tp_size_ != 2 || tp_rank_ != 0 || device_ != 0 || opt_.batch != 0)
+            throw std::runtime_error("requires one sequence on TP2 owners 0/1");
+        // Do not silently requantize the full target head: that would change the draft proposals.
+        if (!on("STRATA_DFLASH2_HEAD8") && !on("STRATA_DFLASH2_HEAD_Q4") && !on("STRATA_DFLASH2_HEAD_FUSE"))
+            throw std::runtime_error("requires the existing HEAD8, HEAD_Q4 or HEAD_FUSE option");
+        int count = 0;
+        ck(hipGetDeviceCount(&count), "DFlash2 visible devices");
+        if (count != 4) throw std::runtime_error("requires four visible gfx906 GPUs");
+        for (int device = 0; device < 4; ++device) {
+            hipDeviceProp_t props{};
+            ck(hipGetDeviceProperties(&props, device), "DFlash2 GPU properties");
+            if (props.warpSize != 64 || !kernels::gfx_arch_is(props.gcnArchName, "gfx906"))
+                throw std::runtime_error("requires gfx906 wave64 on all four devices");
+        }
+        for (auto [from, to] : {std::pair{0, 2}, std::pair{2, 0}, std::pair{2, 3}, std::pair{3, 2}}) {
+            DfOnDevice here(from);
+            int peer = 0;
+            ck(hipDeviceCanAccessPeer(&peer, from, to), "DFlash2 query peer access");
+            if (!peer) throw std::runtime_error("missing P2P link " + std::to_string(from) + " -> " + std::to_string(to));
+            const auto rc = hipDeviceEnablePeerAccess(to, 0);
+            // Mappings may already belong to KV helpers or another engine; never disable them here.
+            if (rc == hipErrorPeerAccessAlreadyEnabled) (void) hipGetLastError();
+            else ck(rc, "DFlash2 enable peer access");
+        }
+        auto gpu = std::make_unique<DfGpu23>();
+        const auto stream = [](cudaStream_t* s) { ck(hipStreamCreateWithFlags(s, hipStreamNonBlocking), "DFlash2 stream"); };
+        const auto event = [](cudaEvent_t* e) { ck(hipEventCreateWithFlags(e, hipEventDisableTiming), "DFlash2 event"); };
+        stream(&gpu->tx0);
+        for (auto& t : gpu->taps) {
+            event(&t.ready0);
+            event(&t.pushed);
+        }
+        {
+            DfOnDevice on2(2);
+            stream(&gpu->s2);
+            for (auto& t : gpu->taps) {
+                event(&t.read2);
+                event(&t.done2);
+            }
+            event(&gpu->h2_ready);
+        }
+        {
+            DfOnDevice on3(3);
+            stream(&gpu->s3);
+            event(&gpu->h3_done);
+        }
+        gpu->async_ctx = async_ctx;
+        df_gpu23_ = std::move(gpu);
+        std::fputs("strata-poly: DFlash2 GPU23: backbone/context on GPU2, private head on GPU2/3\n", stderr);
+    } catch (const std::runtime_error& e) {
+        std::fprintf(stderr, "strata-poly: DFlash2 GPU23 unavailable: %s; using ordinary DFlash2\n", e.what());
+    }
+#else
+    std::fputs("strata-poly: DFlash2 GPU23 unavailable without gfx906; using ordinary DFlash2\n", stderr);
+#endif
+}
+
+void Inkling2::df_gpu23_scratch() {
+    namespace d2 = dflash2;
+    auto& gpu = *df_gpu23_;
+    const int rows = std::min(rows_, kDfSub);
+    gpu.tap_stage0 = (float*) gpu.alloc((size_t) rows * 4 * kWidth * sizeof(float), "DFlash2 tap staging");
+    DfOnDevice on2(2);
+    df_scratch();
+    const size_t ring = (size_t) kDfLayers * d2::kWindow * d2::kKey * sizeof(__half);
+    df_kc_ = (__half*) gpu.alloc(ring, "DFlash2 K rings");
+    df_vc_ = (__half*) gpu.alloc(ring, "DFlash2 V rings");
+    gpu.lin.stream = gpu.s2;
+    gpu.lin.q8 = gpu.alloc(std::max(rows, d2::kBlock) * kernels::native_q8_1_bytes(4 * kWidth), "DFlash2 Q8_1 rows");
+    if (rows >= kStageRows) {
+        // Keep the same prefill lin() dispatch as V6-R1; all its working memory is local to GPU2.
+        const auto floats = [](const Dev& w) { return w.type == kTypeF32 || w.type == kTypeBF16; };
+        bool blas = floats(df_fc_), mmq = false;
+        const auto test_mmq = [&](const Dev& w) {
+            return !floats(w) && mmq_ && Mmq::fits((int) w.type, w.n_out, w.n_in);
+        };
+        mmq |= test_mmq(df_fc_);
+        size_t count = df_fc_.type == kTypeBF16 ? (size_t) df_fc_.n_in * df_fc_.n_out : 0;
+        for (const auto& layer : df_) for (const Dev& w : {layer.k, layer.v}) {
+            blas |= floats(w);
+            mmq |= test_mmq(w);
+            if (w.type == kTypeBF16) count = std::max(count, (size_t) w.n_in * w.n_out);
+        }
+        if (blas) gpu.lin.blas = blas_create(gpu.s2);
+        if (count) {
+            gpu.lin.bf16_max = count;
+            gpu.lin.wf = (float*) gpu.alloc(count * sizeof(float), "DFlash2 BF16 conversion scratch");
+        }
+        if (mmq) {
+            gpu.mmq = std::make_unique<Mmq>();
+            gpu.lin.mmq = gpu.mmq.get();
+            gpu.lin.mqx = gpu.alloc(Mmq::q8_bytes(rows, 4 * kWidth), "DFlash2 MMQ scratch");
+            gpu.lin.hf = (float*) gpu.alloc(rows * sizeof(float), "DFlash2 MMQ row scales");
+        }
+    }
+    // These are the width-invariant short paths: FC/K/V bypass GEMM/MMQ, have at most 2304 outputs, and
+    // use rowwise F32/BF16, native Q4_0/Q8_0 or V6-R1's planar K|V. Unknown formats still use df_kept().
+    const auto prefix_exact = [](const Dev& w) {
+        return w.type == kTypeF32 || w.type == kTypeBF16 || w.type == GGML_TYPE_Q4_0 || w.type == GGML_TYPE_Q8_0;
+    };
+    if (gpu.async_ctx) {
+        const char* waves = std::getenv("STRATA_MMVQ_WAVE");
+        gpu.async_ctx = !(waves && !std::strcmp(waves, "0")) && prefix_exact(df_fc_);
+        for (const auto& layer : df_) gpu.async_ctx &= prefix_exact(layer.k) && prefix_exact(layer.v);
+        if (!gpu.async_ctx) {
+            std::fputs("strata-poly: DFlash2 ASYNC_CTX needs width-invariant FC/K/V; using kept-only context\n", stderr);
+            return;
+        }
+        {
+            DfOnDevice on0(0);
+            gpu.prov_taps0 = (float*) gpu.alloc(d2::kBlock * 4 * kWidth * sizeof(float), "DFlash2 provisional source taps");
+        }
+        gpu.prov_taps2 = (float*) gpu.alloc(d2::kBlock * 4 * kWidth * sizeof(float), "DFlash2 provisional destination taps");
+        const size_t bytes = (size_t) kDfLayers * d2::kBlock * d2::kKey * sizeof(__half);
+        gpu.prov_k2 = (__half*) gpu.alloc(bytes, "DFlash2 provisional K");
+        gpu.prov_v2 = (__half*) gpu.alloc(bytes, "DFlash2 provisional V");
+        std::fputs("strata-poly: DFlash2 ASYNC_CTX: prepare decode K/V behind the target head\n", stderr);
+    }
+}
+
+void Inkling2::df_linear(const Dev& w, const float* x, float* y, int n) {
+    if (df_gpu23_) lin_on(df_gpu23_->lin, w, x, y, n);
+    else lin(w, x, y, n);
+}
+
+void Inkling2::df_scratch() {
+    namespace d2 = dflash2;
+    const auto f = [&](size_t n) {
+        return df_gpu23_ ? (float*) df_gpu23_->alloc(n * sizeof(float), "DFlash2 scratch") : fbuf(n);
+    };
+    const size_t b = d2::kBlock, c = kDfSub;
+    df_t_ = f(2 * kWidth);
+    df_x_ = f(b * kWidth);
+    df_h_ = f(b * kWidth);
+    df_hp_ = f(b * kWidth);
+    df_dyn_ = f(b * d2::kDyn);
+    df_q_ = f(b * d2::kQuery);
+    df_qr_ = f(b * d2::kQuery);
+    df_k_ = f(b * d2::kKey);
+    df_kr_ = f(b * d2::kKey);
+    df_v_ = f(b * d2::kKey);
+    df_ao_ = f(b * d2::kQuery);
+    df_o_ = f(b * kWidth);
+    df_g_ = f(b * kDfFfn);
+    df_u_ = f(b * kDfFfn);
+    df_m_ = f(b * kDfFfn);
+    df_fin_ = f(b * kWidth);
+    if (!df_head_fuse_ && !df_gpu23_) df_logits_ = f((b - 1) * (size_t) n_vocab_);
+    df_selh_ = f((b - 1) * d2::kRank);
+    df_vals_ = f((b - 1) * d2::kTop);
+    df_ids_ = (int32_t*) f((b - 1) * d2::kTop);
+    df_edges_ = f((b - 1) * d2::kTop * d2::kTop);
+    df_att_ = f(d2::attend_floats());
+    if (!df_head_fuse_ && !df_gpu23_) df_top_ = f(d2::topk_floats((int) b - 1));
+    df_ctx_ = f(c * 4 * kWidth);
+    df_c_ = f(c * kWidth);
+    df_cn_ = f(c * kWidth);
+    df_ck_ = f(c * d2::kKey);
+    df_ckr_ = f(c * d2::kKey);
+    df_cv_ = f(c * d2::kKey);
+    df_xq_ = (int8_t*) f(b * 4 * kWidth / 4);
+    df_xd_ = f(b * 4 * kWidth / 32);
+}
+
+void Inkling2::df_load_weights() {
     namespace d2 = dflash2;
     const Shards& g = *dg_;
     const auto up = [&](const std::string& name, int64_t n_in, int64_t n_out, Want want) {
@@ -3460,13 +3707,58 @@ void Inkling2::df_load() {
     df_hnorm_ = upload(enc, enc->name, kWidth, 1, kF32);
     df_onorm_ = up("output_norm.weight", kWidth, 1, kF32);
     df_selw_ = up("selector_hidden.weight", kWidth, d2::kRank, kAnyMat);
-    // Engine::load() runs this twice: the first pass only sizes the dense arena (dense_ not yet allocated).  The
-    // drafter's own buffers below are allocated once, in the second.
-    if (!dense_) return;
+    if (df_gpu23_) {
+        const char* name = "token_embd_norm.weight";
+        df_token_norm_ = upload(gg_->find(name), name, kWidth, 1, kF32);
+    }
+}
+
+void Inkling2::df_load() {
+    namespace d2 = dflash2;
+    const auto on = [](const char* k) { const char* v = std::getenv(k); return v && v[0] == '1' && !v[1]; };
+    const bool fill = dense_ != nullptr;
+    if (!fill) df_gpu23_init();
+    // The stock path keeps using the Engine arena. GPU23 sizes and fills a separate GPU2 arena with the same uploader.
+    if (auto* gpu = df_gpu23_.get()) {
+        DfOnDevice on2(2);
+        DfWeightArena& w = gpu->weights;
+        const auto swap = [&] {
+            std::swap(w.data, dense_);
+            std::swap(w.bytes, dense_bytes_);
+            std::swap(w.at, dense_at_);
+            std::swap(w.bf16_max, bf16_max_);
+        };
+        swap();
+        void* model_stream = std::exchange(st_, gpu->s2);
+        try {
+            dense_at_ = 0;
+            df_load_weights();
+            if (!fill) {
+                dense_bytes_ = dense_at_;
+                dense_ = (uint8_t*) gpu->alloc(dense_bytes_ + 256, "DFlash2 dense weights");
+                zero_vram(dense_, dense_bytes_ + 256);
+            }
+        } catch (...) {
+            swap();
+            st_ = model_stream;
+            throw;
+        }
+        swap();
+        st_ = model_stream;
+    } else {
+        df_load_weights();
+    }
+    if (!fill) return;
+    // Continue packing on the same device and stream as the raw uploads.
+    const DfOnDevice draft_device(df_gpu23_ ? 2 : device_);
+    const auto alloc = [&](size_t bytes, const char* what) {
+        return df_gpu23_ ? df_gpu23_->alloc(bytes, what) : dmalloc(bytes, what);
+    };
+    const Shards& g = *dg_;
     const auto book = [&](const char* name) {
         const TensorInfo& t = *g.find(name);   // validated by df_shape()
         const size_t bytes = g.payload(t);
-        void* d = dmalloc(bytes, "DFlash2 selector codebook");
+        void* d = alloc(bytes, "DFlash2 selector codebook");
         ck(cudaMemcpy(d, g.data(t), bytes, cudaMemcpyHostToDevice), "DFlash2 selector codebook");
         const auto kind = t.type == GGML_TYPE_F16 ? d2::BookKind::kF16 :
                           t.type == GGML_TYPE_Q8_0 ? d2::BookKind::kQ8 : d2::BookKind::kQ4;
@@ -3474,7 +3766,6 @@ void Inkling2::df_load() {
     };
     df_pred_ = book("selector_predecessor.weight");
     df_succ_ = book("selector_successor.weight");
-    const auto on = [](const char* k) { const char* v = std::getenv(k); return v && v[0] == '1' && !v[1]; };
     const bool mixed = on("STRATA_DFLASH2_MIXED");
     df_planar_ = mixed || on("STRATA_DFLASH2_GEMV8");
     df_kept_opt_ = on("STRATA_DFLASH2_KEPT_OPT");
@@ -3497,10 +3788,12 @@ void Inkling2::df_load() {
             df_sel_ = df_pack_rows({df_selw_});
             need_xsum |= df_sel_.q4();
         }
-        ck(cudaStreamSynchronize(cs(st_)), "DFlash2 planar pack");
+        ck(cudaStreamSynchronize(df_stream()), "DFlash2 planar pack");
     }
     if (need_xsum)
-        df_xsum_ = (int32_t*) dmalloc(d2::kBlock * 4 * kWidth / 32 * sizeof(int32_t), "DFlash2 activation sums");
+        df_xsum_ = (int32_t*) alloc(d2::kBlock * 4 * kWidth / 32 * sizeof(int32_t), "DFlash2 activation sums");
+    if (df_gpu23_ && !df_planar_ && !df_kept_opt_)
+        ck(cudaStreamSynchronize(df_stream()), "DFlash2 dense upload");
     df_head_q4_ = tp_size_ == 2 && on("STRATA_DFLASH2_HEAD_Q4");
     df_head_fuse_ = tp_size_ == 2 && on("STRATA_DFLASH2_HEAD_FUSE");
     df_private_head_ = tp_size_ == 2 && (on("STRATA_DFLASH2_HEAD8") || df_head_q4_ || df_head_fuse_);
@@ -3520,30 +3813,33 @@ dflash2::Mat Inkling2::df_pack_rows(std::initializer_list<Dev> weights) {
     const int n_in = first.n_in;
     const size_t blocks = (size_t) n_out * (n_in / 32);
     d2::Mat mat{nullptr, nullptr, n_in, n_out, q4 ? d2::MatKind::kQ4 : d2::MatKind::kQ8, !q4 || df_q4_f32_};
-    auto* q = (uint8_t*) dmalloc(blocks * mat.code_bytes(), "DFlash2 planar codes");
-    auto* d = (uint8_t*) dmalloc(blocks * mat.scale_bytes(), "DFlash2 planar scales");
+    const auto alloc = [&](size_t bytes, const char* what) {
+        return df_gpu23_ ? df_gpu23_->alloc(bytes, what) : dmalloc(bytes, what);
+    };
+    auto* q = (uint8_t*) alloc(blocks * mat.code_bytes(), "DFlash2 planar codes");
+    auto* d = (uint8_t*) alloc(blocks * mat.scale_bytes(), "DFlash2 planar scales");
     mat.q = q;
     mat.d = d;
     size_t at = 0;
     for (const Dev& w : weights) {
         if (q4)
             d2::pack_q4_0(w.p, n_in, w.n_out, q + at * mat.code_bytes(), d + at * mat.scale_bytes(),
-                           mat.scale_f32, cs(st_));
+                           mat.scale_f32, df_stream());
         else
-            d2::pack_q8_0(w.p, n_in, w.n_out, q + at * mat.code_bytes(), reinterpret_cast<float*>(d) + at, cs(st_));
+            d2::pack_q8_0(w.p, n_in, w.n_out, q + at * mat.code_bytes(), reinterpret_cast<float*>(d) + at, df_stream());
         at += (size_t) w.n_out * (n_in / 32);
     }
     return mat;
 }
 
 void Inkling2::df_lin(const Dev& w, const dflash2::Mat& packed, const float* x, float* y, int rows) {
-    if (!packed || rows > dflash2::kBlock) return lin(w, x, y, rows);
-    dflash2::quantize(x, packed.n_in, rows, df_xq_, df_xd_, packed.q4() ? df_xsum_ : nullptr, cs(st_));
-    dflash2::gemv(packed, df_xq_, df_xd_, df_xsum_, y, rows, cs(st_));
+    if (!packed || rows > dflash2::kBlock) return df_linear(w, x, y, rows);
+    dflash2::quantize(x, packed.n_in, rows, df_xq_, df_xd_, packed.q4() ? df_xsum_ : nullptr, df_stream());
+    dflash2::gemv(packed, df_xq_, df_xd_, df_xsum_, y, rows, df_stream());
 }
 
 // Requantize this rank's target head rows on the host, one row at a time. These weights affect guesses only.
-void Inkling2::df_head_load(int lo, int n) {
+void Inkling2::df_head_load(int lo, int n, Inkling2* gpu23_owner) {
     namespace d2 = dflash2;
     const TensorInfo* t = gg_->find("output.weight");
     if (!t) throw std::runtime_error("DFlash2 private head: the target has no output.weight");
@@ -3587,16 +3883,19 @@ void Inkling2::df_head_load(int lo, int n) {
             }
         });
     for (auto& th : pool) th.join();
-    auto* dq = (uint8_t*) dmalloc(q.size(), "DFlash2 private head codes");
-    void* dd = dmalloc(d.size(), "DFlash2 private head scales");
+    const auto alloc = [&](size_t bytes, const char* what) {
+        return gpu23_owner ? gpu23_owner->df_gpu23_->alloc(bytes, what) : dmalloc(bytes, what);
+    };
+    auto* dq = (uint8_t*) alloc(q.size(), "DFlash2 private head codes");
+    void* dd = alloc(d.size(), "DFlash2 private head scales");
     ck(cudaMemcpy(dq, q.data(), q.size(), cudaMemcpyHostToDevice), "DFlash2 private head codes");
     ck(cudaMemcpy(dd, d.data(), d.size(), cudaMemcpyHostToDevice), "DFlash2 private head scales");
     mat.q = dq;
     mat.d = dd;
     df_head_ = mat;
     df_head_lo_ = lo;
-    const auto f = [&](size_t count, const char* what) { return (float*) dmalloc(count * sizeof(float), what); };
-    if (df_head_fuse_) df_head_parts_ = dmalloc(d2::head_top_bytes(n), "DFlash2 fused head top");
+    const auto f = [&](size_t count, const char* what) { return (float*) alloc(count * sizeof(float), what); };
+    if (df_head_fuse_) df_head_parts_ = alloc(d2::head_top_bytes(n), "DFlash2 fused head top");
     else {
         df_hlog_ = f((size_t) d2::kGuess * n, "DFlash2 head logits");
         df_htop_ = f(d2::topk_floats(d2::kGuess), "DFlash2 head top");
@@ -3610,73 +3909,188 @@ void Inkling2::df_head_load(int lo, int n) {
     df_hxq_ = (int8_t*) f(d2::kGuess * kWidth / 4, "DFlash2 head codes");
     df_hxd_ = f(d2::kGuess * kWidth / 32, "DFlash2 head scales");
     if (df_head_q4_ || df_sel_.q4())
-        df_hxsum_ = (int32_t*) dmalloc(d2::kGuess * kWidth / 32 * sizeof(int32_t), "DFlash2 head activation sums");
+        df_hxsum_ = (int32_t*) alloc(d2::kGuess * kWidth / 32 * sizeof(int32_t), "DFlash2 head activation sums");
 }
 
-void Inkling2::df_head_run(const float* h) {
+void Inkling2::df_head_run(const float* h, cudaStream_t stream) {
     namespace d2 = dflash2;
-    d2::quantize(h, kWidth, d2::kGuess, df_hxq_, df_hxd_, df_hxsum_, cs(st_));
+    d2::quantize(h, kWidth, d2::kGuess, df_hxq_, df_hxd_, df_hxsum_, stream);
     if (df_head_fuse_) {
-        d2::head_top(df_head_, df_hxq_, df_hxd_, df_hxsum_, df_head_parts_, df_hids_, df_hvals_, cs(st_));
+        d2::head_top(df_head_, df_hxq_, df_hxd_, df_hxsum_, df_head_parts_, df_hids_, df_hvals_, stream);
     } else {
-        d2::gemv(df_head_, df_hxq_, df_hxd_, df_hxsum_, df_hlog_, d2::kGuess, cs(st_));
-        d2::topk(df_hlog_, d2::kGuess, df_head_.n_out, df_head_.n_out, df_htop_, df_hids_, df_hvals_, cs(st_));
+        d2::gemv(df_head_, df_hxq_, df_hxd_, df_hxsum_, df_hlog_, d2::kGuess, stream);
+        d2::topk(df_hlog_, d2::kGuess, df_head_.n_out, df_head_.n_out, df_htop_, df_hids_, df_hvals_, stream);
     }
 }
 
+void Inkling2::df_taps_push(int first, int n, bool provisional) {
+    namespace d2 = dflash2;
+    auto& gpu = *df_gpu23_;
+    const size_t plane = (size_t) rows_ * kWidth;
+    const d2::Taps taps{{ds_taps_, ds_taps_ + plane, ds_taps_ + 2 * plane, hn_ + n_embd_}};
+    float* src = provisional ? gpu.prov_taps0 : gpu.tap_stage0;
+    float* dst = provisional ? gpu.prov_taps2 : df_ctx_;
+    auto& ev = gpu.taps[gpu.next_taps];
+    gpu.next_taps = (gpu.next_taps + 1) % gpu.taps.size();
+    if (ev.used) {
+        // Normal decode already synchronized GPU2 for its guesses. Backpressure only if an unusually long series of
+        // calls without an ask fills the event ring; wait for this old transfer, not the new context.
+        DfOnDevice on2(2);
+        const auto status = cudaEventQuery(ev.done2);
+        if (status == cudaErrorNotReady) ck(cudaEventSynchronize(ev.done2), "DFlash2 recycle transfer events");
+        else ck(status, "DFlash2 check transfer events");
+    }
+    auto& prev = gpu.last_taps[provisional];
+    // The model can reuse the tap planes after gather. Same-buffer reuse waits only for the previous DMA.
+    if (prev && prev != &ev) ck(cudaStreamWaitEvent(cs(st_), prev->pushed, 0), "DFlash2 reuse GPU0 staging");
+    d2::gather_taps(taps, first, n, src, cs(st_));
+    ck(cudaEventRecord(ev.ready0, cs(st_)), "DFlash2 taps ready");
+    ck(cudaStreamWaitEvent(gpu.tx0, ev.ready0, 0), "DFlash2 wait for taps");
+    if (prev && prev != &ev) ck(cudaStreamWaitEvent(gpu.tx0, prev->read2, 0), "DFlash2 reuse GPU2 staging");
+#if defined(STRATA_HIP_GFX906)
+    ck(hipMemcpyPeerAsync(dst, 2, src, 0, (size_t) n * 4 * kWidth * sizeof(float), gpu.tx0), "DFlash2 push taps 0->2");
+#endif
+    ck(cudaEventRecord(ev.pushed, gpu.tx0), "DFlash2 taps pushed");
+    DfOnDevice on2(2);
+    ck(cudaStreamWaitEvent(gpu.s2, ev.pushed, 0), "DFlash2 wait for pushed taps");
+    df_context(dst, pos_ + first, n, provisional, ev.read2);
+    ck(cudaEventRecord(ev.done2, gpu.s2), "DFlash2 context done");
+    // The other staging pair's last use has completed if we just recycled its event slot.
+    if (gpu.last_taps[!provisional] == &ev) gpu.last_taps[!provisional] = nullptr;
+    prev = &ev;
+    ev.used = true;
+}
+
+void Inkling2::on_verify_rows(int n) {
+    auto* gpu = df_gpu23_.get();
+    if (!gpu || !gpu->async_ctx) return;
+    gpu->prov_valid = false;
+    if (n < 1 || n > dflash2::kBlock || pos_ < df_skip_) return;
+    df_taps_push(0, n, true);
+    gpu->prov_pos = pos_;
+    gpu->prov_n = n;
+    gpu->prov_valid = true;
+}
+
 // The kept rows' context: [tap 5, tap 23, tap 41, final norm] -> fc -> hidden_norm, and each layer's K (k_norm, RoPE at
-// the row's position) and V into its ring.  A prompt's rows that no block will see (df_skip_) are left out.
+// the row's position) and V into its ring. A prompt's rows that no block will see (df_skip_) are left out.
 void Inkling2::df_kept(int n) {
     namespace d2 = dflash2;
+    auto* gpu = df_gpu23_.get();
+    const bool commit = gpu && std::exchange(gpu->prov_valid, false) && gpu->prov_pos == pos_ && n <= gpu->prov_n;
     int first = (int) std::clamp<int64_t>(df_skip_ - pos_, 0, n);
     first = std::max(first, n - d2::kWindow);
     if (first >= n) return;
     const int64_t at = pos_ + first;
     if (at > df_hi_ || at < df_lo_) df_lo_ = at;   // a gap: the older rows are no longer this sequence's neighbours
-    const size_t plane = (size_t) rows_ * kWidth;
-    const d2::Taps taps{{ds_taps_, ds_taps_ + plane, ds_taps_ + 2 * plane, hn_ + n_embd_}};
-    const size_t ring = (size_t) d2::kWindow * d2::kKey;
-    for (int done = first; done < n;) {
-        const int m = std::min(kDfSub, n - done);
-        d2::gather_taps(taps, done, m, df_ctx_, cs(st_));
-        lin(df_fc_, df_ctx_, df_c_, m);
-        rms_norm(df_c_, fp(df_hnorm_), df_cn_, kWidth, m, df_eps_, st_);
-        // Use the same planar activation format as the draft block (not lin()'s half-scale Q8_1).
-        const bool planar = df_kept_opt_ && m <= d2::kBlock;
-        bool quantized = false;
-        for (int l = 0; l < kDfLayers; ++l) {
-            const DfLayer& L = df_[(size_t) l];
-            if (planar && L.qkv) {
-                if (!quantized) {
-                    d2::quantize(df_cn_, kWidth, m, df_xq_, df_xd_, df_xsum_, cs(st_));
-                    quantized = true;
-                }
-                const auto kv = L.qkv.slice(d2::kQuery, 2 * d2::kKey);
-                d2::gemv_split(kv, df_xq_, df_xd_, df_xsum_, df_ck_, d2::kKey, df_cv_, d2::kKey, nullptr, 0, m, cs(st_));
-            } else {
-                lin(L.k, df_cn_, df_ck_, m);
-                lin(L.v, df_cn_, df_cv_, m);
-            }
-            head_norm_rope(df_ck_, kHead, fp(L.k_norm), df_ckr_, kHead, d2::kKv, kHead, df_theta_, pos_ + done, m,
-                           df_eps_, st_);
-            d2::store(df_ckr_, df_cv_, df_kc_ + l * ring, df_vc_ + l * ring, pos_ + done, m, cs(st_));
+    if (commit && first == 0) {
+        DfOnDevice on2(2);
+        // The same stream orders provisional computation, commit, and the next draft ask. Never wait on the host.
+        d2::commit_prov_kv(gpu->prov_k2, gpu->prov_v2, df_kc_, df_vc_, pos_, n, kDfLayers, gpu->s2);
+    } else if (gpu) {
+        for (int done = first; done < n;) {
+            const int m = std::min(kDfSub, n - done);
+            df_taps_push(done, m, false);
+            done += m;
         }
-        done += m;
+    } else {
+        const size_t plane = (size_t) rows_ * kWidth;
+        const d2::Taps taps{{ds_taps_, ds_taps_ + plane, ds_taps_ + 2 * plane, hn_ + n_embd_}};
+        for (int done = first; done < n;) {
+            const int m = std::min(kDfSub, n - done);
+            d2::gather_taps(taps, done, m, df_ctx_, cs(st_));
+            df_context(df_ctx_, pos_ + done, m, false);
+            done += m;
+        }
     }
     df_hi_ = pos_ + n;
+}
+
+void Inkling2::df_context(const float* taps, int64_t pos, int m, bool provisional, cudaEvent_t taps_read) {
+    namespace d2 = dflash2;
+    const auto stream = df_stream();
+    const size_t ring = (size_t) d2::kWindow * d2::kKey;
+    df_linear(df_fc_, taps, df_c_, m);
+    // The packed input is dead after FC (including a possible half-sum rescale).
+    if (taps_read) ck(cudaEventRecord(taps_read, stream), "DFlash2 taps consumed");
+    rms_norm(df_c_, fp(df_hnorm_), df_cn_, kWidth, m, df_eps_, stream);
+    // Use the same planar activation format as the draft block (not lin()'s half-scale Q8_1).
+    const bool planar = df_kept_opt_ && m <= d2::kBlock;
+    bool quantized = false;
+    for (int l = 0; l < kDfLayers; ++l) {
+        const DfLayer& L = df_[(size_t) l];
+        if (planar && L.qkv) {
+            if (!quantized) {
+                d2::quantize(df_cn_, kWidth, m, df_xq_, df_xd_, df_xsum_, stream);
+                quantized = true;
+            }
+            const auto kv = L.qkv.slice(d2::kQuery, 2 * d2::kKey);
+            d2::gemv_split(kv, df_xq_, df_xd_, df_xsum_, df_ck_, d2::kKey, df_cv_, d2::kKey, nullptr, 0, m, stream);
+        } else {
+            df_linear(L.k, df_cn_, df_ck_, m);
+            df_linear(L.v, df_cn_, df_cv_, m);
+        }
+        head_norm_rope(df_ck_, kHead, fp(L.k_norm), df_ckr_, kHead, d2::kKv, kHead, df_theta_, pos, m,
+                       df_eps_, stream);
+        if (provisional) {
+            const size_t off = (size_t) l * d2::kBlock * d2::kKey;
+            d2::store(df_ckr_, df_cv_, df_gpu23_->prov_k2 + off, df_gpu23_->prov_v2 + off, 0, m, stream);
+        } else {
+            d2::store(df_ckr_, df_cv_, df_kc_ + l * ring, df_vc_ + l * ring, pos, m, stream);
+        }
+    }
+}
+
+void Inkling2::df_gpu23_head(bool reuse_selector_quant) {
+    namespace d2 = dflash2;
+    auto& gpu = *df_gpu23_;
+    auto& other = *peer_;
+    const auto h = df_fin_ + kWidth;
+#if defined(STRATA_HIP_GFX906)
+    // Use GPU3's stream for both DMAs so both can overlap GPU2's private head, which reads the same immutable rows.
+    ck(hipEventRecord(gpu.h2_ready, gpu.s2), "DFlash2 head inputs ready");
+    {
+        DfOnDevice on3(3);
+        ck(hipStreamWaitEvent(gpu.s3, gpu.h2_ready, 0), "DFlash2 head 3 waits for GPU2");
+        ck(hipMemcpyPeerAsync(other.df_hx_, 3, h, 2, d2::kGuess * kWidth * sizeof(float), gpu.s3),
+           "DFlash2 hidden rows 2->3");
+        other.df_head_run(other.df_hx_, gpu.s3);
+        d2::pack_top(other.df_hids_, other.df_hvals_, d2::kGuess, other.df_head_lo_, other.df_hpack_, gpu.s3);
+        ck(hipMemcpyPeerAsync(df_hpack_, 2, other.df_hpack_, 3, d2::kGuess * 2 * d2::kTop * sizeof(float), gpu.s3),
+           "DFlash2 top-16 3->2");
+        ck(hipEventRecord(gpu.h3_done, gpu.s3), "DFlash2 head 3 done");
+    }
+    df_head_run(h, gpu.s2);
+    if (reuse_selector_quant)
+        d2::gemv(df_sel_, df_hxq_, df_hxd_, df_hxsum_, df_selh_, d2::kGuess, gpu.s2);
+    ck(hipStreamWaitEvent(gpu.s2, gpu.h3_done, 0), "DFlash2 wait for GPU3 top-16");
+    d2::unpack_top(df_hpack_, d2::kGuess, df_hids1_, df_hvals1_, gpu.s2);
+    d2::merge2(df_hids_, df_hvals_, df_hids1_, df_hvals1_, d2::kGuess, df_ids_, df_vals_, gpu.s2);
+#else
+    (void) gpu; (void) other; (void) h; (void) reuse_selector_quant;
+#endif
 }
 
 // The block at the anchor `token` (picked at pos(), not fed yet): its embedding and seven masks, each through the
 // target's token norm, five layers, the output norm, the target's head on rows 1..7, the top 16 of each, and the
 // selector's walk into h_block_.
 void Inkling2::drafter_guesses(int32_t token) {
+    if (df_gpu23_) {
+        DfOnDevice on2(2);
+        return df_ask(token);
+    }
+    df_ask(token);
+}
+
+void Inkling2::df_ask(int32_t token) {
     namespace d2 = dflash2;
+    const auto stream = df_stream();
     const int64_t a = pos_;
     input(token, a, ds_host_);
     input(kDfMask, a + 1, ds_host_ + kWidth);
-    ck(cudaMemcpyAsync(df_t_, ds_host_, 2 * kWidth * sizeof(float), cudaMemcpyHostToDevice, cs(st_)), "DFlash2");
-    rms_norm(df_t_, fp(token_norm_), df_x_, kWidth, 2, rms_eps_, st_);
-    dspark::fill_rows(df_x_ + kWidth, df_x_ + 2 * kWidth, kWidth, d2::kBlock - 2, cs(st_));
+    ck(cudaMemcpyAsync(df_t_, ds_host_, 2 * kWidth * sizeof(float), cudaMemcpyHostToDevice, stream), "DFlash2");
+    rms_norm(df_t_, fp(df_gpu23_ ? df_token_norm_ : token_norm_), df_x_, kWidth, 2, rms_eps_, stream);
+    dspark::fill_rows(df_x_ + kWidth, df_x_ + 2 * kWidth, kWidth, d2::kBlock - 2, stream);
     const int64_t lo = df_hi_ >= a ? df_lo_ : a;
     const size_t ring = (size_t) d2::kWindow * d2::kKey;
     constexpr int b = d2::kBlock;
@@ -3684,68 +4098,70 @@ void Inkling2::drafter_guesses(int32_t token) {
         const DfLayer& L = df_[(size_t) l];
         if (df_fast_ && df_planar_ && L.waproj && L.qkv) {
             d2::rms_norm_quantize(df_x_, fp(L.attn_norm), df_h_, df_xq_, df_xd_, L.waproj.q4() ? df_xsum_ : nullptr,
-                                  kWidth, b, df_eps_, cs(st_));
-            d2::gemv(L.waproj, df_xq_, df_xd_, df_xsum_, df_dyn_, b, cs(st_));
-            d2::conv_quantize(df_h_, df_dyn_, fp(L.abase), 0, b, df_xq_, df_xd_, L.qkv.q4() ? df_xsum_ : nullptr, cs(st_));
+                                  kWidth, b, df_eps_, stream);
+            d2::gemv(L.waproj, df_xq_, df_xd_, df_xsum_, df_dyn_, b, stream);
+            d2::conv_quantize(df_h_, df_dyn_, fp(L.abase), 0, b, df_xq_, df_xd_, L.qkv.q4() ? df_xsum_ : nullptr, stream);
             d2::gemv_split(L.qkv, df_xq_, df_xd_, df_xsum_, df_q_, d2::kQuery, df_k_, d2::kKey, df_v_, d2::kKey,
-                           b, cs(st_));
+                           b, stream);
         } else {
-            rms_norm(df_x_, fp(L.attn_norm), df_h_, kWidth, b, df_eps_, st_);
+            rms_norm(df_x_, fp(L.attn_norm), df_h_, kWidth, b, df_eps_, stream);
             df_lin(L.aproj, L.waproj, df_h_, df_dyn_, b);
-            d2::conv(df_h_, df_dyn_, fp(L.abase), 0, df_hp_, b, false, cs(st_));
+            d2::conv(df_h_, df_dyn_, fp(L.abase), 0, df_hp_, b, false, stream);
             if (df_planar_ && L.qkv) {   // one launch for q, k and v
-                d2::quantize(df_hp_, kWidth, b, df_xq_, df_xd_, L.qkv.q4() ? df_xsum_ : nullptr, cs(st_));
+                d2::quantize(df_hp_, kWidth, b, df_xq_, df_xd_, L.qkv.q4() ? df_xsum_ : nullptr, stream);
                 d2::gemv_split(L.qkv, df_xq_, df_xd_, df_xsum_, df_q_, d2::kQuery, df_k_, d2::kKey, df_v_, d2::kKey,
-                               b, cs(st_));
+                               b, stream);
             } else {
-                lin(L.q, df_hp_, df_q_, b);
-                lin(L.k, df_hp_, df_k_, b);
-                lin(L.v, df_hp_, df_v_, b);
+                df_linear(L.q, df_hp_, df_q_, b);
+                df_linear(L.k, df_hp_, df_k_, b);
+                df_linear(L.v, df_hp_, df_v_, b);
             }
         }
-        head_norm_rope(df_q_, kHead, fp(L.q_norm), df_qr_, kHead, d2::kHeads, kHead, df_theta_, a, b, df_eps_, st_);
-        head_norm_rope(df_k_, kHead, fp(L.k_norm), df_kr_, kHead, d2::kKv, kHead, df_theta_, a, b, df_eps_, st_);
+        head_norm_rope(df_q_, kHead, fp(L.q_norm), df_qr_, kHead, d2::kHeads, kHead, df_theta_, a, b, df_eps_, stream);
+        head_norm_rope(df_k_, kHead, fp(L.k_norm), df_kr_, kHead, d2::kKv, kHead, df_theta_, a, b, df_eps_, stream);
         (df_attend3_ ? d2::attend3 : d2::attend)(
-            df_qr_, df_kr_, df_v_, df_kc_ + l * ring, df_vc_ + l * ring, lo, a, df_att_, df_ao_, cs(st_));
+            df_qr_, df_kr_, df_v_, df_kc_ + l * ring, df_vc_ + l * ring, lo, a, df_att_, df_ao_, stream);
         df_lin(L.o, L.wo, df_ao_, df_o_, b);
-        d2::conv(df_o_, df_dyn_, fp(L.abase), 1, df_x_, b, true, cs(st_));
+        d2::conv(df_o_, df_dyn_, fp(L.abase), 1, df_x_, b, true, stream);
         if (df_fast_ && df_planar_ && L.wfproj && L.gu && L.wdown) {
             d2::rms_norm_quantize(df_x_, fp(L.ffn_norm), df_h_, df_xq_, df_xd_, L.wfproj.q4() ? df_xsum_ : nullptr,
-                                  kWidth, b, df_eps_, cs(st_));
-            d2::gemv(L.wfproj, df_xq_, df_xd_, df_xsum_, df_dyn_, b, cs(st_));
-            d2::conv_quantize(df_h_, df_dyn_, fp(L.fbase), 0, b, df_xq_, df_xd_, L.gu.q4() ? df_xsum_ : nullptr, cs(st_));
-            d2::gemv_split(L.gu, df_xq_, df_xd_, df_xsum_, df_g_, kDfFfn, df_u_, kDfFfn, nullptr, 0, b, cs(st_));
-            d2::swiglu_quantize(df_g_, df_u_, kDfFfn, b, df_xq_, df_xd_, L.wdown.q4() ? df_xsum_ : nullptr, cs(st_));
-            d2::gemv(L.wdown, df_xq_, df_xd_, df_xsum_, df_o_, b, cs(st_));
+                                  kWidth, b, df_eps_, stream);
+            d2::gemv(L.wfproj, df_xq_, df_xd_, df_xsum_, df_dyn_, b, stream);
+            d2::conv_quantize(df_h_, df_dyn_, fp(L.fbase), 0, b, df_xq_, df_xd_, L.gu.q4() ? df_xsum_ : nullptr, stream);
+            d2::gemv_split(L.gu, df_xq_, df_xd_, df_xsum_, df_g_, kDfFfn, df_u_, kDfFfn, nullptr, 0, b, stream);
+            d2::swiglu_quantize(df_g_, df_u_, kDfFfn, b, df_xq_, df_xd_, L.wdown.q4() ? df_xsum_ : nullptr, stream);
+            d2::gemv(L.wdown, df_xq_, df_xd_, df_xsum_, df_o_, b, stream);
         } else {
-            rms_norm(df_x_, fp(L.ffn_norm), df_h_, kWidth, b, df_eps_, st_);
+            rms_norm(df_x_, fp(L.ffn_norm), df_h_, kWidth, b, df_eps_, stream);
             df_lin(L.fproj, L.wfproj, df_h_, df_dyn_, b);
-            d2::conv(df_h_, df_dyn_, fp(L.fbase), 0, df_hp_, b, false, cs(st_));
+            d2::conv(df_h_, df_dyn_, fp(L.fbase), 0, df_hp_, b, false, stream);
             if (df_planar_ && L.gu) {
-                d2::quantize(df_hp_, kWidth, b, df_xq_, df_xd_, L.gu.q4() ? df_xsum_ : nullptr, cs(st_));
-                d2::gemv_split(L.gu, df_xq_, df_xd_, df_xsum_, df_g_, kDfFfn, df_u_, kDfFfn, nullptr, 0, b, cs(st_));
+                d2::quantize(df_hp_, kWidth, b, df_xq_, df_xd_, L.gu.q4() ? df_xsum_ : nullptr, stream);
+                d2::gemv_split(L.gu, df_xq_, df_xd_, df_xsum_, df_g_, kDfFfn, df_u_, kDfFfn, nullptr, 0, b, stream);
             } else {
-                lin(L.gate, df_hp_, df_g_, b);
-                lin(L.up, df_hp_, df_u_, b);
+                df_linear(L.gate, df_hp_, df_g_, b);
+                df_linear(L.up, df_hp_, df_u_, b);
             }
-            swiglu_clamp(df_g_, df_u_, df_m_, b * kDfFfn, INFINITY, st_);
+            swiglu_clamp(df_g_, df_u_, df_m_, b * kDfFfn, INFINITY, stream);
             df_lin(L.down, L.wdown, df_m_, df_o_, b);
         }
-        d2::conv(df_o_, df_dyn_, fp(L.fbase), 1, df_x_, b, true, cs(st_));
+        d2::conv(df_o_, df_dyn_, fp(L.fbase), 1, df_x_, b, true, stream);
     }
-    rms_norm(df_x_, fp(df_onorm_), df_fin_, kWidth, b, df_eps_, st_);
+    rms_norm(df_x_, fp(df_onorm_), df_fin_, kWidth, b, df_eps_, stream);
     const int guesses = std::min(d2::kGuess, opt_.window - 1);
     const bool reuse_selector_quant = df_fast_ && df_private_head_ && df_sel_;
-    if (df_private_head_) {   // both owners' private halves run at once; rank 1 returns its top 16 only
+    if (df_gpu23_) {
+        df_gpu23_head(reuse_selector_quant);
+    } else if (df_private_head_) {   // both owners' private halves run at once; rank 1 returns its top 16 only
         peer_dispatch(PeerCmd::kDraftHead, d2::kGuess);
         try {
-            tp2_->broadcast_from_0(0, df_fin_ + kWidth, d2::kGuess * kWidth, st_);
-            df_head_run(df_fin_ + kWidth);
+            tp2_->broadcast_from_0(0, df_fin_ + kWidth, d2::kGuess * kWidth, stream);
+            df_head_run(df_fin_ + kWidth, stream);
             if (reuse_selector_quant)
-                d2::gemv(df_sel_, df_hxq_, df_hxd_, df_hxsum_, df_selh_, d2::kGuess, cs(st_));
-            tp2_->gather_from_1(0, df_hpack_, nullptr, d2::kGuess * 2 * d2::kTop, st_);
-            d2::unpack_top(df_hpack_, d2::kGuess, df_hids1_, df_hvals1_, cs(st_));
-            d2::merge2(df_hids_, df_hvals_, df_hids1_, df_hvals1_, d2::kGuess, df_ids_, df_vals_, cs(st_));
+                d2::gemv(df_sel_, df_hxq_, df_hxd_, df_hxsum_, df_selh_, d2::kGuess, stream);
+            tp2_->gather_from_1(0, df_hpack_, nullptr, d2::kGuess * 2 * d2::kTop, stream);
+            d2::unpack_top(df_hpack_, d2::kGuess, df_hids1_, df_hvals1_, stream);
+            d2::merge2(df_hids_, df_hvals_, df_hids1_, df_hvals1_, d2::kGuess, df_ids_, df_vals_, stream);
         } catch (...) {
             tp2_->abort_barrier();
             peer_wait();
@@ -3754,14 +4170,14 @@ void Inkling2::drafter_guesses(int32_t token) {
         peer_wait();
     } else {
         project_logits(df_fin_ + kWidth, df_logits_, d2::kGuess);
-        d2::topk(df_logits_, d2::kGuess, n_vocab_, kDfVocab, df_top_, df_ids_, df_vals_, cs(st_));
+        d2::topk(df_logits_, d2::kGuess, n_vocab_, kDfVocab, df_top_, df_ids_, df_vals_, stream);
     }
     if (!reuse_selector_quant)
         df_lin(df_selw_, df_sel_, df_fin_ + kWidth, df_selh_, d2::kGuess);
     static_assert(sizeof(d2::Guess) == sizeof(Likeliest));
     d2::select(df_ids_, df_vals_, df_selh_, df_pred_, df_succ_, token, df_cap_, df_edges_,
-               reinterpret_cast<d2::Guess*>(h_block_), cs(st_));
-    ck(cudaStreamSynchronize(cs(st_)), "DFlash2 guesses");
+               reinterpret_cast<d2::Guess*>(h_block_), stream);
+    ck(cudaStreamSynchronize(stream), "DFlash2 guesses");
     block_n_ = guesses;
 }
 

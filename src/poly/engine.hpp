@@ -478,6 +478,8 @@ protected:
     virtual void on_keep_snap(size_t snap_idx) { (void) snap_idx; }
     virtual Dev load_output_matrix(const TensorInfo* t, int64_t file_vocab);
     virtual void project_logits(const float* h, float* out, int rows);
+    /// A decode call has produced its final norm, immediately before the target LM head.
+    virtual void on_verify_rows(int rows) { (void) rows; }
     /// The model's output for `rows` tokens from row `first` of the call, normed: what the output matrix takes.
     virtual void output_rows(int first, int rows, float* h) = 0;
     /// A token's experts and their weights from its scores at layer il's router.  `token` is the token the row is
@@ -597,7 +599,15 @@ protected:
     const Image* image_at(int64_t row) const;
     bool input(int32_t token, int64_t row, float* dst) const;
     void lin(const Dev& w, const float* x, float* y, int n, const void* xq = nullptr, int rows_per_x = 0);
-    void lin_raw(const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x);
+    struct LinWorkspace {
+        void *stream, *blas, *q8, *mqx;
+        Mmq* mmq;
+        float *wf, *hf;
+        size_t bf16_max;
+    };
+    void lin_on(const LinWorkspace& ws, const Dev& w, const float* x, float* y, int n,
+                const void* xq = nullptr, int rows_per_x = 0);
+    void lin_raw(const LinWorkspace& ws, const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x);
     /// The layer's ExpertScales for rows of the experts ids[r] (on the card), or none.
     ExpertScales expert_scales(const Layer& L, const int32_t* ids = nullptr) const;
     void expert_activation(const float* gate_up, float* out, int rows, float limit, const ExpertScales& scales);

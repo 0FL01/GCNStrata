@@ -36,6 +36,10 @@ void conv(const float* x, const float* dyn, const float* base, int stage, float*
 /// K/V rows (normed and rotated K) of positions pos .. pos + n - 1 into the half rings of kWindow rows ([slot][kKey]).
 void store(const float* k, const float* v, __half* kc, __half* vc, int64_t pos, int n, cudaStream_t st);
 
+/// Copy only accepted FP16 rows from [layers][kBlock][kKey] to [layers][kWindow][kKey].
+void commit_prov_kv(const __half* k, const __half* v, __half* kc, __half* vc, int64_t pos, int n, int layers,
+                    cudaStream_t st);
+
 /// Non-causal attention of the block's queries at pos .. pos + 7 over the ring rows of positions lo .. pos - 1 (row i
 /// sees those within kWindow - 1 of pos + i) and the block's own keys.  q [8][32][128], kb/vb [8][8][128]; out [8][4096].
 size_t attend_floats();

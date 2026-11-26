@@ -19,6 +19,7 @@ namespace strata::poly {
 
 class Inkling2 final : public Engine {
 public:
+    Inkling2();
     static std::unique_ptr<Engine> open_tp2(const Options& o);
     ~Inkling2() override;
 
@@ -53,6 +54,7 @@ protected:
     void layer_head(Layer& L, int il, int n) override;
     void layer_tail(Layer& L, int il, int n) override;
     void output_rows(int first, int rows, float* h) override;
+    void on_verify_rows(int rows) override;
     void finish_logits(float* logits, int rows) override;
     void route(int il, const float* logits, int32_t, int* ids, float* w, float* tmp) const override;
 #if defined(STRATA_HIP_GFX906)
@@ -264,8 +266,8 @@ private:
     float* df_hxd_ = nullptr;
     int32_t* df_hxsum_ = nullptr;
     int8_t* df_hxq_ = nullptr;
-    void df_head_load(int lo, int n);   // on this object's card
-    void df_head_run(const float* h);   // h: [7][2304] on this card; leaves df_hids_/df_hvals_ (rank-local ids)
+    void df_head_load(int lo, int n, Inkling2* gpu23_owner = nullptr);
+    void df_head_run(const float* h, cudaStream_t stream);   // h: [7][2304] on this card; leaves df_hids_/df_hvals_ (rank-local ids)
     int8_t* df_xq_ = nullptr;          // planar activations: [8][9216] codes
     float* df_xd_ = nullptr;           // [8][288] scales
     int32_t* df_xsum_ = nullptr;       // [8][288] unscaled code sums (Q4 only)
@@ -288,6 +290,19 @@ private:
     int32_t* df_ids_ = nullptr;
     void df_shape(const Shards& g);
     void df_load();
+    void df_load_weights();
+    void df_scratch();
+    void df_linear(const Dev& w, const float* x, float* y, int n);
+    void df_context(const float* taps, int64_t pos, int n, bool provisional, cudaEvent_t taps_read = nullptr);
+    void df_ask(int32_t token);
+    struct DfGpu23;
+    std::unique_ptr<DfGpu23> df_gpu23_;
+    Dev df_token_norm_;
+    void df_gpu23_init();
+    void df_gpu23_scratch();
+    void df_taps_push(int first, int n, bool provisional);
+    void df_gpu23_head(bool reuse_selector_quant);
+    cudaStream_t df_stream() const;
     void df_kept(int n);
 };
 

@@ -783,6 +783,15 @@ drafter changes only speed, never output.
   packed K|V slice. Larger batches and layers without a packed group keep the existing `lin()` path. The packed
   projection uses FP32 activation scales and a different reduction order than native `lin()`, so it is not bitwise
   equivalent to `lin()`. This can change guesses, not the verifier.
+- `STRATA_DFLASH2_GPU23=1`: with four visible gfx906 GPUs, TP2, a single sequence and an existing private-head
+  option (`HEAD8`, `HEAD_Q4` or `HEAD_FUSE`), move the draft backbone, selector and context rings to GPU2 and
+  the two private head shards to GPUs 2 and 3. This does not change the selected weight formats. The target
+  stays on GPUs 0 and 1. Peer transfers and draft kernels use nonblocking streams separate from KV/Flash helpers.
+  Without the required devices, P2P links or private head, ordinary DFlash2 is used.
+- `STRATA_DFLASH2_ASYNC_CTX=1` (requires `GPU23`): prepare exact context K/V for up to eight verifier rows while
+  the target head runs and the CPU samples. Only the kept prefix is copied into the draft rings. Reset, state
+  restore, replay or a mismatched prefix discards the provisional rows; unsupported projection formats use
+  ordinary kept-only context. This path requires the width-invariant gfx906 decode projections.
 - `guesses.hpp`: for an all-at-once drafter the run is paid once; later guesses carry no ask cost.
 
 The `poly_inkling_dflash2_test` target (`STRATA_BUILD_TESTS=ON`) checks planar projections, mixed codebooks, and

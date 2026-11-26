@@ -3818,8 +3818,13 @@ void Engine::dbg(const char* name, int il, const float* dev, int n) {
 // y = w x for n tokens.  xq is x already in Q8_1, when the caller has it.  rows_per_x below n_out gives each group
 // of rows its own input (see gemv_f32); only the float types take it.
 void Engine::lin(const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x) {
-    lin_raw(w, x, y, n, xq, rows_per_x);
-    if (w.scale != 1.0f) axpy(y, w.scale, y, n * w.n_out, false, st_);
+    lin_on({st_, blas_, q8_, mqx_, mmq_.get(), wf_, hf_, bf16_max_}, w, x, y, n, xq, rows_per_x);
+}
+
+void Engine::lin_on(const LinWorkspace& ws, const Dev& w, const float* x, float* y, int n,
+                    const void* xq, int rows_per_x) {
+    lin_raw(ws, w, x, y, n, xq, rows_per_x);
+    if (w.scale != 1.0f) axpy(y, w.scale, y, n * w.n_out, false, ws.stream);
 }
 
 ExpertScales Engine::expert_scales(const Layer& L, const int32_t* ids) const {
@@ -3840,59 +3845,59 @@ void Engine::expert_activation(const float* gate_up, float* out, int rows, float
     else swiglu_clamp_rows(gate_up, out, n_ff_exp_, rows, limit, st_, &scales);
 }
 
-void Engine::lin_raw(const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x) {
+void Engine::lin_raw(const LinWorkspace& ws, const Dev& w, const float* x, float* y, int n, const void* xq, int rows_per_x) {
     if (w.type == kTypeF32 || w.type == kTypeBF16) {
         const int per = rows_per_x ? rows_per_x : w.n_out;
         const size_t count = (size_t) w.n_in * w.n_out;
         // A prompt batch: one matrix product.  The kernel below has a block for every output of every token,
         // and GLM 5.3 Flash's per-head projections are 32,768 outputs a token.
-        if (n >= kStageRows && (w.type == kTypeF32 || (wf_ && count <= bf16_max_))) {
+        if (n >= kStageRows && (w.type == kTypeF32 || (ws.wf && count <= ws.bf16_max))) {
             const float* wf = fp(w);
             if (w.type == kTypeBF16) {
-                bf16_to_f32((const uint16_t*) w.p, wf_, count, st_);
-                wf = wf_;
+                bf16_to_f32((const uint16_t*) w.p, ws.wf, count, ws.stream);
+                wf = ws.wf;
             }
-            return gemm_f32(blas_, wf, x, y, w.n_in, w.n_out, per, n);
+            return gemm_f32(ws.blas, wf, x, y, w.n_in, w.n_out, per, n);
         }
         if (w.type == kTypeF32)
-            return (wave_gemv_ ? gemv_f32_waves : gemv_f32)(fp(w), x, y, w.n_in, w.n_out, per, n, st_);
-        return gemv_bf16((const uint16_t*) w.p, x, y, w.n_in, w.n_out, per, n, st_);
+            return (wave_gemv_ ? gemv_f32_waves : gemv_f32)(fp(w), x, y, w.n_in, w.n_out, per, n, ws.stream);
+        return gemv_bf16((const uint16_t*) w.p, x, y, w.n_in, w.n_out, per, n, ws.stream);
     }
     // a prompt batch: llama.cpp's matrix-matrix kernels read the weights once for all the tokens
-    if (mmq_ && n >= kStageRows && Mmq::fits((int) w.type, w.n_out, w.n_in)) {
+    if (ws.mmq && n >= kStageRows && Mmq::fits((int) w.type, w.n_out, w.n_in)) {
         // A row too large for the halves its blocks keep their sums in goes in divided by a power of two, and x is
         // left as it was for whatever reads it next (both exact): its product comes out divided by the same.
         const bool guard = half_sum_guard_ && Mmq::half_sums((int) w.type);
         float* xs = const_cast<float*>(x);
-        if (guard) guard_half_sums(xs, w.n_in, w.n_in, n, hf_, st_);
-        Mmq::quantize(x, nullptr, mqx_, (int) w.type, w.n_in, w.n_in, n, st_);
-        if (guard) scale_rows(xs, w.n_in, w.n_in, n, nullptr, hf_, false, st_);
-        mmq_->mul(w.p, (int) w.type, w.n_out, w.n_in, 0, 1, mqx_, nullptr, nullptr, n, n, y, w.n_out, st_);
-        if (guard) scale_rows(y, w.n_out, w.n_out, n, nullptr, hf_, false, st_);
+        if (guard) guard_half_sums(xs, w.n_in, w.n_in, n, ws.hf, ws.stream);
+        Mmq::quantize(x, nullptr, ws.mqx, (int) w.type, w.n_in, w.n_in, n, ws.stream);
+        if (guard) scale_rows(xs, w.n_in, w.n_in, n, nullptr, ws.hf, false, ws.stream);
+        ws.mmq->mul(w.p, (int) w.type, w.n_out, w.n_in, 0, 1, ws.mqx, nullptr, nullptr, n, n, y, w.n_out, ws.stream);
+        if (guard) scale_rows(y, w.n_out, w.n_out, n, nullptr, ws.hf, false, ws.stream);
         return;
     }
     if (!xq) {
         // the tokens' blocks are back to back, so they quantize as one long vector
-        kernels::native_quantize_q8_1(x, q8_, w.n_in * n, 1, st_);
-        xq = q8_;
+        kernels::native_quantize_q8_1(x, ws.q8, w.n_in * n, 1, ws.stream);
+        xq = ws.q8;
     }
     if (head_warps_ && n == 1 && w.type == GGML_TYPE_Q6_K && w.p == output_.p &&
-        kernels::native_q6_k_mmvq_warps(w.p, xq, y, w.n_in, w.n_out, st_))
+        kernels::native_q6_k_mmvq_warps(w.p, xq, y, w.n_in, w.n_out, ws.stream))
         return;
     // A guesser's windows and its own block: a few rows, each weight block read once for all of them.  The Q6_K head
     // for any of them (Inkling's 4-token window: 2.0 ms a round against native_mmvq()'s 3.8, RX 6700 XT); Q8_0 only
     // for eight rows of a tall matrix (the drafter's block: 132 against 185 us at 9216 x 2304; at four rows 84
     // against 65, and with fewer rows of output the launch has too few blocks for the card).
     if (cols_kernels_ && n >= 2 && n <= 8 &&
-        ((w.type == GGML_TYPE_Q6_K && kernels::native_q6_k_mmvq_warps_cols(w.p, xq, y, w.n_in, w.n_out, n, st_)) ||
+        ((w.type == GGML_TYPE_Q6_K && kernels::native_q6_k_mmvq_warps_cols(w.p, xq, y, w.n_in, w.n_out, n, ws.stream)) ||
          (w.type == GGML_TYPE_Q8_0 && n == 8 && w.n_out >= 8192 &&
-          kernels::native_q8_0_mmvq_warps_cols(w.p, xq, y, w.n_in, w.n_out, n, st_))))
+          kernels::native_q8_0_mmvq_warps_cols(w.p, xq, y, w.n_in, w.n_out, n, ws.stream))))
         return;
     // a launch takes up to 8 tokens, and each comes out as it would alone
     const size_t token = kernels::native_q8_1_bytes(w.n_in);
     for (int at = 0; at < n; at += 8)
         kernels::native_mmvq((int) w.type, w.p, (const uint8_t*) xq + (size_t) at * token,
-                             y + (size_t) at * w.n_out, w.n_in, w.n_out, std::min(8, n - at), st_);
+                             y + (size_t) at * w.n_out, w.n_in, w.n_out, std::min(8, n - at), ws.stream);
 }
 
 void Engine::router_scores(const Layer& L, int n) {
@@ -5867,6 +5872,7 @@ void Engine::eval(const int32_t* tokens, int n, bool want_logits) {
             output_rows(n - m, m, h);
             dbg("out_norm", n_layer_, h, n_embd_);
             if (!want_logits) return;
+            if (!replay) on_verify_rows(m);
             project_logits(h + (size_t) (m - 1) * n_embd_, logits_, 1);
             finish_logits(logits_, 1);
             ck(cudaMemcpyAsync(h_logits_, logits_, (size_t) n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost,
@@ -6158,6 +6164,7 @@ void Engine::window(const int32_t* tokens, int t) {
     }
     float* h = draft_ ? hn_ + n_embd_ : xn_;
     output_rows(0, t, h);
+    on_verify_rows(t);
     project_logits(h, wlogits_, t);
     finish_logits(wlogits_, t);
     ck(cudaMemcpyAsync(h_wlogits_, wlogits_, (size_t) t * n_vocab_ * sizeof(float), cudaMemcpyDeviceToHost, cs(st_)),
