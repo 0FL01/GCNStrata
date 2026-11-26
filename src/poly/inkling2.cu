@@ -2947,6 +2947,9 @@ void Inkling2::df_load() {
     df_hnorm_ = up("enc.output_norm.weight", kWidth, 1, kF32);
     df_onorm_ = up("output_norm.weight", kWidth, 1, kF32);
     df_selw_ = up("selector_hidden.weight", kWidth, d2::kRank, kAnyMat);
+    // Engine::load() runs this twice: the first pass only sizes the dense arena (dense_ not yet allocated).  The
+    // drafter's own buffers below are allocated once, in the second.
+    if (!dense_) return;
     const auto book = [&](const char* name) {
         const TensorInfo* t = g.find(name);
         g.payload(*t);
