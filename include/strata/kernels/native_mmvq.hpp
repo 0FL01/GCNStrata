@@ -257,6 +257,9 @@ bool native_q8_0_segments_cols_grouped(const MmvqSegments& s, int n_in, int ncol
 // Single-token Inkling TP2 Q4_0 [Q,] gate, rel. One shared Q8_1 input, disjoint
 // outputs, existing gfx906 wave64 R4 dispatch. Caller verifies gfx906 wave64.
 bool native_inkling_q4_0_segments(const MmvqSegments& s, int n_in, void* stream);
+// Multi-row (2..8 columns) Inkling TP2 Q4_0 segments (1..3 matrices sharing one Q8_1 input, e.g. [Q,] gate, rel or o).
+// Bitwise equal per column to the T1 wave64 R4 kernel: same lane-to-block map, FMA order and 64-lane xor butterfly.
+bool native_inkling_q4_0_segments_cols(const MmvqSegments& s, int n_in, int ncols, void* stream);
 #endif
 bool native_q6_k_mmvq_warps(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, void* stream);
 bool native_q6_k_mmvq_warps_cols(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,

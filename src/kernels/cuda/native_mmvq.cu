@@ -1988,6 +1988,82 @@ __global__ __launch_bounds__(256) void inkling_q40_segments_wave_kernel(InklingQ
     }
 }
 
+#if defined(STRATA_HIP_GFX906)
+// STRATA_INKLING_Q4_0_DENSE_COLS=1 (SV5 D1w +grp): 1..3 Q4_0 matrices sharing one Q8_1 input across NCOLS = 2..8
+// columns in one launch, with activations staged once in LDS, x/ds hoisted out of the R-row inner loop, and an
+// unaligned 8-byte weight load.  Every output word equals the T1 wave64 kernel bitwise.
+struct InklingQ40Segs {
+    const Q40Block* w[3];
+    float* y[3];
+    int end[3];   // cumulative CTA tile counts
+    int ldy[3];   // rows per segment (column stride of y)
+};
+
+template<int NCOLS, int R>
+__launch_bounds__(256)
+__global__ void inkling_q40_segments_cols_kernel(InklingQ40Segs s, const Q81Block* __restrict__ xg, int nb, int tiles) {
+    extern __shared__ int4 s_xw[];
+    const int t = int(blockIdx.x);
+    if (t >= tiles) return;
+    const int xs_words = NCOLS * nb * int(sizeof(Q81Block)) / 16;
+    const int4* src = reinterpret_cast<const int4*>(xg);
+    for (int i = int(threadIdx.x); i < xs_words; i += 256) s_xw[i] = src[i];
+    __syncthreads();
+
+    const int lane = int(threadIdx.x) & 63, wave = int(threadIdx.x) >> 6, h = lane & 1, kl = lane >> 1;
+    const int seg = t < s.end[0] ? 0 : (t < s.end[1] ? 1 : 2);
+    const int local = t - (seg == 0 ? 0 : s.end[seg - 1]);
+    const int row0 = (local * 4 + wave) * R;
+    const Q40Block* w = s.w[seg];
+    const Q81Block* xs = reinterpret_cast<const Q81Block*>(s_xw);
+
+    float tmp[NCOLS][R] = {};
+    for (int kbx = kl; kbx < nb; kbx += 32) {
+        int vi0[R][2], vi1[R][2];
+        float wd[R];
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            const Q40Block* b = w + std::size_t(row0 + i) * nb + kbx;
+            int v[2];
+            __builtin_memcpy(v, reinterpret_cast<const uint8_t*>(b) + 2 + 8 * h, 8);
+            vi0[i][0] = v[0] & 0x0f0f0f0f;
+            vi1[i][0] = (v[0] >> 4) & 0x0f0f0f0f;
+            vi0[i][1] = v[1] & 0x0f0f0f0f;
+            vi1[i][1] = (v[1] >> 4) & 0x0f0f0f0f;
+            wd[i] = __half2float(b->d);
+        }
+#pragma unroll
+        for (int j = 0; j < NCOLS; ++j) {
+            const Q81Block* xb = xs + j * nb + kbx;
+            const int* u = reinterpret_cast<const int*>(xb->qs) + 2 * h;
+            const int u0 = u[0], u1 = u[1], u4 = u[4], u5 = u[5];
+            const float2 ds = __half22float2(xb->ds);
+            const float m4 = 4.f * ds.y;
+#pragma unroll
+            for (int i = 0; i < R; ++i) {
+                int sumi = 0;
+                sumi = STRATA_DP4A(vi0[i][0], u0, sumi);
+                sumi = STRATA_DP4A(vi1[i][0], u4, sumi);
+                sumi = STRATA_DP4A(vi0[i][1], u1, sumi);
+                sumi = STRATA_DP4A(vi1[i][1], u5, sumi);
+                tmp[j][i] += wd[i] * (sumi * ds.x - m4);
+            }
+        }
+    }
+    float* y = s.y[seg];
+    const int ldy = s.ldy[seg];
+#pragma unroll
+    for (int j = 0; j < NCOLS; ++j)
+#pragma unroll
+        for (int i = 0; i < R; ++i) {
+            float v = tmp[j][i];
+#pragma unroll
+            for (int off = 32; off > 0; off >>= 1) v += __shfl_xor(v, off, 64);
+            if (lane == 0) y[std::size_t(j) * ldy + row0 + i] = v;
+        }
+}
+#endif
+
 // Indexed MTP head component only. Existing wave kernel and dispatch stay unchanged.
 template<typename F, int NCOLS, int R>
 __launch_bounds__(256)
@@ -3838,6 +3914,45 @@ bool native_inkling_q4_0_segments(const MmvqSegments& s, int n_in, void* stream)
     const int blocks = (large * kInklingQ40Large + kInklingQ40Rel) / kInklingQ40Tile;
     if (large == 1) inkling_q40_segments_wave_kernel<1><<<blocks, 256, 0, st>>>(p);
     else inkling_q40_segments_wave_kernel<2><<<blocks, 256, 0, st>>>(p);
+    launch_check();
+    return true;
+}
+
+bool native_inkling_q4_0_segments_cols(const MmvqSegments& s, int n_in, int ncols, void* stream) {
+    if (g_wave_off || ncols < 2 || ncols > 8 || s.count < 1 || s.count > 3 || n_in <= 0 || n_in % 128 != 0)
+        return false;
+    const int nb = n_in / Q8K;
+    const std::size_t lds = std::size_t(ncols) * std::size_t(nb) * sizeof(Q81Block);
+    if (lds > 48 * 1024 || lds % 16 != 0) return false;
+    const int r_rows = ncols <= 3 ? 4 : 2;
+    const int tile = 4 * r_rows;
+    InklingQ40Segs p{};
+    int total_tiles = 0;
+    for (int i = 0; i < s.count; ++i) {
+        if (s.rows[i] <= 0 || s.rows[i] % tile != 0 || s.x[i] != s.x[0]) return false;
+        validate_pointer(s.w[i]);
+        validate_pointer(s.y[i]);
+        p.w[i] = static_cast<const Q40Block*>(s.w[i]);
+        p.y[i] = s.y[i];
+        p.ldy[i] = s.rows[i];
+        total_tiles += s.rows[i] / tile;
+        p.end[i] = total_tiles;
+    }
+    for (int i = s.count; i < 3; ++i) p.end[i] = total_tiles;
+    validate_pointer(s.x[0]);
+    if (reinterpret_cast<std::uintptr_t>(s.x[0]) % 16 != 0) return false;
+    validate_stream(stream);
+    const auto* x = static_cast<const Q81Block*>(s.x[0]);
+    const auto st = static_cast<cudaStream_t>(stream);
+    switch (ncols) {
+    case 2: inkling_q40_segments_cols_kernel<2, 4><<<total_tiles, 256, lds, st>>>(p, x, nb, total_tiles); break;
+    case 3: inkling_q40_segments_cols_kernel<3, 4><<<total_tiles, 256, lds, st>>>(p, x, nb, total_tiles); break;
+    case 4: inkling_q40_segments_cols_kernel<4, 2><<<total_tiles, 256, lds, st>>>(p, x, nb, total_tiles); break;
+    case 5: inkling_q40_segments_cols_kernel<5, 2><<<total_tiles, 256, lds, st>>>(p, x, nb, total_tiles); break;
+    case 6: inkling_q40_segments_cols_kernel<6, 2><<<total_tiles, 256, lds, st>>>(p, x, nb, total_tiles); break;
+    case 7: inkling_q40_segments_cols_kernel<7, 2><<<total_tiles, 256, lds, st>>>(p, x, nb, total_tiles); break;
+    case 8: inkling_q40_segments_cols_kernel<8, 2><<<total_tiles, 256, lds, st>>>(p, x, nb, total_tiles); break;
+    }
     launch_check();
     return true;
 }

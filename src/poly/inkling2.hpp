@@ -148,6 +148,8 @@ private:
     bool cpu_sum_ = false;  // moe_add() left the CPU experts' sum for layer_tail()
     bool fo_clean_ = false; // layer_tail() left fo_ 0 for the next layer's experts (moe_shared())
     bool kv_stored_ = false;   // layer_head() stored the decode row's K and V (heads_kv_kernel) for attention()
+    bool heads_kv_rows_ = false;   // STRATA_INKLING_HEADS_KV_ROWS=1: fuse conv2 + head_norms + store2_q8 for windows
+    bool q4_0_dense_cols_ = false; // STRATA_INKLING_Q4_0_DENSE_COLS=1: grouped multi-row Q4_0 dense projections
     void* attq_ = nullptr;  // the attention's output as Q8_1 (attend_decode()), for the output projection
     void *kq8_ = nullptr, *vq8_ = nullptr;   // K's and V's own inputs as Q8_1 (project())
     // heads(): the three streams' current rows, messages, norm pairs, ranks, normed inputs (one after the other)

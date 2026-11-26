@@ -471,6 +471,79 @@ __global__ void heads_kv_kernel(Conv k, Conv v, HeadNorms h, KvStore c, float ep
     (j == 2 ? c.vc : c.kc)[(size_t) c.at * kv_width + i] = (int8_t) q;
 }
 
+// Multi-row version of heads_kv_kernel for a fused Q8_0 decode/verify window (n > 1):
+//   - Q and rel blocks (2 * n_heads * n blocks) run head_norm in parallel across all n rows;
+//   - K and V blocks (2 * n_kv blocks) run conv_channel -> head_norm -> Q8_0 store in a single register pass over
+//     t = 0..n-1 with zero extra global reads of k_/v_.
+// Every output word equals conv2_kernel + head_norms_kernel + store2_q8_kernel bitwise.
+__global__ void heads_kv_rows_kernel(Conv k, Conv v, HeadNorms h, KvStore c, float eps, int64_t pos, int ring,
+                                     float alpha, size_t stride, int kv_width, int n) {
+    __shared__ float waves[kThreads / 32];
+    static_assert(kThreads == 128, "a thread a value of a 128-wide K or V head");
+    const int n_q = h.s[0].heads * n;
+    const int n_rel = h.s[3].heads * n;
+    const int b = blockIdx.x;
+    if (b < n_q) {
+        const HeadNorm& s = h.s[0];
+        head_norm(s.x, s.w, s.width, s.heads, s.clip, eps, pos, s.floor, alpha, b % s.heads, b / s.heads, waves);
+        return;
+    }
+    if (b < n_q + n_rel) {
+        const int r = b - n_q;
+        const HeadNorm& s = h.s[3];
+        head_norm(s.x, s.w, s.width, s.heads, s.clip, eps, pos, s.floor, alpha, r % s.heads, r / s.heads, waves);
+        return;
+    }
+    const int kv_idx = b - (n_q + n_rel);
+    const bool is_v = kv_idx >= h.s[1].heads;
+    const int head = is_v ? kv_idx - h.s[1].heads : kv_idx;
+    const Conv& cv = is_v ? v : k;
+    const HeadNorm& s = is_v ? h.s[2] : h.s[1];
+    const int i = head * kThreads + threadIdx.x;
+    float* hist = cv.state + 3 * i;
+    float ha = hist[0], hb = hist[1], hc = hist[2];
+    const float* w = cv.w + 4 * i;
+    const float scale = cv.dynamic ? 1.f / 3.f : 0.4472135954999579f;
+    const int nb = kv_width / 32;
+    for (int t = 0; t < n; ++t) {
+        const size_t at_x = (size_t) t * kv_width + i;
+        const float d = cv.x[at_x];
+        float sv = ha * w[0] + hb * w[1] + hc * w[2] + d * w[3];
+        if (cv.dynamic) {
+            const float* p = cv.dynamic + 4 * (t * (kv_width / 128) + i / 128);
+            sv += d * p[0] + hc * p[1] + hb * p[2] + ha * p[3];
+        }
+        const float conv_out = (d + sv) * scale;
+        ha = hb;
+        hb = hc;
+        hc = d;
+        if (cv.snap && t + 1 < n) {
+            float* sn = cv.snap + (size_t) t * stride + 3 * i;
+            sn[0] = ha;
+            sn[1] = hb;
+            sn[2] = hc;
+        }
+        // head_norm for K/V (s.w == nullptr, s.width == 128, s.floor == 0 -> tau == 1.f)
+        const float ss = block_reduce(conv_out * conv_out, waves);
+        const float ns = s.clip > 0.f ? fminf(1.f, s.clip / (sqrtf(ss) + 1.e-6f)) : rsqrtf(ss / kThreads + eps);
+        const float x = conv_out * ns;
+        cv.x[at_x] = x;
+        float amax = fmaxf(0.f, fabsf(x));   // store2_q8_kernel's maximum starts at 0: a NaN does not count
+#pragma unroll
+        for (int o = 16; o > 0; o >>= 1) amax = fmaxf(amax, __shfl_xor(amax, o, 32));
+        const float dq = amax / 127.0f;
+        const float id = dq > 0.f ? 1.0f / dq : 0.0f;
+        const int64_t at_kv = ring ? (pos + t) % ring : pos + t;
+        if (threadIdx.x % 32 == 0) (is_v ? c.vs : c.ks)[(size_t) at_kv * nb + i / 32] = __float2half(dq);
+        float q = rintf(x * id);
+        q = fminf(fmaxf(q, -127.0f), 127.0f);
+        (is_v ? c.vc : c.kc)[(size_t) at_kv * kv_width + i] = (int8_t) q;
+    }
+    hist[0] = ha;
+    hist[1] = hb;
+    hist[2] = hc;
+}
+
 // K and V into their Q8_0 caches in one launch, as store_q8_kernel writes them, a row at (pos + row) % ring (or
 // pos + row in a full layer's cache).
 __global__ void store2_q8_kernel(const float* k, const float* v, int8_t* kc, __half* ks, int8_t* vc, __half* vs,
@@ -743,6 +816,16 @@ void Inkling2::load_geometry() {
     route_dual_ = decode_ && route_dual && route_dual[0] == '1' && route_dual[1] == '\0';
     if (route_dual_)
         std::fputs("strata-poly: STRATA_INKLING_ROUTE_DUAL=1: the router's copies to the host ride its producers\n",
+                   stderr);
+    const char* heads_kv_rows = std::getenv("STRATA_INKLING_HEADS_KV_ROWS");
+    heads_kv_rows_ = decode_ && heads_kv_rows && heads_kv_rows[0] == '1' && heads_kv_rows[1] == '\0';
+    if (heads_kv_rows_)
+        std::fputs("strata-poly: STRATA_INKLING_HEADS_KV_ROWS=1: fused K/V conv, head norms and Q8 store for windows\n",
+                   stderr);
+    const char* q4_dense_cols = std::getenv("STRATA_INKLING_Q4_0_DENSE_COLS");
+    q4_0_dense_cols_ = decode_ && q4_dense_cols && q4_dense_cols[0] == '1' && q4_dense_cols[1] == '\0';
+    if (q4_0_dense_cols_)
+        std::fputs("strata-poly: STRATA_INKLING_Q4_0_DENSE_COLS=1: grouped multi-row Q4_0 dense projections\n",
                    stderr);
     if (!q8() && opt_.kv_format != KvFmt::kFp16)
         throw std::runtime_error("Inkling-2-Mini supports Q8_0 or FP16 KV");
@@ -2493,12 +2576,20 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
         const Conv cv{v_, hist + 3 * n_key_, fp(b.vconv), swa ? nullptr : taps2_, snap_of(hist + 3 * n_key_)};
         HeadNorms h{{{q_, fp(b.qclip), kHead, n_heads_, qk_clip_, floor}, {k_, nullptr, kHead, n_kv_, qk_clip_, 0},
                      {v_, nullptr, kHead, n_kv_, 0.f, 0}, {rel_, fp(b.rclip), kRelative, n_heads_, r_clip_, floor}}};
-        if (n == 1 && q8()) {   // attention() finds K and V stored
+        const bool can_fuse_kv =
+            n == 1 || (heads_kv_rows_ &&
+                       (!swa || !swa_stage_rows_ || pos_ + n <= ring_ ||
+                        inkling::swa_stage_layout(pos_, kWindow).fits_ring(n, ring_)));
+        if (q8() && can_fuse_kv) {   // attention() finds K and V stored
             Cache& c = caches_[visit_];
             const KvStore to{(int8_t*) c.planes[0].data, (int8_t*) c.planes[2].data, (__half*) c.planes[1].data,
                              (__half*) c.planes[3].data, swa ? pos_ % ring_ : pos_};
-            heads_kv_kernel<<<2 * n_heads_ + 2 * n_kv_, kThreads, 0, cs(st_)>>>(ck, cv, h, to, rms_eps_, pos_, alpha_,
-                                                                                rec_n_, n_key_);
+            if (n == 1)
+                heads_kv_kernel<<<2 * n_heads_ + 2 * n_kv_, kThreads, 0, cs(st_)>>>(ck, cv, h, to, rms_eps_, pos_,
+                                                                                    alpha_, rec_n_, n_key_);
+            else
+                heads_kv_rows_kernel<<<2 * n_heads_ * n + 2 * n_kv_, kThreads, 0, cs(st_)>>>(
+                    ck, cv, h, to, rms_eps_, pos_, swa ? ring_ : 0, alpha_, rec_n_, n_key_, n);
             kv_stored_ = true;
         } else {
             conv2_kernel<<<div_up(2 * n_key_, kThreads), kThreads, 0, cs(st_)>>>(ck, cv, n_key_, n, rec_n_);
@@ -2521,6 +2612,19 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
     dbg("Qcur", visit_, q_, n_query_);
     dbg("Kcur", visit_, k_, n_key_);
     attention(b, n);
+#if defined(STRATA_HIP_GFX906)
+    bool o_done = false;
+    if (q4_0_dense_cols_ && fused(n) && n >= 2 && n <= 8 && attq_ && b.o.type == GGML_TYPE_Q4_0 && b.o.scale == 1.f) {
+        kernels::MmvqSegments os;
+        os.w[0] = b.o.p;
+        os.x[0] = attq_;
+        os.y[0] = ao_;
+        os.rows[0] = b.o.n_out;
+        os.count = 1;
+        o_done = kernels::native_inkling_q4_0_segments_cols(os, b.o.n_in, n, st_);
+    }
+    if (!o_done)
+#endif
     lin(b.o, att_, ao_, n, fused(n) ? attq_ : nullptr);   // attend_decode() quantized it
     if (tp2_) tp2_->all_reduce(tp_rank_, ao_, n * kWidth, st_);
     if (fused(n))
@@ -2583,7 +2687,31 @@ void Inkling2::project_cols(const Block& b, const float* xq, const float* xk, co
     }
     if (group.count && !kernels::native_q8_0_segments_cols_grouped(group, kWidth, n, st_))
         throw std::runtime_error("STRATA_INKLING_Q8_COLS: unsupported projection group");
-    for (const Part& p : parts) {
+#if defined(STRATA_HIP_GFX906)
+    bool q4_done[5] = {};
+    if (q4_0_dense_cols_ && n >= 2 && n <= 8 && q8) {
+        kernels::MmvqSegments q4g;
+        int q4_idx[3] = {};
+        for (int i = 0; i < 3; ++i) {
+            const Dev& w = *parts[i].w;
+            if (w.type == GGML_TYPE_Q4_0 && w.n_in == kWidth && w.scale == 1.f && parts[i].xq == q8) {
+                q4g.w[q4g.count] = w.p;
+                q4g.x[q4g.count] = q8;
+                q4g.y[q4g.count] = parts[i].y;
+                q4g.rows[q4g.count] = w.n_out;
+                q4_idx[q4g.count++] = i;
+            }
+        }
+        if (q4g.count && kernels::native_inkling_q4_0_segments_cols(q4g, kWidth, n, st_)) {
+            for (int k = 0; k < q4g.count; ++k) q4_done[q4_idx[k]] = true;
+        }
+    }
+#endif
+    for (int i = 0; i < 5; ++i) {
+#if defined(STRATA_HIP_GFX906)
+        if (q4_done[i]) continue;
+#endif
+        const Part& p = parts[i];
         const Dev& w = *p.w;
         if (w.type == GGML_TYPE_Q8_0 && w.n_in == kWidth && w.scale == 1.f) {
             if (p.xq) continue;   // in the group above

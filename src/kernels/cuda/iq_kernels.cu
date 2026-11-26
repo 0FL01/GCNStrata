@@ -3718,6 +3718,40 @@ __global__ void __launch_bounds__(64) inkling_moe_group_kernel(const int32_t* __
     if (t == kGroupMaxPicks - 1) g[0] = r + lead;   // leaders among all 64 slots (slots >= rr are not leaders)
 }
 
+// Heavy-first sorted distinct-expert table (STRATA_INKLING_MOE_MULT=1): descending multiplicity so multi-row experts
+// dispatch first and avoid wave-tail bubbles; same expert entries, bitwise identical output.
+__global__ void __launch_bounds__(64) inkling_moe_group_heavy_kernel(const int32_t* __restrict__ ids, int rr,
+                                                                     int32_t* g) {
+    __shared__ int s_id[kGroupMaxPicks], s_cnt[kGroupMaxPicks], s_lead[kGroupMaxPicks];
+    const int t = threadIdx.x;
+    if (t < rr) s_id[t] = ids[t];
+    __syncthreads();
+    int lead = 0, cnt = 0;
+    if (t < rr) {
+        lead = 1;
+        for (int j = 0; j < t; ++j) lead &= s_id[j] != s_id[t];
+        if (lead) for (int j = t; j < rr; ++j) cnt += (s_id[j] == s_id[t]);
+    }
+    s_lead[t] = lead;
+    s_cnt[t] = cnt;
+    __syncthreads();
+    if (lead) {
+        int r = 0;
+        for (int j = 0; j < rr; ++j)
+            if (s_lead[j] && (s_cnt[j] > cnt || (s_cnt[j] == cnt && j < t))) ++r;
+        int* o = g + 1 + r * kGroupStride;
+        o[0] = s_id[t];
+        o[1] = cnt;
+        int c = 0;
+        for (int j = t; j < rr; ++j) if (s_id[j] == s_id[t]) o[2 + c++] = j;
+    }
+    if (t == 0) {
+        int u = 0;
+        for (int j = 0; j < rr; ++j) u += s_lead[j];
+        g[0] = u;
+    }
+}
+
 __device__ __forceinline__ void stage_q8_1(int4* dst, const uint8_t* const* src, int n, int per, int tid, int nthr) {
     for (int c = 0; c < n; ++c)
         for (int i = tid; i < per; i += nthr) dst[c * per + i] = reinterpret_cast<const int4*>(src[c])[i];
@@ -3729,12 +3763,12 @@ __device__ __forceinline__ void stage_q8_1_words(int* dst, const uint8_t* const*
 
 // Gate/up, 2304 -> 1152 Q4_0.  G: one CTA column per distinct expert (all its window columns, LDS n x 2592 B);
 // else one per pick (one column).  WARPS logical warps x TILE rows per CTA; each lane's five k steps unrolled.
-template<int TILE, int WARPS, bool G>
+template<int TILE, int WARPS, bool G, int MAX_C = kGroupCols>
 __global__ void __launch_bounds__(32 * WARPS) inkling_gu_q4_0_window_kernel(MmvqIds ids, const int32_t* __restrict__ g) {
     using F = Fmt<2>;
     using S = Split<2>;
     extern __shared__ int4 s_x[];
-    constexpr int NC = G ? kGroupCols : 1;
+    constexpr int NC = G ? MAX_C : 1;
     int n = 1, e, col[NC];
     if constexpr (G) {
         if (int(blockIdx.y) >= g[0]) return;
@@ -3790,26 +3824,26 @@ static_assert(5 * (32 / Fmt<2>::ipb) >= kInklingGuBlocks && 4 * (32 / Fmt<2>::ip
 
 // Down, 576 -> 2304, grouped: 8 warps x RW rows per CTA, every window column of the CTA's expert, partials
 // part[j][2304]; inkling_down_combine_kernel then adds a token's eight picks to fo as inkling_down_sum_kernel does.
-template<int TY, int RW>
+template<int TY, int RW, int NC = kGroupCols>
 __global__ void __launch_bounds__(256) inkling_down_window_kernel(MmvqIds ids, const int32_t* __restrict__ g, float* part) {
     using F = Fmt<TY>;
     using S = Split<TY>;
     constexpr int blocks = 576 / 32, calls = blocks * F::ipb, per = blocks * sizeof(block_q8_1) / 4;
     constexpr int rb = blocks * (TY == 2 ? sizeof(block_q4_0) : sizeof(block_q4_1));
-    __shared__ int s_x[kGroupCols * per];
+    __shared__ int s_x[NC * per];
     if (int(blockIdx.y) >= g[0]) return;
     const int* gu = g + 1 + int(blockIdx.y) * kGroupStride;
     const int n = gu[1], lane = threadIdx.x;
-    const uint8_t* src[kGroupCols];
+    const uint8_t* src[NC];
 #pragma unroll
-    for (int c = 0; c < kGroupCols; ++c)
+    for (int c = 0; c < NC; ++c)
         src[c] = static_cast<const uint8_t*>(ids.x) + std::size_t(gu[2 + (c < n ? c : 0)]) * ids.x_stride;
     stage_q8_1_words(s_x, src, n, per, int(threadIdx.x) + int(threadIdx.y) * 32, 256);
     __syncthreads();
     const auto* x = reinterpret_cast<const block_q8_1*>(s_x);
     const int first = int(blockIdx.x) * 8 * RW + int(threadIdx.y) * RW;
     const auto* w = static_cast<const uint8_t*>(ids.table[gu[0]]) + ids.offset;
-    float s[RW][kGroupCols] = {};
+    float s[RW][NC] = {};
 #pragma unroll
     for (int i = 0; i < 2; ++i) {   // row_dot's k = lane, lane + 32 (36 calls)
         const int k = lane + 32 * i;
@@ -3821,12 +3855,12 @@ __global__ void __launch_bounds__(256) inkling_down_window_kernel(MmvqIds ids, c
 #pragma unroll
             for (int r = 0; r < RW; ++r)
 #pragma unroll
-                for (int c = 0; c < kGroupCols; ++c)
+                for (int c = 0; c < NC; ++c)
                     if (c < n) s[r][c] += S::apply(wr[r], x + c * blocks + kbx * (F::qk / 32), iqs);
         }
     }
 #pragma unroll
-    for (int c = 0; c < kGroupCols; ++c) {
+    for (int c = 0; c < NC; ++c) {
         if (c >= n) break;
 #pragma unroll
         for (int r = 0; r < RW; ++r) {
@@ -3904,6 +3938,16 @@ bool inkling_gu_q4_0_r4(int t, const MmvqIds& ids, int count, int n_in, int n_ou
     return true;
 }
 
+bool inkling_moe_mult_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_INKLING_MOE_MULT");
+        const bool v = e && e[0] == '1' && e[1] == '\0';
+        if (v) std::fputs("strata-poly: STRATA_INKLING_MOE_MULT=1: heavy-first NC-specialized grouped window MoE\n", stderr);
+        return v;
+    }();
+    return on;
+}
+
 bool inkling_gu_window(int t, const MmvqIds& gu, int n, int32_t* group, void* stream) {
     const auto st = (cudaStream_t)stream;
     const int rr = n * kInklingGuPicks;
@@ -3911,15 +3955,42 @@ bool inkling_gu_window(int t, const MmvqIds& gu, int n, int32_t* group, void* st
         gu.x_every != kInklingGuPicks || gu.x_stride != kInklingGuBlocks * sizeof(block_q8_1) ||
         gu.y_stride != kInklingGuOut || !group)
         return false;
-    inkling_moe_group_kernel<<<1, kGroupMaxPicks, 0, st>>>(gu.ids, rr, group);
+    const bool mult = inkling_moe_mult_enabled();
+    if (mult) inkling_moe_group_heavy_kernel<<<1, kGroupMaxPicks, 0, st>>>(gu.ids, rr, group);
+    else inkling_moe_group_kernel<<<1, kGroupMaxPicks, 0, st>>>(gu.ids, rr, group);
     check("Inkling window expert groups");
     const size_t col_bytes = kInklingGuBlocks * sizeof(block_q8_1);
-    if (n == 2)
+    if (mult) {
+        const dim3 grid(kInklingGuOut / 32, rr), block(32, 16);
+        switch (n) {
+        case 2: inkling_gu_q4_0_window_kernel<2, 16, true, 2><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+        case 3: inkling_gu_q4_0_window_kernel<2, 16, true, 3><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+        case 4: inkling_gu_q4_0_window_kernel<2, 16, true, 4><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+        case 5: inkling_gu_q4_0_window_kernel<2, 16, true, 5><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+        case 6: inkling_gu_q4_0_window_kernel<2, 16, true, 6><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+        case 7: inkling_gu_q4_0_window_kernel<2, 16, true, 7><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+        case 8: inkling_gu_q4_0_window_kernel<2, 16, true, 8><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+        }
+    } else if (n == 2)
         inkling_gu_q4_0_window_kernel<4, 4, false><<<dim3(kInklingGuOut / 16, rr), dim3(32, 4), col_bytes, st>>>(gu, group);
     else
         inkling_gu_q4_0_window_kernel<2, 16, true><<<dim3(kInklingGuOut / 32, rr), dim3(32, 16), n * col_bytes, st>>>(gu, group);
     check("Inkling window gate/up");
     return true;
+}
+
+template<int TY>
+void launch_down_window_mult(const MmvqIds& down, int n, const int32_t* group, float* part, cudaStream_t st) {
+    const dim3 grid(2304 / 16, n * 8), block(32, 8);
+    switch (n) {
+    case 2: inkling_down_window_kernel<TY, 2, 2><<<grid, block, 0, st>>>(down, group, part); break;
+    case 3: inkling_down_window_kernel<TY, 2, 3><<<grid, block, 0, st>>>(down, group, part); break;
+    case 4: inkling_down_window_kernel<TY, 2, 4><<<grid, block, 0, st>>>(down, group, part); break;
+    case 5: inkling_down_window_kernel<TY, 2, 5><<<grid, block, 0, st>>>(down, group, part); break;
+    case 6: inkling_down_window_kernel<TY, 2, 6><<<grid, block, 0, st>>>(down, group, part); break;
+    case 7: inkling_down_window_kernel<TY, 2, 7><<<grid, block, 0, st>>>(down, group, part); break;
+    case 8: inkling_down_window_kernel<TY, 2, 8><<<grid, block, 0, st>>>(down, group, part); break;
+    }
 }
 
 bool inkling_down_window(int t, const MmvqIds& down, int n, const float* weights, float* fo, float* part,
@@ -3936,8 +4007,13 @@ bool inkling_down_window(int t, const MmvqIds& down, int n, const float* weights
     }
     if (!part || !group) return false;
     const int rr = n * 8;
-    if (t == 2) inkling_down_window_kernel<2, 2><<<dim3(2304 / 16, rr), dim3(32, 8), 0, st>>>(down, group, part);
-    else inkling_down_window_kernel<3, 2><<<dim3(2304 / 16, rr), dim3(32, 8), 0, st>>>(down, group, part);
+    if (inkling_moe_mult_enabled()) {
+        if (t == 2) launch_down_window_mult<2>(down, n, group, part, st);
+        else launch_down_window_mult<3>(down, n, group, part, st);
+    } else {
+        if (t == 2) inkling_down_window_kernel<2, 2><<<dim3(2304 / 16, rr), dim3(32, 8), 0, st>>>(down, group, part);
+        else inkling_down_window_kernel<3, 2><<<dim3(2304 / 16, rr), dim3(32, 8), 0, st>>>(down, group, part);
+    }
     check("Inkling window down");
     inkling_down_combine_kernel<<<dim3(2304 / 256, n), 256, 0, st>>>(part, weights, fo);
     check("Inkling window down combine");
