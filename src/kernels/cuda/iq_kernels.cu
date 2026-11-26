@@ -3925,7 +3925,240 @@ __global__ void __launch_bounds__(256) inkling_down_sum_lds_kernel(MmvqIds ids, 
         fo[out] = sum;
     }
 }
+struct Q40Hoist {
+    int lo0, hi0, lo1, hi1;
+    float d;
+};
+
+__device__ __forceinline__ Q40Hoist load_q40_u8(const block_q4_0* __restrict__ b, int iqs) {
+    int v[2];
+    __builtin_memcpy(v, reinterpret_cast<const uint8_t*>(b->qs) + 4 * iqs, 8);
+    Q40Hoist r;
+    r.lo0 = q4_0_centred((v[0] >> 0) & 0x0F0F0F0F);
+    r.hi0 = q4_0_centred((v[0] >> 4) & 0x0F0F0F0F);
+    r.lo1 = q4_0_centred((v[1] >> 0) & 0x0F0F0F0F);
+    r.hi1 = q4_0_centred((v[1] >> 4) & 0x0F0F0F0F);
+    r.d = __half2float(b->d);
+    return r;
+}
+
+__global__ void __launch_bounds__(128) inkling_gu_q4_0_r4_hoist_kernel(MmvqIds ids) {
+    using F = Fmt<2>;
+    const int lane = threadIdx.x;
+    const int first = (int(blockIdx.x) * kInklingGuWarps + int(threadIdx.y)) * kInklingGuTile;
+    const SlotPtrs at = slot_ptrs(ids, int(blockIdx.y));
+    const auto* w = static_cast<const block_q4_0*>(at.w) + first * kInklingGuBlocks;
+    const auto* x = static_cast<const block_q8_1*>(at.x);
+    const int iqs = F::step * (lane % F::ipb);
+    float sum[kInklingGuTile] = {};
+    for (int k = lane / F::ipb; k < kInklingGuBlocks; k += 32 / F::ipb) {
+        const block_q8_1* xb = x + k;
+        const int u0 = get_int_b4(xb->qs, iqs + 0);
+        const int u4 = get_int_b4(xb->qs, iqs + 4);
+        const int u1 = get_int_b4(xb->qs, iqs + 1);
+        const int u5 = get_int_b4(xb->qs, iqs + 5);
+        const float dx = __low2float(xb->ds);
+#pragma unroll
+        for (int r = 0; r < kInklingGuTile; ++r) {
+            const Q40Hoist wr = load_q40_u8(w + r * kInklingGuBlocks + k, iqs);
+            int sumi = ggml_cuda_dp4a(wr.lo0, u0, 0);
+            sumi = ggml_cuda_dp4a(wr.hi0, u4, sumi);
+            sumi = ggml_cuda_dp4a(wr.lo1, u1, sumi);
+            sumi = ggml_cuda_dp4a(wr.hi1, u5, sumi);
+            sum[r] += wr.d * dx * sumi;
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < kInklingGuTile; ++r) {
+        const float y = warp_sum(sum[r]);
+        if (lane == 0) at.y[first + r] = y;
+    }
+}
+
+template<int TILE, int WARPS, int NC>
+__global__ void __launch_bounds__(32 * WARPS) inkling_gu_q4_0_window_hoist_kernel(MmvqIds ids, const int32_t* __restrict__ g) {
+    using F = Fmt<2>;
+    extern __shared__ int4 s_x[];
+    if (int(blockIdx.y) >= g[0]) return;
+    const int* gu = g + 1 + int(blockIdx.y) * kGroupStride;
+    const int n = gu[1], e = gu[0];
+    int col[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c) col[c] = gu[2 + (c < n ? c : 0)];
+    const uint8_t* src[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        src[c] = static_cast<const uint8_t*>(ids.x) + std::size_t(col[c] / ids.x_every) * ids.x_stride;
+    constexpr int per = kInklingGuBlocks * sizeof(block_q8_1) / 16;
+    stage_q8_1(s_x, src, n, per, int(threadIdx.x) + int(threadIdx.y) * 32, 32 * WARPS);
+    __syncthreads();
+    const auto* x = reinterpret_cast<const block_q8_1*>(s_x);
+    const int lane = threadIdx.x;
+    const int first = (int(blockIdx.x) * WARPS + int(threadIdx.y)) * TILE;
+    const auto* w = reinterpret_cast<const block_q4_0*>(static_cast<const uint8_t*>(ids.table[e]) + ids.offset) +
+                    first * kInklingGuBlocks;
+    const int iqs = F::step * (lane % F::ipb);
+    float sum[TILE][NC] = {};
+#pragma unroll
+    for (int i = 0; i < 5; ++i) {
+        const int k = lane / F::ipb + (32 / F::ipb) * i;
+        if (i < 4 || k < kInklingGuBlocks) {
+            Q40Hoist wr[TILE];
+#pragma unroll
+            for (int r = 0; r < TILE; ++r) wr[r] = load_q40_u8(w + r * kInklingGuBlocks + k, iqs);
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                if (c >= n) break;
+                const block_q8_1* xb = x + c * kInklingGuBlocks + k;
+                const int u0 = get_int_b4(xb->qs, iqs + 0);
+                const int u4 = get_int_b4(xb->qs, iqs + 4);
+                const int u1 = get_int_b4(xb->qs, iqs + 1);
+                const int u5 = get_int_b4(xb->qs, iqs + 5);
+                const float dx = __low2float(xb->ds);
+#pragma unroll
+                for (int r = 0; r < TILE; ++r) {
+                    int sumi = ggml_cuda_dp4a(wr[r].lo0, u0, 0);
+                    sumi = ggml_cuda_dp4a(wr[r].hi0, u4, sumi);
+                    sumi = ggml_cuda_dp4a(wr[r].lo1, u1, sumi);
+                    sumi = ggml_cuda_dp4a(wr[r].hi1, u5, sumi);
+                    sum[r][c] += wr[r].d * dx * sumi;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (c >= n) break;
+        float* y = ids.y + std::size_t(col[c]) * ids.y_stride + first;
+#pragma unroll
+        for (int r = 0; r < TILE; ++r) {
+            const float v = warp_sum(sum[r][c]);
+            if (lane == 0) y[r] = v;
+        }
+    }
+}
+
+template<int RW, int NC>
+__global__ void __launch_bounds__(256) inkling_down_q4_0_window_hoist_kernel(MmvqIds ids, const int32_t* __restrict__ g, float* part) {
+    using F = Fmt<2>;
+    constexpr int blocks = 576 / 32, calls = blocks * F::ipb, per = blocks * sizeof(block_q8_1) / 4;
+    __shared__ int s_x[NC * per];
+    if (int(blockIdx.y) >= g[0]) return;
+    const int* gu = g + 1 + int(blockIdx.y) * kGroupStride;
+    const int n = gu[1], lane = threadIdx.x;
+    const uint8_t* src[NC];
+#pragma unroll
+    for (int c = 0; c < NC; ++c)
+        src[c] = static_cast<const uint8_t*>(ids.x) + std::size_t(gu[2 + (c < n ? c : 0)]) * ids.x_stride;
+    stage_q8_1_words(s_x, src, n, per, int(threadIdx.x) + int(threadIdx.y) * 32, 256);
+    __syncthreads();
+    const auto* x = reinterpret_cast<const block_q8_1*>(s_x);
+    const int first = int(blockIdx.x) * 8 * RW + int(threadIdx.y) * RW;
+    const auto* w = reinterpret_cast<const block_q4_0*>(static_cast<const uint8_t*>(ids.table[gu[0]]) + ids.offset) +
+                    std::size_t(first) * blocks;
+    float s[RW][NC] = {};
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int k = lane + 32 * i;
+        if (i == 0 || k < calls) {
+            const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+            Q40Hoist wr[RW];
+#pragma unroll
+            for (int r = 0; r < RW; ++r) wr[r] = load_q40_u8(w + std::size_t(r) * blocks + kbx, iqs);
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+                if (c >= n) break;
+                const block_q8_1* xb = x + c * blocks + kbx;
+                const int u0 = get_int_b4(xb->qs, iqs + 0);
+                const int u4 = get_int_b4(xb->qs, iqs + 4);
+                const int u1 = get_int_b4(xb->qs, iqs + 1);
+                const int u5 = get_int_b4(xb->qs, iqs + 5);
+                const float dx = __low2float(xb->ds);
+#pragma unroll
+                for (int r = 0; r < RW; ++r) {
+                    int sumi = ggml_cuda_dp4a(wr[r].lo0, u0, 0);
+                    sumi = ggml_cuda_dp4a(wr[r].hi0, u4, sumi);
+                    sumi = ggml_cuda_dp4a(wr[r].lo1, u1, sumi);
+                    sumi = ggml_cuda_dp4a(wr[r].hi1, u5, sumi);
+                    s[r][c] += wr[r].d * dx * sumi;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int c = 0; c < NC; ++c) {
+        if (c >= n) break;
+#pragma unroll
+        for (int r = 0; r < RW; ++r) {
+            const float v = warp_sum(s[r][c]);
+            if (lane == 0) part[std::size_t(gu[2 + c]) * 2304 + first + r] = v;
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256) inkling_down_sum_lds_q4_0_hoist_kernel(MmvqIds ids, const float* weights, float* fo) {
+    using F = Fmt<2>;
+    constexpr int rows = 4, blocks = 576 / 32, calls = blocks * F::ipb, per = blocks * sizeof(block_q8_1) / 4;
+    const int t = blockIdx.y, first = blockIdx.x * rows, pick = threadIdx.y, lane = threadIdx.x;
+    const int j = t * 8 + pick;
+    __shared__ int s_x[8 * per];
+    __shared__ float down[8][rows];
+    {
+        const int* src = reinterpret_cast<const int*>(static_cast<const uint8_t*>(ids.x) + std::size_t(t * 8) * ids.x_stride);
+        for (int i = int(threadIdx.x) + int(threadIdx.y) * 32; i < 8 * per; i += 256) s_x[i] = src[i];
+    }
+    __syncthreads();
+    const auto* x = reinterpret_cast<const block_q8_1*>(s_x) + pick * blocks;
+    const auto* w = reinterpret_cast<const block_q4_0*>(static_cast<const uint8_t*>(ids.table[ids.ids[j]]) + ids.offset) +
+                    std::size_t(first) * blocks;
+    float s[rows] = {};
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const int k = lane + 32 * i;
+        if (i == 0 || k < calls) {
+            const int kbx = k / F::ipb, iqs = F::step * (k % F::ipb);
+            const block_q8_1* xb = x + kbx;
+            const int u0 = get_int_b4(xb->qs, iqs + 0);
+            const int u4 = get_int_b4(xb->qs, iqs + 4);
+            const int u1 = get_int_b4(xb->qs, iqs + 1);
+            const int u5 = get_int_b4(xb->qs, iqs + 5);
+            const float dx = __low2float(xb->ds);
+#pragma unroll
+            for (int r = 0; r < rows; ++r) {
+                const Q40Hoist wr = load_q40_u8(w + std::size_t(r) * blocks + kbx, iqs);
+                int sumi = ggml_cuda_dp4a(wr.lo0, u0, 0);
+                sumi = ggml_cuda_dp4a(wr.hi0, u4, sumi);
+                sumi = ggml_cuda_dp4a(wr.lo1, u1, sumi);
+                sumi = ggml_cuda_dp4a(wr.hi1, u5, sumi);
+                s[r] += wr.d * dx * sumi;
+            }
+        }
+    }
+#pragma unroll
+    for (int r = 0; r < rows; ++r) {
+        const float y = warp_sum(s[r]);
+        if (!lane) down[pick][r] = y;
+    }
+    __syncthreads();
+    if (pick == 0 && lane < rows) {
+        const int out = t * 2304 + first + lane;
+        float sum = fo[out];
+#pragma unroll
+        for (int k = 0; k < 8; ++k) sum = sum + down[k][lane] * weights[t * 8 + k];
+        fo[out] = sum;
+    }
+}
 }  // namespace
+
+bool inkling_moe_q4_hoist_enabled() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_INKLING_MOE_Q4_HOIST");
+        const bool v = e && e[0] == '1' && e[1] == '\0';
+        if (v) std::fputs("strata-poly: STRATA_INKLING_MOE_Q4_HOIST=1: 8B Q4_0 load and hoisted LDS x/ds in MoE experts\n", stderr);
+        return v;
+    }();
+    return on;
+}
 
 bool inkling_gu_q4_0_r4(int t, const MmvqIds& ids, int count, int n_in, int n_out, void* stream) {
     if (t != 2 || count != kInklingGuPicks || n_in != kInklingGuIn || n_out != kInklingGuOut ||
@@ -3933,7 +4166,10 @@ bool inkling_gu_q4_0_r4(int t, const MmvqIds& ids, int count, int n_in, int n_ou
         ids.x_stride != kInklingGuBlocks * sizeof(block_q8_1) || ids.y_stride != kInklingGuOut)
         return false;
     const dim3 grid(kInklingGuOut / (kInklingGuTile * kInklingGuWarps), count), block(32, kInklingGuWarps);
-    inkling_gu_q4_0_r4_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(ids);
+    if (inkling_moe_q4_hoist_enabled())
+        inkling_gu_q4_0_r4_hoist_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(ids);
+    else
+        inkling_gu_q4_0_r4_kernel<<<grid, block, 0, (cudaStream_t)stream>>>(ids);
     check("Inkling routed Q4_0 gate/up R4");
     return true;
 }
@@ -3962,14 +4198,26 @@ bool inkling_gu_window(int t, const MmvqIds& gu, int n, int32_t* group, void* st
     const size_t col_bytes = kInklingGuBlocks * sizeof(block_q8_1);
     if (mult) {
         const dim3 grid(kInklingGuOut / 32, rr), block(32, 16);
-        switch (n) {
-        case 2: inkling_gu_q4_0_window_kernel<2, 16, true, 2><<<grid, block, n * col_bytes, st>>>(gu, group); break;
-        case 3: inkling_gu_q4_0_window_kernel<2, 16, true, 3><<<grid, block, n * col_bytes, st>>>(gu, group); break;
-        case 4: inkling_gu_q4_0_window_kernel<2, 16, true, 4><<<grid, block, n * col_bytes, st>>>(gu, group); break;
-        case 5: inkling_gu_q4_0_window_kernel<2, 16, true, 5><<<grid, block, n * col_bytes, st>>>(gu, group); break;
-        case 6: inkling_gu_q4_0_window_kernel<2, 16, true, 6><<<grid, block, n * col_bytes, st>>>(gu, group); break;
-        case 7: inkling_gu_q4_0_window_kernel<2, 16, true, 7><<<grid, block, n * col_bytes, st>>>(gu, group); break;
-        case 8: inkling_gu_q4_0_window_kernel<2, 16, true, 8><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+        if (inkling_moe_q4_hoist_enabled()) {
+            switch (n) {
+            case 2: inkling_gu_q4_0_window_hoist_kernel<2, 16, 2><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+            case 3: inkling_gu_q4_0_window_hoist_kernel<2, 16, 3><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+            case 4: inkling_gu_q4_0_window_hoist_kernel<2, 16, 4><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+            case 5: inkling_gu_q4_0_window_hoist_kernel<2, 16, 5><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+            case 6: inkling_gu_q4_0_window_hoist_kernel<2, 16, 6><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+            case 7: inkling_gu_q4_0_window_hoist_kernel<2, 16, 7><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+            case 8: inkling_gu_q4_0_window_hoist_kernel<2, 16, 8><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+            }
+        } else {
+            switch (n) {
+            case 2: inkling_gu_q4_0_window_kernel<2, 16, true, 2><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+            case 3: inkling_gu_q4_0_window_kernel<2, 16, true, 3><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+            case 4: inkling_gu_q4_0_window_kernel<2, 16, true, 4><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+            case 5: inkling_gu_q4_0_window_kernel<2, 16, true, 5><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+            case 6: inkling_gu_q4_0_window_kernel<2, 16, true, 6><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+            case 7: inkling_gu_q4_0_window_kernel<2, 16, true, 7><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+            case 8: inkling_gu_q4_0_window_kernel<2, 16, true, 8><<<grid, block, n * col_bytes, st>>>(gu, group); break;
+            }
         }
     } else if (n == 2)
         inkling_gu_q4_0_window_kernel<4, 4, false><<<dim3(kInklingGuOut / 16, rr), dim3(32, 4), col_bytes, st>>>(gu, group);
@@ -3982,6 +4230,20 @@ bool inkling_gu_window(int t, const MmvqIds& gu, int n, int32_t* group, void* st
 template<int TY>
 void launch_down_window_mult(const MmvqIds& down, int n, const int32_t* group, float* part, cudaStream_t st) {
     const dim3 grid(2304 / 16, n * 8), block(32, 8);
+    if constexpr (TY == 2) {
+        if (inkling_moe_q4_hoist_enabled()) {
+            switch (n) {
+            case 2: inkling_down_q4_0_window_hoist_kernel<2, 2><<<grid, block, 0, st>>>(down, group, part); break;
+            case 3: inkling_down_q4_0_window_hoist_kernel<2, 3><<<grid, block, 0, st>>>(down, group, part); break;
+            case 4: inkling_down_q4_0_window_hoist_kernel<2, 4><<<grid, block, 0, st>>>(down, group, part); break;
+            case 5: inkling_down_q4_0_window_hoist_kernel<2, 5><<<grid, block, 0, st>>>(down, group, part); break;
+            case 6: inkling_down_q4_0_window_hoist_kernel<2, 6><<<grid, block, 0, st>>>(down, group, part); break;
+            case 7: inkling_down_q4_0_window_hoist_kernel<2, 7><<<grid, block, 0, st>>>(down, group, part); break;
+            case 8: inkling_down_q4_0_window_hoist_kernel<2, 8><<<grid, block, 0, st>>>(down, group, part); break;
+            }
+            return;
+        }
+    }
     switch (n) {
     case 2: inkling_down_window_kernel<TY, 2, 2><<<grid, block, 0, st>>>(down, group, part); break;
     case 3: inkling_down_window_kernel<TY, 2, 3><<<grid, block, 0, st>>>(down, group, part); break;
@@ -4000,8 +4262,12 @@ bool inkling_down_window(int t, const MmvqIds& down, int n, const float* weights
         down.x_every != 1 || down.x_stride != 18 * sizeof(block_q8_1))
         return false;
     if (n == 1) {
-        if (t == 2) inkling_down_sum_lds_kernel<2><<<dim3(2304 / 4, 1), dim3(32, 8), 0, st>>>(down, weights, fo);
-        else inkling_down_sum_lds_kernel<3><<<dim3(2304 / 4, 1), dim3(32, 8), 0, st>>>(down, weights, fo);
+        if (t == 2) {
+            if (inkling_moe_q4_hoist_enabled())
+                inkling_down_sum_lds_q4_0_hoist_kernel<<<dim3(2304 / 4, 1), dim3(32, 8), 0, st>>>(down, weights, fo);
+            else
+                inkling_down_sum_lds_kernel<2><<<dim3(2304 / 4, 1), dim3(32, 8), 0, st>>>(down, weights, fo);
+        } else inkling_down_sum_lds_kernel<3><<<dim3(2304 / 4, 1), dim3(32, 8), 0, st>>>(down, weights, fo);
         check("Inkling down sum (LDS)");
         return true;
     }
