@@ -53,6 +53,32 @@ Porting the latest Inkling execution improvements to Qwen, and integrating
 [Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2), are active research
 directions. Qwen DFlash2 is not yet a qualified native feature of this fork.
 
+## Model weights used
+
+Most kernel development and performance qualification in this fork uses **bartowski's GGUF quantizations**,
+primarily Q4_0. The exact target and drafter variants matter when reproducing the results below.
+
+- **Inkling-2-Mini target:** [bartowski/Inkling-2-Mini-GGUF](https://huggingface.co/bartowski/Inkling-2-Mini-GGUF),
+  [`Inkling-2-Mini-Q4_0.gguf`](https://huggingface.co/bartowski/Inkling-2-Mini-GGUF/blob/ad66863fd3b7f3236c0b7a0862412c9e00f78a6e/Inkling-2-Mini-Q4_0.gguf)
+  (15,064,977,088 bytes). This is the target used for the Inkling V8 results: 45 Q4_0 and 3 Q4_1 routed-expert
+  tensors, with no NVFP4 routed-expert tensors.
+- **Inkling DFlash2 drafter:** [incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2),
+  locally converted to `dflash2-Inkling-2-Mini-Q4_0-mixed.gguf` (approximately 434 MiB).
+  The mixed format uses a Q4_0 trunk, Q8_0 for selected sensitive projections, and F16 selector codebooks.
+  The reported V8 measurements use this drafter, not the earlier DSpark or Q8_0 DFlash2 baselines.
+- **Qwen3.8-Flash-Next base weights:** [bartowski/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/bartowski/Qwen3.8-Flash-Next-GGUF),
+  specifically the [Q4_0 split GGUF](https://huggingface.co/bartowski/Qwen3.8-Flash-Next-GGUF/tree/db3a185731e162be9ffa4d52d20d7509939e60e8/Qwen3.8-Flash-Next-Q4_0).
+  Earlier gfx906 development also used bartowski's Q4_1 quantization.
+- **Qwen B3 benchmark target:** `orcarouter-Qwen3.8-Flash-Next-B3-Abliterated-Q4_0`, a locally prepared
+  derivative of the above bartowski Q4_0 base. It incorporates projected weights, 192 restored BF16
+  hyper-connection tensors and an IQ4_NL N-gram/PLE table. The historical Qwen results below use this
+  standalone B3 variant with a separate shared-Q8_0 MTP drafter; they are not measurements of the
+  unmodified bartowski download.
+
+The links identify the original weight sources, not a public download of the exact locally prepared B3 or
+mixed DFlash2 files. Qwen DFlash2 remains a research target. Earlier Unsloth and other quantization experiments
+are historical baselines, not the models behind the headline measurements.
+
 ## Measured performance
 
 All numbers below refer to specific measured configurations of the four-GPU reference system,
