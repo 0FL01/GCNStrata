@@ -4250,6 +4250,27 @@ bool native_inkling_q4_0_segments_cols(const MmvqSegments& s, int n_in, int ncol
     launch_check();
     return true;
 }
+
+bool native_gdn_segments(int ggml_type, const void* weights, const void* x_q8_1, float* y,
+                         int n_in, int n_out, int ncols, void* stream) {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_GDN_SEG");
+        return e && e[0] == '1' && !e[1];
+    }();
+    if (!on || ggml_type != 2 /* Q4_0 */ || ncols < 2) return false;
+    // B3 shapes and measured winning widths only. Q8_0 out is left to its existing dispatch.
+    const bool qkv_or_z = n_in == 2560 && (n_out == 10240 || n_out == 6144) && ncols <= 5;
+    const bool out = n_in == 6144 && n_out == 2560 && ncols <= 3;
+    if (!qkv_or_z && !out) return false;
+    // The kernel launcher passes the descriptor by value; nothing to allocate or upload at capture time.
+    MmvqSegments seg{};
+    seg.count = 1;
+    seg.w[0] = weights;
+    seg.x[0] = x_q8_1;
+    seg.y[0] = y;
+    seg.rows[0] = n_out;
+    return native_inkling_q4_0_segments_cols(seg, n_in, ncols, stream);
+}
 #endif
 bool native_q6_k_mmvq_warps(const void*, const void*, float*, int, int, void*) { return false; }
 bool native_q6_k_mmvq_warps_cols(const void*, const void*, float*, int, int, int, void*) { return false; }

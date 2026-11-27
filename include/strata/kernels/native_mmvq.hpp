@@ -265,6 +265,10 @@ bool native_inkling_q4_0_segments(const MmvqSegments& s, int n_in, void* stream)
 // Multi-row (2..8 columns) Inkling TP2 Q4_0 segments (1..3 matrices sharing one Q8_1 input, e.g. [Q,] gate, rel or o).
 // Bitwise equal per column to the T1 wave64 R4 kernel: same lane-to-block map, FMA order and 64-lane xor butterfly.
 bool native_inkling_q4_0_segments_cols(const MmvqSegments& s, int n_in, int ncols, void* stream);
+// Qwen GDN verify only: opt-in LDS path over the existing Q4_0 blocks and packed Q8_1 columns.
+// False means no launch; keep the caller's usual projection path in that case.
+bool native_gdn_segments(int ggml_type, const void* weights, const void* x_q8_1, float* y,
+                         int n_in, int n_out, int ncols, void* stream);
 #endif
 bool native_q6_k_mmvq_warps(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, void* stream);
 bool native_q6_k_mmvq_warps_cols(const void* weights, const void* x_q8_1, float* y, int n_in, int n_out, int ncols,

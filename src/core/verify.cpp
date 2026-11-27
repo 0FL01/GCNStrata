@@ -1370,6 +1370,19 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 if (!native_of(wqkv, v.name("attn_qkv.weight"), err) || !native_of(wg, v.name("attn_gate.weight"), err) ||
                     !native_of(wout, v.name("ssm_out.weight"), err))
                     return false;
+                // Use the same packed Q8_1 columns in xq_, on the projection's original stream (and event edges).
+                auto gdn_seg = [&](const WeightRef* w, float* out, int n_in, int n_out, cudaStream_t s) {
+#if defined(STRATA_HIP_GFX906)
+                    return native_gdn_segments(w->native_type, w->native_data, xq_, out, n_in, n_out, n, s);
+#else
+                    (void) w; (void) out; (void) n_in; (void) n_out; (void) s;
+                    return false;
+#endif
+                };
+                auto gdn_mm = [&](const WeightRef* w, float* out, int n_in, int n_out) {
+                    if (!gdn_seg(w, out, n_in, n_out, cs)) mm(w, out, n_in, n_out);
+                };
+                float* z = z_ + (size_t) tb * ZV;
                 const int64_t gi = gdn_idx[(size_t) l];
                 float* state = ss.gdn_state + (size_t) (gi - ss.gdn_ord0) * gdn_floats;
                 float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
@@ -1395,10 +1408,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         il_ready = true;
                     }
                     if (!branch(pfork_, cs, side2_, "fork")) return false;
-                    mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
-                    if (g_il) strata::kernels::native_mmvq_il(wg->native_type, wg->native_data, xq_, xil_, z_ + (size_t) tb * ZV,
-                                                              (int) N, (int) ZV, n, side2_);
-                    else native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, side2_);
+                    gdn_mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);
+                    if (!gdn_seg(wg, z, (int) N, (int) ZV, side2_)) {
+                        if (g_il) strata::kernels::native_mmvq_il(wg->native_type, wg->native_data, xq_, xil_, z,
+                                                                  (int) N, (int) ZV, n, side2_);
+                        else native_mmvq(wg->native_type, wg->native_data, xq_, z, (int) N, (int) ZV, n, side2_);
+                    }
                     if (cudaEventRecord(pjoin_, side2_) != cudaSuccess) { err = "verify: the gate projection's branch could not join"; return false; }
                 }
                 if (br) {   // STRATA_DF_BRANCH: a/b and z beside q/k/v and the conv; all of them read only this layer's input
@@ -1407,11 +1422,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                  (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
                                  (int) HV, n, df_side_[0]);
                     fork(1);
-                    native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n,
-                                df_side_[1]);
+                    if (!gdn_seg(wg, z, (int) N, (int) ZV, df_side_[1]))
+                        native_mmvq(wg->native_type, wg->native_data, xq_, z, (int) N, (int) ZV, n, df_side_[1]);
                 }
                 const bool fuse_ab = fuse_convab_on() && !br && !batch_rec_ && !prof_on_ && !sidem;   // the side mixer computes the gates on its branch
-                if (!side_proj) mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
+                if (!side_proj) gdn_mm(wqkv, qkv + (size_t) tb * C, (int) N, (int) C);   // with side_proj: above, first
                 stamp(l, 2, grp);
                 if (batch_rec_) {   // contiguous rows may be proposals for the same slot
                     for (int t = tb; t < te;) {
@@ -1444,7 +1459,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                              (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N, (int) HV,
                              n, cs);
                 stamp(l, 4, grp);
-                if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
+                if (!side_proj) gdn_mm(wg, z, (int) N, (int) ZV);
                 stamp(l, 5, grp);
                 if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
                     err = "verify: the gate projection's branch could not join";
@@ -1493,7 +1508,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 // destination (#1139: the out-projection read stale bytes), so that case quantizes here as without it
                 if (!g_qfuse() || batch_rec_) quant_in(y_ + (size_t) tb * ZV, (int) ZV);
                 else il_ready = false;
-                mm(wout, bo_ + tb * N, (int) ZV, (int) N);
+                gdn_mm(wout, bo_ + tb * N, (int) ZV, (int) N);
             } else {
                 // ======================= QSA =======================
                 const int64_t qi = qsa_idx[(size_t) l];

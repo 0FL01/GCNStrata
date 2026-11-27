@@ -93,14 +93,15 @@ __global__ void gdn_conv_commit_kernel(float* __restrict__ hist, const float* __
 
 // FIXN (gfx906 STRATA_GFX906_GDN_AB_FIXED, default on): n at compile time, so the lane's 10 chunks of the row unroll and
 // their loads go out together (the same chunks, FMAs and tree; ab_mb on MI50: T2 14.7 -> 10.9 us, T1 9.6 -> 9.4)
-template <int MAX_T = kVerifyMaxT, bool EXACT_T = false, int FIXN = 0>
+template <int MAX_T = kVerifyMaxT, bool EXACT_T = false, int FIXN = 0, bool PAIR = false>
 __device__ __forceinline__ void gdn_ab_body(const int bx, const float* __restrict__ x, const uint16_t* __restrict__ wa,
                                                           const uint16_t* __restrict__ wb,
                                                           const float* __restrict__ dt,
                                                           const float* __restrict__ ssm_a, float* __restrict__ gate,
                                                           float* __restrict__ beta, int n, int h_v, int T) {
     if constexpr (FIXN > 0) n = FIXN;
-    const int row = bx * 2 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    const int row = PAIR ? bx : bx * 2 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    const int parity = PAIR ? (threadIdx.x >> 5) : 0;
     if (row >= 2 * h_v) return;
     const bool is_beta = row >= h_v;
     const int r = is_beta ? row - h_v : row;
@@ -118,7 +119,9 @@ __device__ __forceinline__ void gdn_ab_body(const int bx, const float* __restric
 #pragma unroll
         for (int t = 0; t < MAX_T; ++t) {
             if (!EXACT_T && t >= T) break;
-            const float* xt = x + (size_t) t * n;
+            const int tok = PAIR ? 2 * t + parity : t;
+            if (PAIR && tok >= T) break;
+            const float* xt = x + (size_t) tok * n;
             const float4 xa = __ldg(reinterpret_cast<const float4*>(xt + j * 8));
             const float4 xb = __ldg(reinterpret_cast<const float4*>(xt + j * 8 + 4));
             float a = acc[t];
@@ -132,19 +135,29 @@ __device__ __forceinline__ void gdn_ab_body(const int bx, const float* __restric
 #pragma unroll
     for (int t = 0; t < MAX_T; ++t) {
         if (!EXACT_T && t >= T) break;
+        const int tok = PAIR ? 2 * t + parity : t;
         float a = acc[t];
 #pragma unroll
         for (int o = 16; o > 0; o >>= 1) a += __shfl_xor_sync(0xffffffffu, a, o);
-        if (lane != 0) continue;
+        if (lane != 0 || (PAIR && tok >= T)) continue;
         if (is_beta) {
-            beta[(size_t) t * h_v + r] = 1.0f / (1.0f + __expf(-a));
+            beta[(size_t) tok * h_v + r] = 1.0f / (1.0f + __expf(-a));
         } else {
             const float v = a + dt[r];
             const float sp = v > 20.0f ? v : log1pf(__expf(v));
-            gate[(size_t) t * h_v + r] = sp * ssm_a[r];
+            gate[(size_t) tok * h_v + r] = sp * ssm_a[r];
         }
     }
 }
+
+#if defined(STRATA_HIP_GFX906)
+// One wave per alpha/beta weight row, independent token streams in its two halves.
+template<int T>
+__global__ void __launch_bounds__(64) gdn_ab_a3_kernel(const float* x, const uint16_t* wa, const uint16_t* wb,
+    const float* dt, const float* ssm_a, float* gate, float* beta, int hv) {
+    gdn_ab_body<(T + 1) / 2, true, 2560, true>(blockIdx.x, x, wa, wb, dt, ssm_a, gate, beta, 2560, hv, T);
+}
+#endif
 
 template <int MAX_T = kVerifyMaxT, bool EXACT_T = false, int FIXN = 0>
 __global__ void __launch_bounds__(64) gdn_ab_multi_kernel(const float* __restrict__ x, const uint16_t* __restrict__ wa,
@@ -1116,6 +1129,20 @@ void gdn_ab_multi(const float* x, const uint16_t* w_alpha, const uint16_t* w_bet
     const unsigned blocks = (unsigned) ((2 * h_v + 1) / 2);
     cudaStream_t st = (cudaStream_t) stream;
 #if defined(STRATA_HIP_GFX906)
+    static const bool a3 = [] {
+        const char* e = std::getenv("STRATA_GDN_A3");
+        return e && e[0] == '1' && !e[1];
+    }();
+    if (a3 && n_embd == 2560 && n_tok >= 2 && n_tok <= kVerifyMaxT) {
+        switch (n_tok) {
+#define STRATA_AB_A3(T) case T: gdn_ab_a3_kernel<T><<<2 * h_v, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, h_v); break;
+        STRATA_AB_A3(2) STRATA_AB_A3(3) STRATA_AB_A3(4) STRATA_AB_A3(5)
+        STRATA_AB_A3(6) STRATA_AB_A3(7) STRATA_AB_A3(8)
+#undef STRATA_AB_A3
+        }
+        check("gdn_ab_multi A3");
+        return;
+    }
     static const bool fixed = [] { const char* e = std::getenv("STRATA_GFX906_GDN_AB_FIXED"); return e == nullptr || std::atoi(e) != 0; }();
     if (fixed && n_embd == 2560 && (n_tok == 1 || n_tok == 2)) {
         if (n_tok == 1) gdn_ab_multi_kernel<1, true, 2560><<<blocks, 64, 0, st>>>(x, w_alpha, w_beta, dt, ssm_a, gate, beta, n_embd, h_v, n_tok);
