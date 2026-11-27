@@ -28,6 +28,11 @@ public:
     void request_budget(int64_t prompt_rows, int64_t max_new) override;
     bool kv_prefix_tags() const override { return mirror_tagging_; }
     void set_kv_prefix_tag(uint64_t tag, int64_t preserved) override;
+    bool kv_canonical_suffix_supported() const override;
+    void arm_canonical_suffix(uint64_t snapshot_id, int64_t valid_hi) override;
+    int64_t canonical_suffix_skip_from(uint64_t snapshot_id, int64_t need) override;
+    void invalidate_canonical_suffix(uint64_t snapshot_id = 0) override;
+    void clear_stage_b_kv_valid() override;
     void on_keep_rows(int64_t end) override;
     LogitShards project_target_shards(const float* h, int rows, bool window) override;
 #endif
@@ -47,6 +52,9 @@ protected:
     void on_loaded() override;
     void on_reset() override;
     void before_state_access() override;
+#if defined(STRATA_HIP_GFX906)
+    void before_state_mutation() override;
+#endif
     bool draft_independent_of_model_stream() const override { return decode_async_keep_ && df_gpu23_; }
     void on_keep_snap(size_t snap_idx) override;
     Dev load_output_matrix(const TensorInfo* t, int64_t file_vocab) override;
@@ -133,6 +141,14 @@ private:
     int swa_stage_rows_ = 0;   // positive only when the stage fits in input_[0]
     inkling::kv_helpers::MirrorPtr kv_helper_;
     bool mirror_tagging_ = false;
+    // Only rank 0 publishes an anchor. Both allocation generations must still match it.
+    struct CanonicalSuffix {
+        uint64_t snapshot_id = 0;
+        int64_t valid_hi = 0, dirty_hi = 0;
+        uint64_t alloc_gen = 0, peer_alloc_gen = 0;
+    } canonical_suffix_;
+    uint64_t alloc_gen_ = 0;
+    bool canonical_suffix_enabled_ = false;
     struct HeadPair;
     std::unique_ptr<HeadPair> head_pair_;
     static std::unique_ptr<HeadPair> init_head_pair(Inkling2& owner, int rows);
@@ -148,6 +164,8 @@ private:
     std::unique_ptr<StageBWorker> stage_b_worker_;
     bool dualtp_sched_v8_ = false, dualtp_2inbox_ = false, dualtp_chunk_v8_ = false;
     bool dualtp_async_df_ = false, dualtp_df_pending_ = false;
+    bool async_mirror_seed_ = false;
+    int64_t seed_frozen_end_ = 0;  // sources below this position cannot be overwritten until join
     struct CutInbox {
         float *depth0 = nullptr, *prelude = nullptr, *bank0 = nullptr, *bank1 = nullptr;
         float *residual = nullptr, *tap0 = nullptr, *tap1 = nullptr;
@@ -178,6 +196,7 @@ private:
     void phase_dualtp_sync_from_b(int64_t final_pos);
     void phase_dualtp_df_kept(int64_t chunk_pos, int m, int first, bool async);
     void phase_dualtp_join_df();
+    void join_mirror_seed();
     bool gpu_route_supported() const;
     bool gpu_decode_supported() const;
     void init_gpu_route(bool decode, bool prefill);

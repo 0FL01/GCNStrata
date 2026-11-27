@@ -45,13 +45,17 @@ public:
     Conversations(E& engine, CacheOptions o)
         : e_(engine), o_(std::move(o)), slots_((size_t) std::max(o_.park_slots, 0) + 1) {
         if constexpr (requires { e_.kv_prefix_tags(); }) prefix_tags_ = e_.kv_prefix_tags();
+        if constexpr (requires { e_.kv_canonical_suffix_supported(); }) {
+            canonical_suffix_ = e_.kv_canonical_suffix_supported();
+            invalidate_suffix();  // snapshot IDs are local to this cache's lifetime
+        }
     }
 
     /// The tokens the engine has read.
     const std::vector<int32_t>& seq() const { return slots_[cur_].seq; }
 
     /// Leaves the engine at the furthest point of `ids` that can be come back to, and returns that position.
-    int64_t resume(const std::vector<int32_t>& ids) {
+    int64_t resume(const std::vector<int32_t>& ids) try {
         const int64_t n = (int64_t) ids.size();
         turn_ = -1;
         size_t best = cur_;
@@ -64,7 +68,8 @@ public:
         if (at == 0) {
             // nothing kept starts like this
             if (!cur().seq.empty() && park(slots_.size())) cur_ = take(cur_);
-            slots_[cur_] = Slot{};
+            forget(cur_);
+            cur_live_hi_ = 0;
             set_prefix(0, 0);
             e_.reset();
         } else if (best != cur_ || at < len(cur())) {
@@ -81,6 +86,10 @@ public:
         }
         cur().stamp = clock_;
         return at;
+    } catch (...) {
+        invalidate_suffix();
+        cur_live_hi_ = 0;
+        throw;
     }
 
     /// One more checkpoint of the prompt resume() took up: where its chat's last turn begins, which the server
@@ -140,7 +149,9 @@ public:
     /// checkpoints take their places.
     void read(const int32_t* t, int64_t n) {
         Slot& s = cur();
+        const int64_t at = len(s);
         s.seq.insert(s.seq.end(), t, t + n);
+        if (canonical_suffix_ && cur_live_hi_ == at) cur_live_hi_ += n;
         if (due_.empty()) return;
         const auto stays = [&](const Checkpoint& m) {
             return m.state && std::find(after_.begin(), after_.end(), m.pos) != after_.end();
@@ -157,12 +168,13 @@ public:
     /// A read was given up part way: what it left in the engine is not the conversation's, and the checkpoints
     /// inside it are not taken.  The conversation goes back to its last checkpoint, which the engine is left
     /// at, or is forgotten when it has none.  Returns where the conversation is then.
-    int64_t rewind() {
+    int64_t rewind() try {
         due_.clear();
         Slot& s = cur();
         set_prefix(0, 0);
         if (s.marks.empty()) {
-            slots_[cur_] = Slot{};
+            forget(cur_);
+            cur_live_hi_ = 0;
             e_.reset();
             return 0;
         }
@@ -171,13 +183,19 @@ public:
         e_.load_state(s.marks.back().state->data(), at);
         set_prefix(s.tag, at);
         return at;
+    } catch (...) {
+        invalidate_suffix();
+        cur_live_hi_ = 0;
+        throw;
     }
     /// The first n tokens of the conversation are the prompt the client sent.
     void prompt_was(int64_t n) { cur().prompt = std::min(n, len(cur())); }
     /// After an engine error: the conversation being read is lost.  The caller resets the engine.
     void drop() {
+        invalidate_suffix();  // after an error, including a failed cross-slot restore
         set_prefix(0, 0);
-        slots_[cur_] = Slot{};
+        forget(cur_);
+        cur_live_hi_ = 0;
         due_.clear();
     }
 
@@ -185,15 +203,19 @@ public:
     /// it holds is parked, as resume() parks it, or forgotten.  adopt() then says what it holds.
     void leave() {
         if (!cur().seq.empty() && park(slots_.size())) cur_ = take(cur_);
-        slots_[cur_] = Slot{};
+        forget(cur_);
+        invalidate_suffix();  // the caller may overwrite the buffers outside load_rows()
+        cur_live_hi_ = 0;
         set_prefix(0, 0);
         due_.clear();
     }
     /// The engine holds `seq` now, with the state at its end: a prompt that goes on from there reads none of it.
     void adopt(std::vector<int32_t> seq) {
+        invalidate_suffix();
+        forget(cur_);
         Slot& s = cur();
-        s = Slot{};
         s.seq = std::move(seq);
+        if (canonical_suffix_) cur_live_hi_ = len(s);
         s.prompt = len(s);
         s.stamp = ++clock_;
         if (prefix_tags_) {
@@ -240,6 +262,8 @@ private:
         std::vector<Rows> rows;         // back to back from row 0; a parked conversation has all of its rows
         uint64_t stamp = 0;
         uint64_t tag = 0;   // a lineage, never copied to a diverging branch or recycled when a slot is evicted
+        uint64_t canon_snap = 0;  // independent of the helper-mirror lineage
+        int64_t canon_snap_hi = 0;
     };
     struct Held {
         size_t count = 0, bytes = 0;
@@ -250,6 +274,22 @@ private:
     void set_prefix(uint64_t tag, int64_t n) {
         if constexpr (requires { e_.set_kv_prefix_tag(tag, n); })
             if (prefix_tags_) e_.set_kv_prefix_tag(tag, n);
+    }
+
+    void invalidate_suffix(uint64_t snapshot = 0) {
+        if constexpr (requires { e_.invalidate_canonical_suffix(snapshot); })
+            if (canonical_suffix_) e_.invalidate_canonical_suffix(snapshot);
+    }
+
+    void retire_suffix(Slot& s) {
+        if (s.canon_snap) invalidate_suffix(s.canon_snap);
+        s.canon_snap = 0;
+        s.canon_snap_hi = 0;
+    }
+
+    void forget(size_t i) {
+        retire_suffix(slots_[i]);
+        slots_[i] = Slot{};
     }
 
     Slot& cur() { return slots_[cur_]; }
@@ -312,7 +352,9 @@ private:
         return drop;
     }
 
-    static void cut(Slot& s, int64_t at) {
+    void cut(Slot& s, int64_t at) {
+        retire_suffix(s);
+        cur_live_hi_ = std::min(cur_live_hi_, at);
         if (at >= len(s)) return;
         s.seq.resize((size_t) at);
         s.prompt = std::min(s.prompt, at);
@@ -355,7 +397,7 @@ private:
                     (out == slots_.size() || slots_[i].stamp < slots_[out].stamp))
                     out = i;
             if (out == slots_.size()) return false;
-            slots_[out] = Slot{};
+            forget(out);
             ++evictions_;
         }
         return extra == 0 || !o_.admit || o_.admit(extra);
@@ -363,11 +405,12 @@ private:
 
     // Copies the rows the current conversation still has only in the engine, up to its last checkpoint; what it
     // read after that cannot be come back to and is dropped.  False: it cannot be kept.
-    bool park(size_t keep) {
+    bool park(size_t keep, bool arm_suffix = true) try {
         Slot& s = cur();
         if (o_.park_mib < 1 || o_.park_slots < 1 || s.marks.empty() || s.marks.back().pos < o_.park_min) return false;
         const Clock::time_point t0 = Clock::now();
         const int64_t end = s.marks.back().pos, from = saved(s);
+        if (canonical_suffix_ && from < end && end > cur_live_hi_) return false;
         cut(s, end);
         const size_t bytes = (size_t) (end - from) * e_.row_bytes();
         const BlobPtr b = from < end && fit(bytes, keep) ? blob(bytes) : nullptr;
@@ -380,8 +423,21 @@ private:
             s.rows.push_back({b, from, end - from, end - from});
         }
         if (!fit(0, keep)) return false;
+        if constexpr (requires { e_.arm_canonical_suffix(s.canon_snap, end); }) {
+            // An earlier cross-slot restore may have loaded only part of the saved prefix.
+            // A host blob beyond that point is not proof that its rows are live.
+            if (canonical_suffix_ && arm_suffix && end > 0 && end <= cur_live_hi_ && last_canon_snap_ != UINT64_MAX) {
+                s.canon_snap = ++last_canon_snap_;
+                s.canon_snap_hi = end;
+                e_.arm_canonical_suffix(s.canon_snap, end);
+            }
+        }
         say("parked", end, t0, cur_);
         return true;
+    } catch (...) {
+        invalidate_suffix();
+        cur_live_hi_ = 0;
+        throw;
     }
 
     // An empty slot other than `keep`.
@@ -392,7 +448,7 @@ private:
             if (slots_[i].seq.empty()) return i;
             if (out == slots_.size() || slots_[i].stamp < slots_[out].stamp) out = i;
         }
-        slots_[out] = Slot{};   // park() left one empty, so this is not reached
+        forget(out);   // park() left one empty, so this is not reached
         ++evictions_;
         return out;
     }
@@ -402,18 +458,28 @@ private:
     void enter(size_t i, int64_t need) {
         const Clock::time_point t0 = Clock::now();
         const Slot& in = slots_[i];
+        const uint64_t snapshot = in.canon_snap;
         int64_t have = 0;
         for (size_t k = 0; k < in.rows.size() && k < cur().rows.size() && in.rows[k].blob == cur().rows[k].blob; ++k) {
             have = in.rows[k].first + std::min(in.rows[k].keep, cur().rows[k].keep);
             if (in.rows[k].keep != cur().rows[k].keep) break;
         }
-        if (cur().seq.empty() || !park(i)) slots_[cur_] = Slot{};
+        if (canonical_suffix_) have = std::min(have, cur_live_hi_);
+        if (cur().seq.empty() || !park(i)) forget(cur_);
         set_prefix(0, 0);
+        if constexpr (requires { e_.clear_stage_b_kv_valid(); }) e_.clear_stage_b_kv_valid();
+        int64_t reload_end = need;
+        if constexpr (requires { e_.canonical_suffix_skip_from(snapshot, need); }) {
+            if (canonical_suffix_ && snapshot && need <= in.canon_snap_hi)
+                reload_end = e_.canonical_suffix_skip_from(snapshot, need);
+        }
+        const int64_t load_end = std::min(need, reload_end);
         for (const Rows& r : in.rows) {
-            const int64_t a = std::max(r.first, have), b = std::min(r.first + r.keep, need);
+            const int64_t a = std::max(r.first, have), b = std::min(r.first + r.keep, load_end);
             if (a < b) e_.load_rows(r.blob->data(), r.first, r.count, a, b - a);
         }
         cur_ = i;
+        if (canonical_suffix_) cur_live_hi_ = need;
         say("restored", need, t0, slots_.size());
     }
 
@@ -421,7 +487,8 @@ private:
     // saved.  False: it cannot be parked.
     bool branch(int64_t at) {
         const size_t from = cur_;
-        if (!park(slots_.size())) return false;
+        retire_suffix(cur());
+        if (!park(slots_.size(), false)) return false;
         const size_t to = take(from);
         const Slot& a = slots_[from];
         Slot b;
@@ -433,6 +500,7 @@ private:
             if (r.first < at) b.rows.push_back({r.blob, r.first, r.count, std::min(r.keep, at - r.first)});
         slots_[to] = std::move(b);
         cur_ = to;
+        cur_live_hi_ = std::min(cur_live_hi_, at);
         return true;
     }
 
@@ -450,6 +518,9 @@ private:
     CacheOptions o_;
     bool prefix_tags_ = false;
     uint64_t last_tag_ = 0;
+    bool canonical_suffix_ = false;
+    uint64_t last_canon_snap_ = 0;
+    int64_t cur_live_hi_ = 0;  // may be shorter than cur().seq between enter() and branch()/cut()
     std::vector<Slot> slots_;   // the current conversation and the parked ones
     size_t cur_ = 0;
     uint64_t clock_ = 0;

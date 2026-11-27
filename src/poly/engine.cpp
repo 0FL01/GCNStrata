@@ -3471,6 +3471,7 @@ void Engine::save_profile() const {
 
 void Engine::reset() {
     before_state_access();
+    before_state_mutation();
     OnCard here(device_, split_);
     ck(cudaMemsetAsync(state_, 0, state_n_ * sizeof(float), cs(st_)), "reset");
     pos_ = 0;
@@ -3519,6 +3520,7 @@ void Engine::save_last(uint8_t* dst) {
 
 void Engine::load_state(const uint8_t* src, int64_t pos) {
     before_state_access();
+    before_state_mutation();
     if (pos < 0 || pos > opt_.max_context) throw std::logic_error("load_state: the position is outside the context");
     OnCard here(device_, split_);
     ck(cudaStreamSynchronize(cs(st_)), "load state");
@@ -3540,6 +3542,7 @@ void Engine::save_rows(int64_t first, int64_t n, uint8_t* dst) {
 
 void Engine::load_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) {
     before_state_access();
+    before_state_mutation();
     OnCard here(device_, split_);
     load_card_rows(src, from, count, first, n);
     if (next_) next_->load_rows(src + (size_t) count * card_row_bytes(), from, count, first, n);

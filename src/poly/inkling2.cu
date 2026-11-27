@@ -17,6 +17,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cassert>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -1948,6 +1949,7 @@ Inkling2::~Inkling2() {
             (void) cudaSetDevice(prev);
         }
     }
+    try { join_mirror_seed(); } catch (...) {}  // drain reads of Stage B's full-KV planes first
     stage_b_.reset();
     destroy_phase_dualtp_handles();
     free_v7r4_bufs();
@@ -2135,6 +2137,8 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
     r0->peer_ = std::move(r1);
 #if defined(STRATA_HIP_GFX906)
     r0->decode_async_keep_ = enabled("STRATA_INKLING_DECODE_ASYNC_KEEP");
+    r0->canonical_suffix_enabled_ = enabled("STRATA_INKLING_FAST_RESTORE_SUFFIX") &&
+                                   !r0->opt_.kv_grow && r0->tp_size_ == 2 && !r0->ds_on() && r0->q8();
 #endif
     r0->start_peer_thread();
 #if defined(STRATA_HIP_GFX906)
@@ -2300,6 +2304,27 @@ void Inkling2::before_state_access() {
     phase_dualtp_join_df();
 #endif
 }
+
+#if defined(STRATA_HIP_GFX906)
+void Inkling2::before_state_mutation() try {
+    join_mirror_seed();
+} catch (...) {
+    invalidate_canonical_suffix();
+    throw;
+}
+
+void Inkling2::join_mirror_seed() {
+    if (!seed_frozen_end_) return;
+    std::exception_ptr error;
+    for (Inkling2* a : {this, peer_.get()}) {
+        if (!a || !a->kv_helper_) continue;
+        try { inkling::kv_helpers::join_seed(*a->kv_helper_); }
+        catch (...) { if (!error) error = std::current_exception(); }
+    }
+    seed_frozen_end_ = 0;
+    if (error) std::rethrow_exception(error);
+}
+#endif
 
 void Inkling2::peer_dispatch(PeerCmd cmd, int n, size_t snap_idx) {
     // Ordinary model and target-head jobs do not consume Stage B's draft tail.
@@ -2475,6 +2500,31 @@ void Inkling2::count_gpu_route(int n) {
 #endif
 
 #if defined(STRATA_HIP_GFX906)
+bool Inkling2::kv_canonical_suffix_supported() const { return canonical_suffix_enabled_; }
+
+void Inkling2::arm_canonical_suffix(uint64_t snapshot_id, int64_t valid_hi) {
+    if (!canonical_suffix_enabled_ || !snapshot_id || valid_hi <= 0 || valid_hi > pos_) return;
+    auto& a = canonical_suffix_;
+    if (!a.snapshot_id || a.alloc_gen != alloc_gen_ || a.peer_alloc_gen != peer_->alloc_gen_ ||
+        valid_hi > a.valid_hi - a.dirty_hi)
+        a = {snapshot_id, valid_hi, 0, alloc_gen_, peer_->alloc_gen_};
+}
+
+int64_t Inkling2::canonical_suffix_skip_from(uint64_t snapshot_id, int64_t need) {
+    const auto& a = canonical_suffix_;
+    if (canonical_suffix_enabled_ && snapshot_id && snapshot_id == a.snapshot_id &&
+        a.alloc_gen == alloc_gen_ && a.peer_alloc_gen == peer_->alloc_gen_ &&
+        need <= a.valid_hi && a.dirty_hi < need)
+        return a.dirty_hi;
+    return need;
+}
+
+void Inkling2::invalidate_canonical_suffix(uint64_t snapshot_id) {
+    if (!snapshot_id || snapshot_id == canonical_suffix_.snapshot_id) canonical_suffix_.snapshot_id = 0;
+}
+
+void Inkling2::clear_stage_b_kv_valid() { stage_b_kv_valid_ = 0; }
+
 void Inkling2::set_kv_prefix_tag(uint64_t tag, int64_t preserved) {
     if (!mirror_tagging_) return;
     inkling::kv_helpers::set_prefix_tag(*kv_helper_, tag, preserved);
@@ -2887,6 +2937,11 @@ size_t Inkling2::card_row_bytes() const {
 }
 
 void Inkling2::alloc_caches() {
+#if defined(STRATA_HIP_GFX906)
+    // Engine also uses alloc_caches() to rebind cached allocations.
+    ++alloc_gen_;
+    invalidate_canonical_suffix();
+#endif
     const int local_visits = owned_swa();
     ring_ = std::min(opt_.max_context, kWindow + rows_ - 1);
 #if defined(STRATA_HIP_GFX906)
@@ -3141,11 +3196,13 @@ void Inkling2::save_card_rows(int64_t first, int64_t n, uint8_t* dst) {
     }
 }
 
-void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) {
+void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n) try {
     if (from < 0 || first < from || n < 0 || first + n > from + count || first + n > opt_.max_context)
         throw std::logic_error("load_rows: outside saved rows");
     if (!n) return;
 #if defined(STRATA_HIP_GFX906)
+    if (canonical_suffix_enabled_)
+        canonical_suffix_.dirty_hi = std::max(canonical_suffix_.dirty_hi, first + n);
     if (kv_helper_) inkling::kv_helpers::invalidate_state(*kv_helper_, first);
     stage_b_kv_valid_ = std::min(stage_b_kv_valid_, first);
     if (fast_park_enabled() && peer_ && tp_size_ == 2 && !ds_on()) {
@@ -3190,6 +3247,11 @@ void Inkling2::load_card_rows(const uint8_t* src, int64_t from, int64_t count, i
         peer_->load_card_rows(src, from, count, first, n);
         cudaSetDevice(prev);
     }
+} catch (...) {
+#if defined(STRATA_HIP_GFX906)
+    invalidate_canonical_suffix();
+#endif
+    throw;
 }
 
 size_t Inkling2::extra_bytes() const {
@@ -3737,10 +3799,10 @@ void Inkling2::attention(const Block& b, int n, const float* k_in, const float* 
             try {
                 attend_local();
             } catch (...) {
-                join_seed(*kv_helper_);
+                join_visit_seed(*kv_helper_);
                 throw;
             }
-            join_seed(*kv_helper_);
+            join_visit_seed(*kv_helper_);
             return;
         }
     }
@@ -3918,7 +3980,13 @@ bool Inkling2::heads(const Block& b, int il, bool swa, bool loop, int n, const D
     return true;
 }
 
-void Inkling2::run_visits(int n) {
+void Inkling2::run_visits(int n) try {
+#if defined(STRATA_HIP_GFX906)
+    // Record provisional rows before either rank can enqueue writes (even if keep() rejects them).
+    if (canonical_suffix_enabled_)
+        canonical_suffix_.dirty_hi = std::max(canonical_suffix_.dirty_hi, pos_ + n);
+    if (pos_ < seed_frozen_end_) join_mirror_seed();
+#endif
     // Includes a keep() that needs to replay a prefix: its taps supersede the provisional window.
     if (df_gpu23_) df_gpu23_->prov_valid = false;
 #if defined(STRATA_HIP_GFX906)
@@ -3997,6 +4065,11 @@ void Inkling2::run_visits(int n) {
     } else {
         run_visits_local(n);
     }
+} catch (...) {
+#if defined(STRATA_HIP_GFX906)
+    invalidate_canonical_suffix();
+#endif
+    throw;
 }
 
 void Inkling2::run_visits_local(int n, [[maybe_unused]] bool gpu_route) {
@@ -4048,7 +4121,8 @@ void Inkling2::run_visits_local(int n, [[maybe_unused]] bool gpu_route) {
                    "PhaseDualTP stagger bank1");
             }
 #endif
-            axpy(prelude_, 1.f, r_, n * kWidth, false, st_);
+            // Stage B enters at visit 24 with depth_n_ == 2, so it cannot have changed depth_[1].
+            axpy(prefill_only_ ? depth_[1] : prelude_, 1.f, r_, n * kWidth, false, st_);
             depth_n_ = 1;
         }
         if (draft_)   // the drafter's taps: the residual entering visits 5, 23 and 41 (drafter_kept())
@@ -5637,6 +5711,7 @@ void Inkling2::phase_dualtp_init(const Options& o) {
     dualtp_2inbox_ = dualtp_sched_v8_ || enabled("STRATA_INKLING_DUALTP_2INBOX");
     dualtp_chunk_v8_ = dualtp_sched_v8_ || enabled("STRATA_INKLING_DUALTP_CHUNK_V8");
     dualtp_async_df_ = enabled("STRATA_INKLING_DUALTP_ASYNC_DF") && df_gpu23_;
+    async_mirror_seed_ = enabled("STRATA_INKLING_ASYNC_MIRROR_SEED");
 
     const int max_floats = std::max(o.prompt_batch, 8) * kWidth;
     auto comm_b = Tp2Comm::create(2, 3, max_floats);
@@ -5882,13 +5957,14 @@ void Inkling2::phase_dualtp_handoff_cut(int n, bool send_df_taps, int df_first) 
         ck(cudaStreamSynchronize(src[r]->cut_st_), "PhaseDualTP handoff sync cut_st");
         ck(cudaStreamSynchronize(cs(src[r]->st_)), "PhaseDualTP handoff sync A st");
     }
-    // Materialize Stage B's live buffers from its inbox (~0.08 ms D2D on HBM2); depth_[1] == prelude_ (0 PCIe bytes!).
+    // Materialize Stage B's live buffers from its inbox; the prelude already goes into depth_[1].
     for (int r = 0; r < 2; ++r) {
         Inkling2& a = *src[r];
         Inkling2& b = *dst[r];
         ck(cudaSetDevice(b.device_), "PhaseDualTP handoff unpack B");
         ck(cudaMemcpyAsync(b.depth_[0], b.cut_inbox_[0].depth0, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP d0");
-        ck(cudaMemcpyAsync(b.prelude_, b.cut_inbox_[0].prelude, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP pre");
+        if (!b.prefill_only_)
+            ck(cudaMemcpyAsync(b.prelude_, b.cut_inbox_[0].prelude, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP pre");
         ck(cudaMemcpyAsync(b.depth_[1], b.cut_inbox_[0].prelude, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP d1");
         ck(cudaMemcpyAsync(b.bank0_, b.cut_inbox_[0].bank0, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP b0");
         ck(cudaMemcpyAsync(b.bank1_, b.cut_inbox_[0].bank1, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP b1");
@@ -5915,7 +5991,7 @@ void Inkling2::phase_dualtp_unpack_cut(int slot, int n, bool send_df_taps, int d
         };
         unpack(b.r_, box.residual, bytes);
         unpack(b.depth_[0], box.depth0, bytes);
-        unpack(b.prelude_, box.prelude, bytes);
+        if (!b.prefill_only_) unpack(b.prelude_, box.prelude, bytes);
         unpack(b.depth_[1], box.prelude, bytes);
         unpack(b.bank0_, box.bank0, bytes);
         unpack(b.bank1_, box.bank1, bytes);
@@ -6100,17 +6176,15 @@ void Inkling2::phase_dualtp_sync_from_b(int64_t final_pos) {
                                s.state_, s.device_, conv_bytes, s.kv_ret_st_),
            "PhaseDualTP return ShortConv");
     }
-    for (int r = 0; r < 2; ++r) {
-        ck(cudaSetDevice(src[r]->device_), "PhaseDualTP sync_from_b wait");
-        ck(cudaStreamSynchronize(src[r]->kv_ret_st_), "PhaseDualTP sync_from_b wait");
-    }
-    stage_b_kv_valid_ = final_pos;
-    // Pre-seed persistent KV helper mirrors: slots 0..3 from GPU0/1 (P2P), slots 4..7 locally from Stage B on GPU2/3!
-    if (final_pos >= 8192 && kv_helper_ && peer_->kv_helper_) {
+    // Stage B's four full visits can seed locally, without depending on their canonical KV return.
+    const bool preseed = final_pos >= 8192 && kv_helper_ && peer_->kv_helper_;
+    const auto seed = [&](bool async) {
+        if (!preseed) return;
+        using namespace inkling::kv_helpers;
         for (int r = 0; r < 2; ++r) {
             Inkling2& owner = *dst[r];
             Inkling2& sb = *src[r];
-            if (!owner.kv_helper_) continue;
+            auto& mirror = *owner.kv_helper_;
             for (int v = 0; v < kVisits; ++v) {
                 if (local(v)) continue;
                 const int slot = v / kBlock;
@@ -6119,17 +6193,27 @@ void Inkling2::phase_dualtp_sync_from_b(int64_t final_pos) {
                 const Cache& c = ksrc.caches_[v];
                 const inkling::KvView kv_k{c.planes[0].data, (const uint16_t*) c.planes[1].data};
                 const inkling::KvView kv_v{c.planes[2].data, (const uint16_t*) c.planes[3].data};
-                inkling::kv_helpers::seed_slot(*owner.kv_helper_, slot, kv_k, kv_v,
-                                               fp(ksrc.blocks_[il].table), ksrc.device_, (int) final_pos);
+                (async ? seed_slot_async : seed_slot)(mirror, slot, kv_k, kv_v, fp(ksrc.blocks_[il].table),
+                                                      ksrc.device_, (int) final_pos);
             }
+            if (async) mark_seed_pending(mirror);
         }
-        for (int r = 0; r < 2; ++r)
-            if (dst[r]->kv_helper_) inkling::kv_helpers::sync_seed(*dst[r]->kv_helper_);
+        if (async) seed_frozen_end_ = final_pos;
+        else {
+            for (Inkling2* a : dst) sync_seed(*a->kv_helper_);
+        }
+    };
+    if (async_mirror_seed_) seed(true);
+    for (Inkling2* b : src) {
+        ck(cudaSetDevice(b->device_), "PhaseDualTP sync_from_b wait");
+        ck(cudaStreamSynchronize(b->kv_ret_st_), "PhaseDualTP sync_from_b wait");
     }
+    stage_b_kv_valid_ = final_pos;
+    if (!async_mirror_seed_) seed(false);
 }
 
 bool Inkling2::read_custom(const int32_t* tokens, int n, const Mark* marks, int n_marks,
-                           const std::function<bool(int, int)>* turn, bool& completed) {
+                           const std::function<bool(int, int)>* turn, bool& completed) try {
     if (!stage_b_ || !peer_) return false;
     static const bool balanced = [] {
         const char* v = std::getenv("STRATA_INKLING_PHASE_DUALTP_BALANCED");
@@ -6211,6 +6295,7 @@ bool Inkling2::read_custom(const int32_t* tokens, int n, const Mark* marks, int 
     const size_t r0_state_n = state_n_, r1_state_n = peer_->state_n_;
     const int64_t sb_exp_before = stage_b_->stats_.gpu_experts + stage_b_->peer_->stats_.gpu_experts;
 
+    join_mirror_seed();  // Stage B's next read can overwrite the local seed sources
     if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, pos0);
     if (peer_->kv_helper_) inkling::kv_helpers::invalidate(*peer_->kv_helper_, pos0);
     // Establish the producer on rank 1 before capturing its stream event.
@@ -6268,6 +6353,8 @@ bool Inkling2::read_custom(const int32_t* tokens, int n, const Mark* marks, int 
         ck(cudaSetDevice(device_), "PhaseDualTP Stage A dev");
         if (dualtp_2inbox_) phase_dualtp_acquire_cut(slot);
         run(tokens + call.at, call.m);
+        // Stage A's watermark also covers the later Stage B writes back to canonical KV.
+        assert(!canonical_suffix_enabled_ || canonical_suffix_.dirty_hi >= chunk_pos + call.m);
         if (!dualtp_2inbox_) wait_b();
         phase_dualtp_handoff_cut(call.m, do_df, df_first);
         if (dualtp_2inbox_) wait_b();  // only the B host job; no drain of B's compute streams
@@ -6292,6 +6379,25 @@ bool Inkling2::read_custom(const int32_t* tokens, int n, const Mark* marks, int 
     stats_.gpu_experts += (sb_exp_after - sb_exp_before);
     completed = !cancelled;
     return true;
+} catch (...) {
+    invalidate_canonical_suffix();
+    stage_b_kv_valid_ = 0;
+    if (async_mirror_seed_) {
+        if (kv_helper_) inkling::kv_helpers::abort_seed(*kv_helper_);
+        if (peer_ && peer_->kv_helper_) inkling::kv_helpers::abort_seed(*peer_->kv_helper_);
+        seed_frozen_end_ = 0;
+    }
+    // The workers have unwound, but their already queued KV return copies can still write to the owners.
+    if (stage_b_) {
+        int prev = 0;
+        if (cudaGetDevice(&prev) == cudaSuccess) {
+            for (Inkling2* b : {stage_b_.get(), stage_b_->peer_.get()})
+                if (b && b->kv_ret_st_ && cudaSetDevice(b->device_) == cudaSuccess)
+                    (void) cudaStreamSynchronize(b->kv_ret_st_);
+            (void) cudaSetDevice(prev);
+        }
+    }
+    throw;
 }
 #endif
 

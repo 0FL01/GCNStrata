@@ -337,6 +337,11 @@ public:
     virtual void request_budget(int64_t /*prompt_rows*/, int64_t /*max_new*/) {}
     virtual bool kv_prefix_tags() const { return false; }
     virtual void set_kv_prefix_tag(uint64_t, int64_t) {}
+    virtual bool kv_canonical_suffix_supported() const { return false; }
+    virtual void arm_canonical_suffix(uint64_t, int64_t) {}
+    virtual int64_t canonical_suffix_skip_from(uint64_t, int64_t need) { return need; }
+    virtual void invalidate_canonical_suffix(uint64_t = 0) {}
+    virtual void clear_stage_b_kv_valid() {}
 
     /// Whether the architecture reads pictures.
     virtual bool sees() const { return false; }
@@ -525,6 +530,7 @@ protected:
     virtual void on_loaded() {}
     virtual void on_reset() {}
     virtual void before_state_access() {}
+    virtual void before_state_mutation() {}
     virtual void on_keep_rows(int64_t) {}
     virtual bool draft_independent_of_model_stream() const { return false; }
     virtual void on_keep_snap(size_t snap_idx) { (void) snap_idx; }

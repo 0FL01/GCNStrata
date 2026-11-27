@@ -217,6 +217,97 @@ gemm_tile_kernel(const float* __restrict__ w, const float* __restrict__ x, float
         }
 }
 
+#if defined(STRATA_HIP_GFX906)
+namespace router_tiled_f32 {
+// W8b benchmark kernel from f32_small_tiled_bench.hip.
+// K-major LDS with a per-quartet XOR swizzle. Keep the four adjacent rows
+// aligned and the swizzle inside the tile, including the 16-wide cases.
+template <int Tile, int BK>
+__device__ __forceinline__ int lds_row(int row, int k) {
+    constexpr int step = (128 / BK < Tile / 4) ? 128 / BK : Tile / 4;
+    return row ^ (((k / 4) * step) & (Tile - 1));
+}
+
+template <int Tile, int BK, int Threads>
+__device__ __forceinline__ void stage(float (&tile)[BK][Tile + 8], const float* src,
+                                      int begin, int limit, int kb, int K, int tid) {
+#pragma unroll
+    for (int i = 4 * tid; i < Tile * BK; i += 4 * Threads) {
+        const int row = i / BK, k = i % BK;
+        const float4 v = begin + row < limit
+            ? *reinterpret_cast<const float4*>(src + size_t(begin + row) * K + kb + k)
+            : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        const int r = lds_row<Tile, BK>(row, k);
+        tile[k    ][r] = v.x;
+        tile[k + 1][r] = v.y;
+        tile[k + 2][r] = v.z;
+        tile[k + 3][r] = v.w;
+    }
+}
+
+template <int Width>
+__device__ __forceinline__ void read_lds(float (&dst)[Width], const float* p) {
+    static_assert(Width == 4 || Width == 2);
+    if constexpr (Width == 4) {
+        const float4 v = *reinterpret_cast<const float4*>(p);
+        dst[0] = v.x; dst[1] = v.y; dst[2] = v.z; dst[3] = v.w;
+    } else {
+        const float2 v = *reinterpret_cast<const float2*>(p);
+        dst[0] = v.x; dst[1] = v.y;
+    }
+}
+
+template <int BM, int BN, int BK, int TM, int TN, int Threads>
+__device__ __forceinline__ void tiled_gemm(const float* __restrict__ w, const float* __restrict__ x,
+                                           float* __restrict__ y, int K, int N, int M) {
+    static_assert(BM * BN == Threads * TM * TN && Threads % 64 == 0);
+    static_assert((BM & (BM - 1)) == 0 && (BN & (BN - 1)) == 0 && (BK == 16 || BK == 32));
+    __shared__ __align__(16) float a[BK][BM + 8], b[BK][BN + 8];
+    const int tid = threadIdx.x;
+    const int m0 = int(blockIdx.x) * BM, n0 = int(blockIdx.y) * BN;
+    const int rm = TM * (tid / (BN / TN)), rn = TN * (tid % (BN / TN));
+    float acc[TM][TN] = {};
+    // The benchmark admits only naturally float4-aligned buffers and K % 64 == 0.
+    // All lanes participate in both barriers; M/N tails are masked only at I/O.
+#pragma unroll 1
+    for (int kb = 0; kb < K; kb += BK) {
+        stage<BM, BK, Threads>(a, x, m0, M, kb, K, tid);
+        stage<BN, BK, Threads>(b, w, n0, N, kb, K, tid);
+        __syncthreads();
+#pragma unroll 4
+        for (int k = 0; k < BK; ++k) {
+            float av[TM], bv[TN];
+            read_lds(av, a[k] + lds_row<BM, BK>(rm, k));
+            read_lds(bv, b[k] + lds_row<BN, BK>(rn, k));
+#pragma unroll
+            for (int i = 0; i < TM; ++i) {
+#pragma unroll
+                for (int j = 0; j < TN; ++j) acc[i][j] = fmaf(av[i], bv[j], acc[i][j]);
+            }
+        }
+        if (kb + BK < K) __syncthreads(); // Do not overwrite LDS before peers finish reading.
+    }
+#pragma unroll
+    for (int i = 0; i < TM; ++i) {
+        const int m = m0 + rm + i;
+        if (m < M) {
+#pragma unroll
+            for (int j = 0; j < TN; ++j) {
+                const int n = n0 + rn + j;
+                if (n < N) y[size_t(m) * N + n] = acc[i][j];
+            }
+        }
+    }
+}
+
+__global__ void __launch_bounds__(256)
+tiled_bm64_bn32_bk32(const float* __restrict__ w, const float* __restrict__ x,
+                    float* __restrict__ y, int K, int N, int M) {
+    tiled_gemm<64, 32, 32, 4, 2, 256>(w, x, y, K, N, M);
+}
+}  // namespace router_tiled_f32
+#endif
+
 #if defined(STRATA_USE_HIP)
 namespace small_gemm_2x2 {
 constexpr int SMALL_TOK = 16, SMALL_OUT = 32, SMALL_K = 64, SMALL_THREADS = 128;
@@ -3215,6 +3306,20 @@ void gemm_f32(void* blas, const float* w, const float* x, float* y, int n_in, in
     if (groups == 1 && n_out <= 8 * SMALL_OUT) {
         cudaStream_t stream = nullptr;
         blas_ck(cublasGetStream(h, &stream), "cublasGetStream");
+#if defined(STRATA_HIP_GFX906)
+        static const bool router_tiled = [] {
+            const char* value = std::getenv("STRATA_TP2_PREFILL_F32_ROUTER_TILED");
+            if (!value || value[0] != '1' || value[1] != '\0') return false;
+            std::fputs("strata-poly: STRATA_TP2_PREFILL_F32_ROUTER_TILED=1: tiled FP32 router GEMM enabled\n", stderr);
+            return true;
+        }();
+        if (router_tiled && n_out == 128 && n_in == 2304 && rows >= 1536 && n_in % 32 == 0 &&
+            (reinterpret_cast<std::uintptr_t>(x) % 16 == 0) && (reinterpret_cast<std::uintptr_t>(w) % 16 == 0)) {
+            router_tiled_f32::tiled_bm64_bn32_bk32<<<dim3(grid(rows, 64), grid(n_out, 32)), 256, 0, stream>>>(
+                w, x, y, n_in, n_out, rows);
+            return;
+        }
+#endif
 #if defined(STRATA_USE_HIP)
         if (small_gemm_2x2::use(n_in, n_out, rows)) {
             small_gemm_2x2::launch(w, x, y, n_in, n_out, rows, stream);

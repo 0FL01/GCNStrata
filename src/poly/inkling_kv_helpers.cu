@@ -186,6 +186,8 @@ struct Mirror {
     const int capacity, decode_max_rows;
     const hipStream_t model_stream;
     bool used = false, long_answer = false;
+    hipEvent_t owner_seed_done = nullptr, helper_seed_done = nullptr, src_ready = nullptr;
+    bool seed_pending = false, seed_enqueuing = false;
     std::array<int, kFullVisits> valid{};
     uint64_t active_tag = 0, mirror_tag = 0;
     std::array<bool, kFullVisits> table_ready{};
@@ -232,8 +234,15 @@ struct Mirror {
         int previous = 0;
         if (hipGetDevice(&previous) == hipSuccess) {
             RestoreDevice restore(previous);
-            if (mirror_owner_mem && hipSetDevice(owner.device) == hipSuccess) (void) hipFree(mirror_owner_mem);
-            if (mirror_helper_mem && hipSetDevice(helper.device) == hipSuccess) (void) hipFree(mirror_helper_mem);
+            if (hipSetDevice(owner.device) == hipSuccess) {
+                if (src_ready) (void) hipEventDestroy(src_ready);
+                if (owner_seed_done) (void) hipEventDestroy(owner_seed_done);
+                if (mirror_owner_mem) (void) hipFree(mirror_owner_mem);
+            }
+            if (hipSetDevice(helper.device) == hipSuccess) {
+                if (helper_seed_done) (void) hipEventDestroy(helper_seed_done);
+                if (mirror_helper_mem) (void) hipFree(mirror_helper_mem);
+            }
         }
     }
 };
@@ -426,6 +435,70 @@ void sync_seed(Mirror& m) {
     m.helper.wait(m.helper.stream);
 }
 
+void seed_slot_async(Mirror& m, int slot, KvView k, KvView v, const float* table, int src_device, int end_row) {
+    if (!m.mirror_flash) return;
+    if (slot == 0) {
+        if (m.seed_pending || m.seed_enqueuing) throw std::logic_error("overlapping DualTP mirror seeds");
+        int prev = 0;
+        check(hipGetDevice(&prev), "mirror seed getDevice");
+        RestoreDevice restore(prev);
+        check(hipSetDevice(m.owner.device), "mirror seed owner device");
+        if (!m.src_ready)
+            check(hipEventCreateWithFlags(&m.src_ready, hipEventDisableTiming), "create mirror seed source event");
+        if (!m.owner_seed_done)
+            check(hipEventCreateWithFlags(&m.owner_seed_done, hipEventDisableTiming), "create owner seed completion");
+        m.seed_enqueuing = true;
+        check(hipEventRecord(m.src_ready, m.model_stream), "publish mirror seed sources");
+        check(hipStreamWaitEvent(m.owner.stream, m.src_ready, 0), "owner waits for mirror seed sources");
+        check(hipSetDevice(m.helper.device), "mirror seed helper device");
+        if (!m.helper_seed_done)
+            check(hipEventCreateWithFlags(&m.helper_seed_done, hipEventDisableTiming), "create helper seed completion");
+        // Stage B's model stream is already drained. Wait for any old owner-to-helper writes as well:
+        // the model stream's earlier visits joined those writes before reaching src_ready.
+        check(hipStreamWaitEvent(m.helper.stream, m.src_ready, 0), "helper waits for prior mirror writes");
+    }
+    seed_slot(m, slot, k, v, table, src_device, end_row);
+}
+
+void mark_seed_pending(Mirror& m) {
+    if (!m.seed_enqueuing) return;
+    int prev = 0;
+    check(hipGetDevice(&prev), "mirror seed completion getDevice");
+    RestoreDevice restore(prev);
+    check(hipSetDevice(m.owner.device), "mirror seed completion owner device");
+    check(hipEventRecord(m.owner_seed_done, m.owner.stream), "record owner seed completion");
+    check(hipSetDevice(m.helper.device), "mirror seed completion helper device");
+    check(hipEventRecord(m.helper_seed_done, m.helper.stream), "record helper seed completion");
+    m.seed_enqueuing = false;
+    m.seed_pending = true;
+}
+
+void wait_seed_on_helper(Mirror& m) {
+    // The caller is on the helper device. Its own seed already precedes this work in FIFO order.
+    if (m.seed_pending)
+        check(hipStreamWaitEvent(m.helper.stream, m.owner_seed_done, 0), "helper waits for owner mirror seed");
+}
+
+void abort_seed(Mirror& m) noexcept {
+    if (!m.seed_enqueuing && !m.seed_pending) return;
+    // A failed submit may not have recorded either event, so drain the streams directly.
+    sync_seed(m);
+    m.seed_enqueuing = m.seed_pending = false;
+    m.valid.fill(0);
+    m.table_ready.fill(false);
+}
+
+void join_seed(Mirror& m) {
+    if (!m.seed_pending) return;
+    // Attempt both waits before checking either error: both source allocations can be in use.
+    const auto owner = hipEventSynchronize(m.owner_seed_done);
+    const auto helper = hipEventSynchronize(m.helper_seed_done);
+    if (owner != hipSuccess || helper != hipSuccess) abort_seed(m);
+    m.seed_pending = false;
+    check(owner, "join owner mirror seed");
+    check(helper, "join helper mirror seed");
+}
+
 bool try_flash_mirror(Mirror& m, const Attend& a, int slot) {
     if (!m.mirror_flash || a.kv_heads != kOwnerKvHeads || a.window || a.ring || !a.k.scales || !a.v.scales ||
         slot < 0 || slot >= kFullVisits || a.n < 64 || a.n > kMirrorMaxRows || a.pos < 8192 ||
@@ -482,6 +555,7 @@ bool try_flash_mirror(Mirror& m, const Attend& a, int slot) {
 
         // Helper appends new K/V rows and computes upper 2 KV heads (query heads 6..11).
         check(hipSetDevice(m.helper.device), "mirror select helper");
+        wait_seed_on_helper(m);
         check(hipStreamWaitEvent(work, m.owner.sent, 0), "mirror wait packet");
         append_upper<<<dim3(blocks(rows * kCodeWords), Fields - K), kThreads, 0, work>>>(kv, m.mirror_packet, rows, pos);
         check(hipGetLastError(), "mirror append rows");
@@ -652,6 +726,7 @@ Visit try_visit(Mirror& m, const Attend& a, int slot, float* partial, float* sco
         attend_decode_half(a, partial, scores, q8, model, score_rows);
 
         check(hipSetDevice(m.helper.device), "select KV helper device");
+        wait_seed_on_helper(m);
         check(hipStreamWaitEvent(work, m.owner.sent, 0), "wait for KV helper packet");
         append_upper<<<dim3(blocks(rows * kCodeWords), Fields - K), kThreads, 0, work>>>(kv, m.packet, rows, pos);
         check(hipGetLastError(), "append KV helper rows");
@@ -688,7 +763,7 @@ Visit try_visit(Mirror& m, const Attend& a, int slot, float* partial, float* sco
     }
 }
 
-void join_seed(Mirror& m) {
+void join_visit_seed(Mirror& m) {
     const auto rc = hipStreamWaitEvent(m.model_stream, m.owner.sent, 0);
     if (rc != hipSuccess) {
         m.owner.wait(m.owner.stream);

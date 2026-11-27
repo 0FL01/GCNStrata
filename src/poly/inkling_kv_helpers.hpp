@@ -29,6 +29,12 @@ void enable_flash_mirror(std::array<MirrorPtr, 2>& mirrors);
 bool try_flash_mirror(Mirror& mirror, const Attend& a, int slot);
 void seed_slot(Mirror& mirror, int slot, KvView k, KvView v, const float* table, int src_device, int end_row);
 void sync_seed(Mirror& mirror);
+// Submit all eight slots in order (slot 0 publishes the source event); then record completion on both streams.
+void seed_slot_async(Mirror& mirror, int slot, KvView k, KvView v, const float* table, int src_device, int end_row);
+void mark_seed_pending(Mirror& mirror);
+void wait_seed_on_helper(Mirror& mirror);
+void join_seed(Mirror& mirror);
+void abort_seed(Mirror& mirror) noexcept;
 void invalidate(Mirror& mirror, int64_t first);
 void set_prefix_tag(Mirror& mirror, uint64_t tag, int64_t preserved);
 void invalidate_state(Mirror& mirror, int64_t first);
@@ -38,8 +44,8 @@ enum class Visit { Local, Seeding, Offloaded };
 // Called after the canonical stores, even on full visits that will stay local (they can overwrite provisional rows).
 Visit try_visit(Mirror& mirror, const Attend& a, int slot, float* partial, float* scores, size_t score_floats,
                 void* q8);
-// The caller must join Seeding after enqueuing ordinary attention, before reusing or overwriting its inputs.
-void join_seed(Mirror& mirror);
+// Join Visit::Seeding on the model stream after enqueuing ordinary attention, before overwriting its inputs.
+void join_visit_seed(Mirror& mirror);
 
 // Shared factored kernels and stock combine: two groups, stride 4 in the owner's buffers or 2 in a compact mirror.
 size_t half_decode_floats(int rows);

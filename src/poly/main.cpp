@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -126,9 +127,27 @@ public:
             return draw_all(logits, n_vocab, s, rng);
         }
 
+#if defined(STRATA_POLY_HAVE_AVX2_SAMPLE)
+        if (s.temperature > 0.f && n_vocab > 0 && filtered_sample_enabled() &&
+            fast_candidates(logits, n_vocab, k, s)) return draw_filtered(s, rng);
+#endif
+        stock_candidates(logits, n_vocab, k);
+        return draw_filtered(s, rng);
+    }
+
+private:
+    struct Cand {
+        float logit;
+        int id;
+    };
+
+    static constexpr auto by_logit = [](const Cand& a, const Cand& b) {
+        return a.logit != b.logit ? a.logit > b.logit : a.id < b.id;
+    };
+
+    void stock_candidates(LogitShards logits, int n_vocab, size_t k) {
         // The k best, the best first and of equals the lower id.  A token is a candidate only when it beats the
         // worst of the k so far, which is the heap's first; most of a vocabulary never does.
-        auto by_logit = [](const Cand& a, const Cand& b) { return a.logit != b.logit ? a.logit > b.logit : a.id < b.id; };
         cand_.clear();
         int off = 0;
         logits.spans(0, n_vocab, [&](const float* p, int n) {
@@ -146,7 +165,9 @@ public:
             off += n;
         });
         std::sort_heap(cand_.begin(), cand_.end(), by_logit);
+    }
 
+    int draw_filtered(const Sampling& s, std::mt19937_64& rng) {
         if (s.top_p < 1.f) {
             softmax();
             double cum = 0.0;
@@ -170,12 +191,6 @@ public:
         softmax();
         return cand_[std::discrete_distribution<size_t>(p_.begin(), p_.end())(rng)].id;
     }
-
-private:
-    struct Cand {
-        float logit;
-        int id;
-    };
 
     static constexpr int kSumRun = 4096;
 
@@ -232,6 +247,193 @@ private:
             return *e >= '2' && *e <= '8' ? *e - '0' : 0;
         }();
         return threads;
+    }
+
+    static bool filtered_sample_enabled() {
+        static const bool enabled = [] {
+            const char* e = std::getenv("STRATA_POLY_MT_FILTER_SAMPLE");
+            if (!e || std::strcmp(e, "1") != 0 || !__builtin_cpu_supports("avx2")) return false;
+            std::fprintf(stderr, "strata-poly: STRATA_POLY_MT_FILTER_SAMPLE=1 (exact filtered sampling)\n");
+            return true;
+        }();
+        return enabled;
+    }
+
+    static void replace_worst(std::vector<Cand>& heap, float v, int id) {
+        std::pop_heap(heap.begin(), heap.end(), by_logit);
+        heap.back() = {v, id};
+        std::push_heap(heap.begin(), heap.end(), by_logit);
+    }
+
+    __attribute__((target("avx2,no-fma")))
+    static bool top_k_span(const float* p, int n, int at, std::vector<Cand>& heap) {
+        auto worst = _mm256_set1_ps(heap.front().logit);
+        int j = 0;
+        for (; j <= n - 8; j += 8) {
+            const auto v = _mm256_loadu_ps(p + j);
+            if (_mm256_movemask_ps(_mm256_cmp_ps(v, v, _CMP_UNORD_Q))) return false;
+            unsigned mask = _mm256_movemask_ps(_mm256_cmp_ps(v, worst, _CMP_GT_OQ));
+            if (!mask) continue;
+            do {
+                const int i = j + std::countr_zero(mask);
+                // Earlier lanes may have raised the threshold. It never decreases.
+                if (p[i] > heap.front().logit) replace_worst(heap, p[i], at + i);
+                mask &= mask - 1;
+            } while (mask);
+            worst = _mm256_set1_ps(heap.front().logit);
+        }
+        for (; j < n; ++j) {
+            if (std::isnan(p[j])) return false;
+            if (p[j] > heap.front().logit) replace_worst(heap, p[j], at + j);
+        }
+        return true;
+    }
+
+    template <bool Inclusive>
+    __attribute__((target("avx2,no-fma")))
+    static bool collect_span(const float* p, int n, int at, float threshold, std::vector<Cand>& out) {
+        const auto limit = _mm256_set1_ps(threshold);
+        int j = 0;
+        for (; j <= n - 8; j += 8) {
+            const auto v = _mm256_loadu_ps(p + j);
+            // The min-p path has already checked the entire row for NaNs in its max pass.
+            if constexpr (!Inclusive)
+                if (_mm256_movemask_ps(_mm256_cmp_ps(v, v, _CMP_UNORD_Q))) return false;
+            unsigned mask = _mm256_movemask_ps(_mm256_cmp_ps(v, limit, Inclusive ? _CMP_GE_OQ : _CMP_GT_OQ));
+            for (; mask; mask &= mask - 1) {
+                if constexpr (!Inclusive) if (out.size() == out.capacity()) return false;
+                const int i = j + std::countr_zero(mask);
+                out.push_back({p[i], at + i});
+            }
+        }
+        for (; j < n; ++j) {
+            if constexpr (!Inclusive) if (std::isnan(p[j])) return false;
+            if (!(Inclusive ? p[j] >= threshold : p[j] > threshold)) continue;
+            if constexpr (!Inclusive) if (out.size() == out.capacity()) return false;
+            out.push_back({p[j], at + j});
+        }
+        return true;
+    }
+
+    __attribute__((target("avx2,no-fma")))
+    static bool checked_max_span(const float* p, int n, float& best) {
+        auto mx = _mm256_set1_ps(best);
+        int j = 0;
+        for (; j <= n - 8; j += 8) {
+            const auto v = _mm256_loadu_ps(p + j);
+            if (_mm256_movemask_ps(_mm256_cmp_ps(v, v, _CMP_UNORD_Q))) return false;
+            mx = _mm256_max_ps(v, mx);
+        }
+        float lane[8];
+        _mm256_storeu_ps(lane, mx);
+        for (float v : lane) best = std::max(best, v);
+        for (; j < n; ++j) {
+            if (std::isnan(p[j])) return false;
+            best = std::max(best, p[j]);
+        }
+        return true;
+    }
+
+    __attribute__((target("avx2,no-fma")))
+    static int first_equal_span(const float* p, int n, float best) {
+        const auto target = _mm256_set1_ps(best);
+        int j = 0;
+        for (; j <= n - 8; j += 8) {
+            const auto v = _mm256_loadu_ps(p + j);
+            const unsigned mask = _mm256_movemask_ps(_mm256_cmp_ps(v, target, _CMP_EQ_OQ));
+            if (mask) return j + std::countr_zero(mask);
+        }
+        for (; j < n; ++j) if (p[j] == best) return j;
+        return n;
+    }
+
+    bool min_p_candidates(LogitShards logits, int n, float min_p) {
+        Cand best{-INFINITY, -1};
+        bool ordered = true;
+        logits.spans(0, n, [&](const float* p, int m) {
+            if (ordered) ordered = checked_max_span(p, m, best.logit);
+        });
+        if (!ordered) return false;
+        int at = 0;
+        logits.spans(0, n, [&](const float* p, int m) {
+            if (best.id < 0) {
+                const int i = first_equal_span(p, m, best.logit);
+                if (i < m) best = {p[i], at + i};  // preserve the first equal value's bits
+            }
+            at += m;
+        });
+        const float floor = best.logit + std::log(min_p);
+        cand_.clear();
+        if (!(best.logit >= floor)) {
+            // Stock min-p always keeps its first candidate, even for unordered or above-max floors.
+            cand_.push_back(best);
+        } else {
+            at = 0;
+            logits.spans(0, n, [&](const float* p, int m) {
+                collect_span<true>(p, m, at, floor, cand_);
+                at += m;
+            });
+            std::sort(cand_.begin(), cand_.end(), by_logit);
+        }
+        return true;
+    }
+
+    __attribute__((target("avx2,no-fma")))
+    static bool has_nan_span(const float* p, int n) {
+        int j = 0;
+        for (; j <= n - 8; j += 8) {
+            const auto v = _mm256_loadu_ps(p + j);
+            if (_mm256_movemask_ps(_mm256_cmp_ps(v, v, _CMP_UNORD_Q))) return true;
+        }
+        for (; j < n; ++j) if (std::isnan(p[j])) return true;
+        return false;
+    }
+
+    static uint32_t sortable_desc(uint32_t bits, uint32_t zero_max) {
+        // Canonicalize only the key: comparisons tie both zero signs (and subnormals with DAZ).
+        if ((bits & 0x7fffffffU) <= zero_max) bits = 0;
+        // Nonnegatives precede negatives; their IEEE magnitude bits run in the opposite direction.
+        return (bits >> 31) ? bits : bits ^ 0x7fffffffU;
+    }
+
+    struct RadixCand {
+        uint32_t key;
+        Cand cand;
+    };
+    std::vector<RadixCand> radix_, radix_tmp_;
+
+    bool radix_candidates(LogitShards logits, int n) {
+        bool unordered = false;
+        logits.spans(0, n, [&](const float* p, int m) { unordered = unordered || has_nan_span(p, m); });
+        if (unordered) return false;
+        radix_.clear();
+        radix_.reserve(n);
+        radix_tmp_.resize(n);
+        size_t pos[4][256]{};
+        const uint32_t zero_max = (_mm_getcsr() & _MM_DENORMALS_ZERO_MASK) ? 0x007fffffU : 0;
+        int at = 0;
+        logits.spans(0, n, [&](const float* p, int m) {
+            for (int j = 0; j < m; ++j) {
+                const uint32_t key = sortable_desc(std::bit_cast<uint32_t>(p[j]), zero_max);
+                radix_.push_back({key, {p[j], at + j}});
+                for (int b = 0; b < 4; ++b) ++pos[b][(key >> (8 * b)) & 255];
+            }
+            at += m;
+        });
+        // Each pass scatters forward from the previous order, so equal keys retain increasing global IDs.
+        for (int b = 0; b < 4; ++b) {
+            size_t start = 0;
+            for (size_t& bucket : pos[b]) {
+                const size_t count = bucket;
+                bucket = start;
+                start += count;
+            }
+            for (const auto& c : radix_) radix_tmp_[pos[b][(c.key >> (8 * b)) & 255]++] = c;
+            radix_.swap(radix_tmp_);
+        }
+        cand_.resize(n);
+        for (int i = 0; i < n; ++i) cand_[i] = radix_[i].cand;
+        return true;
     }
 
     __attribute__((target("avx2,no-fma")))
@@ -314,6 +516,21 @@ private:
             for (int i = 1; i < threads_; ++i) mx = std::max(mx, workers_[i].mx);
             return mx;
         }
+        bool prefilter(LogitShards logits, int at, int n, float threshold, std::vector<Cand>& heap) {
+            // Bound replay work and allocate on the caller, never in a worker. If a frozen threshold
+            // lets too much of a slice through, retry with the moving threshold on the caller.
+            for (int i = 0; i < threads_; ++i) workers_[i].filtered.reserve(2048);
+            Job job{logits, nullptr, nullptr, n, 0, threshold};
+            job.filter_at = at;
+            dispatch(job);
+            for (int i = 0; i < threads_; ++i) if (!workers_[i].filter_ready) return false;
+            // Chunks and survivors are in ID order. The real heap threshold can only rise from the frozen one.
+            for (int i = 0; i < threads_; ++i)
+                for (const Cand& c : workers_[i].filtered)
+                    if (c.logit > heap.front().logit) replace_worst(heap, c.logit, c.id);
+            return true;
+        }
+
         void weights(LogitShards logits, float* q, double* runs, int n, int nr, float mx, float inv) {
             dispatch({logits, q, runs, n, nr, mx, inv});
         }
@@ -325,16 +542,34 @@ private:
             double* runs;   // null for the max pass
             int n, nr;
             float mx = 0.f, inv = 0.f;
+            int filter_at = -1;
         };
         struct alignas(64) Worker {
             std::thread thread;
             std::atomic<uint64_t> done{0};
             float mx = 0.f;
+            bool filter_ready = false;
+            std::vector<Cand> filtered;
         };
         static constexpr uint64_t kStop = UINT64_MAX;
         static constexpr auto kSpin = std::chrono::microseconds(50);
 
         void slice(int i) {
+            if (job_.filter_at >= 0) {
+                auto& worker = workers_[i];
+                worker.filtered.clear();
+                worker.filter_ready = true;
+                const int start = job_.filter_at;
+                const int len = job_.n - start;
+                int at = start + (int) ((int64_t) len * i / threads_);
+                const int end = start + (int) ((int64_t) len * (i + 1) / threads_);
+                job_.logits.spans(at, end - at, [&](const float* p, int m) {
+                    if (worker.filter_ready)
+                        worker.filter_ready = collect_span<false>(p, m, at, job_.mx, worker.filtered);
+                    at += m;
+                });
+                return;
+            }
             const int first = job_.nr * i / threads_, last = job_.nr * (i + 1) / threads_;
             const int at = first * kSumRun, end = last == job_.nr ? job_.n : last * kSumRun;
             if (!job_.runs) {
@@ -420,6 +655,47 @@ private:
         if (!sample_pool_) sample_pool_ = std::make_unique<SamplePool>(threads);
         return sample_pool_.get();
     }
+    bool top_k_candidates(LogitShards logits, int n, int k, SamplePool* pool = nullptr) {
+        cand_.clear();
+        cand_.reserve(k);
+        bool ordered = true;
+        int at = 0;
+        logits.spans(0, k, [&](const float* p, int m) {
+            for (int j = 0; ordered && j < m; ++j) {
+                ordered = !std::isnan(p[j]);
+                if (ordered) cand_.push_back({p[j], at + j});
+            }
+            at += m;
+        });
+        if (!ordered) return false;
+        std::make_heap(cand_.begin(), cand_.end(), by_logit);
+        // Seed a useful threshold before farming out a suffix, if a pool is selected.
+        const int end = pool ? std::min(n, std::max(k, k <= 64 ? 8192 : 16384)) : n;
+        const auto scan = [&](int count) {
+            logits.spans(at, count, [&](const float* p, int m) {
+                if (ordered) ordered = top_k_span(p, m, at, cand_);
+                at += m;
+            });
+        };
+        scan(end - k);
+        if (ordered && end < n && !pool->prefilter(logits, end, n, cand_.front().logit, cand_)) scan(n - end);
+        if (!ordered) return false;
+        std::sort_heap(cand_.begin(), cand_.end(), by_logit);
+        return true;
+    }
+
+    bool fast_candidates(LogitShards logits, int n, size_t k, const Sampling& s) {
+        if (k < (size_t) n) {
+            // Four workers paid off on large rows with small heaps. For larger heaps, serial replay and
+            // rechecking a less selective frozen threshold outweighed the shorter scan.
+            auto* pool = n >= 131072 && k <= 64 && mt_sample_threads() == 4 ? sample_pool(n_runs(n)) : nullptr;
+            return top_k_candidates(logits, n, (int) k, pool);
+        }
+        if (s.top_p < 1.f) return radix_candidates(logits, n);
+        if (s.top_p >= 1.f && s.min_p > 0.f) return min_p_candidates(logits, n, s.min_p);
+        return false;
+    }
+
 #else
     class SamplePool;
 #endif
