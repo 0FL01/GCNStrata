@@ -8,6 +8,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
+#include <cstring>
+#include <iostream>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -119,9 +122,9 @@ __global__ void expand_kernel(Matrix w, float* out, size_t n) {
     if (j < n) out[j] = value<T>(w.data + (j / w.in) * w.stride, j % w.in);
 }
 
-__global__ void embed_kernel(Matrix emb, int32_t anchor, float* out) {
+__global__ void embed_kernel(Matrix emb, int32_t anchor, int32_t mask, float* out) {
     const int c = blockIdx.x * 256 + threadIdx.x, r = blockIdx.y;
-    if (c < kWidth) out[r * kWidth + c] = value<Q4_0>(emb.data + size_t(r ? kMask : anchor) * emb.stride, c);
+    if (c < kWidth) out[r * kWidth + c] = value<Q4_0>(emb.data + size_t(r ? mask : anchor) * emb.stride, c);
 }
 
 __device__ __forceinline__ float sum_wave(float x) {
@@ -417,8 +420,11 @@ void validate_draft(const GgufFile& f) {
     require(f.tensors().size() == 6 + kLayers * 15, "draft tensor inventory");
 }
 
+#include "dflash2_qwen_fast.cuh"
+
 struct Layer {
     Matrix ap, fp, q, k, v, o, gate, up, down;
+    Packed pap, pfp, qkv, po, gu, pdown;
     const float *an, *fn, *qn, *kn, *abase, *fbase;
     const float *bulk_k, *bulk_v;
     __half *kc, *vc;
@@ -437,12 +443,18 @@ struct Drafter::Impl {
         for (auto e : events) if (e) (void)cudaEventDestroy(e);
         if (st) (void)cudaStreamDestroy(st);
         if (readback) (void)cudaFreeHost(readback);
+        if (emb_pin) (void)cudaFreeHost(emb_pin);
         for (void* p : allocations) (void)cudaFree(p);
         (void)cudaSetDevice(old);
     }
     int device;
     int64_t lo = 0, hi = 0;
-    bool empty = true;
+    bool empty = true, int8 = false, packed = false;
+    int head_mode = 0, layout = 0;
+    size_t head_bytes = 0;
+    Quant aq{}, aq2{};
+    Packed pfc, phead, psel;
+    float* rounded = nullptr;
     cudaStream_t st = nullptr;
     cublasHandle_t blas = nullptr;
     cudaEvent_t events[4]{};
@@ -462,7 +474,7 @@ struct Drafter::Impl {
         catch (...) { (void)cudaFree(ptr); throw; }
         return static_cast<T*>(ptr);
     }
-    Matrix load(const GgufFile& f, const std::string& name, std::initializer_list<uint64_t> shape,
+    Matrix map(const GgufFile& f, const std::string& name, std::initializer_list<uint64_t> shape,
                 std::initializer_list<uint32_t> types) {
         const auto* t = f.find(name);
         if (!t || t->shape != std::vector<uint64_t>(shape) || std::find(types.begin(), types.end(), t->type) == types.end())
@@ -475,9 +487,58 @@ struct Drafter::Impl {
         const size_t avail = f.file_size() - f.data_start();
         if (t->offset > avail || len > avail - t->offset)
             throw std::runtime_error(f.path() + ": truncated tensor " + name);
-        auto* p = alloc<uint8_t>(len);
-        check(cudaMemcpy(p, f.tensor_data(*t), len, cudaMemcpyHostToDevice), name.c_str());
-        return {p, stride, cols, rows, t->type};
+        return {reinterpret_cast<const uint8_t*>(f.tensor_data(*t)), stride, cols, rows, t->type};
+    }
+    Matrix load(const GgufFile& f, const std::string& name, std::initializer_list<uint64_t> shape,
+                std::initializer_list<uint32_t> types) {
+        auto w = map(f, name, shape, types);
+        auto* p = alloc<uint8_t>(w.stride * w.out);
+        check(cudaMemcpy(p, w.data, w.stride * w.out, cudaMemcpyHostToDevice), name.c_str());
+        w.data = p;
+        return w;
+    }
+    Packed pack(std::initializer_list<Matrix> matrices, bool requant = false) {
+        const Matrix first = *matrices.begin();
+        const bool q4 = requant ? head_mode == 4 : first.type == Q4_0;
+        int rows = 0;
+        size_t max_bytes = 0;
+        for (auto w : matrices) {
+            if (w.in != first.in || w.type != first.type ||
+                (requant ? w.type != Q6_K : w.type != Q4_0 && w.type != Q8_0))
+                throw std::logic_error("incompatible DFlash2 packed tensors");
+            rows += w.out;
+            max_bytes = std::max(max_bytes, w.stride * w.out);
+        }
+        const size_t nb = size_t(first.in / 32) * rows;
+        const int bytes = q4 ? 16 : 32;
+        auto* codes = alloc<uint8_t>(nb * bytes);
+        auto* scales = alloc<__half>(nb);
+        if (requant) head_bytes = nb * (bytes + sizeof(__half));
+        void* temporary = nullptr;
+        check(cudaMalloc(&temporary, max_bytes), "allocate DFlash2 pack staging");
+        try {
+            size_t offset = 0;
+            for (auto w : matrices) {
+                check(cudaMemcpyAsync(temporary, w.data, w.stride * w.out, cudaMemcpyHostToDevice, st), "upload DFlash2 pack source");
+                const size_t blocks = size_t(w.in / 32) * w.out;
+                w.data = static_cast<const uint8_t*>(temporary);
+                auto* q = codes + offset * bytes;
+                auto* d = scales + offset;
+                if (requant) {
+                    if (q4) requant_head<true><<<ceil_div(blocks, 8), 256, 0, st>>>(w, q, d);
+                    else requant_head<false><<<ceil_div(blocks, 8), 256, 0, st>>>(w, q, d);
+                } else if (q4) pack4_kernel<<<ceil_div(blocks, 16), 256, 0, st>>>(w.data, q, d, blocks);
+                else pack_kernel<<<ceil_div(blocks, 8), 256, 0, st>>>(w.data, q, d, blocks);
+                check(cudaGetLastError(), "pack DFlash2 matrix");
+                offset += blocks;
+            }
+            check(cudaStreamSynchronize(st), "complete DFlash2 pack");
+        } catch (...) { (void)cudaFree(temporary); throw; }
+        check(cudaFree(temporary), "free DFlash2 pack staging");
+        return {reinterpret_cast<int4*>(codes), scales, first.in, rows, q4};
+    }
+    Matrix source(const GgufFile& f, const std::string& n, int in, int out) {
+        return map(f, n, {uint64_t(in), uint64_t(out)}, {Q4_0, Q8_0});
     }
     Matrix mat(const GgufFile& f, const std::string& n, int in, int out) {
         return load(f, n, {uint64_t(in), uint64_t(out)}, {F32, F16, BF16, Q4_0, Q8_0});
@@ -501,6 +562,22 @@ struct Drafter::Impl {
         check(cudaGetLastError(), "expand drafter weights");
         return p;
     }
+    Borrow borrow;
+    std::unique_ptr<GgufFile> tfile;     // host_embed: the target shard stays mapped
+    const uint8_t* emb_host = nullptr;   // its token_embd rows
+    uint8_t* emb_pin = nullptr;          // pinned staging for the anchor's row
+    void embed_rows(int32_t anchor, int n) {
+        if (!borrow.host_embed) {
+            embed_kernel<<<dim3(kWidth / 256, n), 256, 0, st>>>(embedding, anchor, kMask, x);
+            return;
+        }
+        // device rows: 0 = the anchor's (copied now), 1 = the mask's (copied at init); the stream orders the reuse
+        check(cudaStreamSynchronize(st), "DFlash2 embedding staging reuse");
+        std::memcpy(emb_pin, emb_host + size_t(anchor) * embedding.stride, embedding.stride);
+        check(cudaMemcpyAsync(const_cast<uint8_t*>(embedding.data), emb_pin, embedding.stride, cudaMemcpyHostToDevice, st),
+              "DFlash2 anchor embedding");
+        embed_kernel<<<dim3(kWidth / 256, n), 256, 0, st>>>(embedding, 0, 1, x);
+    }
     void init(const std::string& draft, const std::string& target) {
         GgufFile f(draft), t(target);
         validate_draft(f);
@@ -509,18 +586,75 @@ struct Drafter::Impl {
         if (props.warpSize != 64 || std::string(props.gcnArchName).rfind("gfx906", 0) != 0)
             throw std::runtime_error("DFlash2 Qwen requires gfx906 wave64");
         check(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking), "create DFlash2 stream");
-        blas_check(cublasCreate(&blas), "create DFlash2 BLAS handle");
-        blas_check(cublasSetStream(blas, st), "assign DFlash2 BLAS stream");
+        const auto env = [](const char* key, const char* fallback) {
+            const char* v = std::getenv(key);
+            return std::string(v && *v ? v : fallback);
+        };
+        const auto speed = env("STRATA_DFLASH2_QWEN_FAST", "0");
+        const auto profile = env("STRATA_DFLASH2_QWEN_PROFILE", "native");
+        if (speed != "0" && speed != "1") throw std::invalid_argument("STRATA_DFLASH2_QWEN_FAST must be 0 or 1");
+        if (profile != "native" && profile != "mixed") throw std::invalid_argument("unknown DFlash2 profile");
+        int8 = speed == "1";
+        const auto hmode = env("STRATA_DFLASH2_QWEN_HEAD", int8 ? "q6" : "reference");
+        if (hmode == "q4") head_mode = 4;
+        else if (hmode == "q8") head_mode = 8;
+        else if (hmode == "q6") head_mode = int8 ? 6 : 0;
+        else if (hmode != "reference") throw std::invalid_argument("unknown DFlash2 head format");
+        const auto ly = env("STRATA_DFLASH2_QWEN_LAYOUT", "default");
+        if (ly == "wide") layout = 1;
+        else if (ly == "narrow") layout = 2;
+        else if (ly != "default") throw std::invalid_argument("unknown DFlash2 packed layout");
+        const auto* ft = f.find("fc.weight");
+        packed = int8 && ft && (ft->type == Q4_0 || ft->type == Q8_0);
+        std::unique_ptr<GgufFile> q8_file, bf_file;
+        if (profile == "mixed") {
+            constexpr const char key[] = "Q4_0.gguf";
+            if (!ft || ft->type != Q4_0 || draft.size() < sizeof(key) - 1 ||
+                draft.compare(draft.size() - (sizeof(key) - 1), sizeof(key) - 1, key))
+                throw std::invalid_argument("mixed DFlash2 profile expects a Q4_0.gguf path with Q8_0 and BF16 siblings");
+            const auto stem = draft.substr(0, draft.size() - (sizeof(key) - 1));
+            q8_file = std::make_unique<GgufFile>(stem + "Q8_0.gguf");
+            bf_file = std::make_unique<GgufFile>(stem + "BF16.gguf");
+            validate_draft(*q8_file);
+            validate_draft(*bf_file);
+        }
+        const GgufFile& sensitive = q8_file ? *q8_file : f;
+        const GgufFile& books = bf_file ? *bf_file : f;
+        if (!packed) {
+            blas_check(cublasCreate(&blas), "create DFlash2 BLAS handle");
+            blas_check(cublasSetStream(blas, st), "assign DFlash2 BLAS stream");
+        }
         for (auto& e : events) check(cudaEventCreate(&e), "create DFlash2 event");
-        embedding = load(t, "token_embd.weight", {kWidth, kVocab}, {Q4_0});
-        head = load(t, "output.weight", {kWidth, kVocab}, {Q6_K});
-        fc = mat(f, "fc.weight", kTapWidth, kWidth);
-        bulk_fc = expand(fc);
+        if (borrow.host_embed) {
+            tfile = std::make_unique<GgufFile>(target);
+            const auto* te = tfile->find("token_embd.weight");
+            if (!te || te->type != Q4_0 || te->shape != std::vector<uint64_t>{uint64_t(kWidth), uint64_t(kVocab)})
+                throw std::runtime_error(target + ": token_embd.weight is not Q4_0 [2560, 248320]");
+            emb_host = static_cast<const uint8_t*>(tfile->tensor_data(*te));
+            const size_t stride = kWidth / 32 * 18;
+            auto* rows = alloc<uint8_t>(2 * stride);
+            check(cudaMemcpy(rows + stride, emb_host + size_t(kMask) * stride, stride, cudaMemcpyHostToDevice), "DFlash2 mask embedding");
+            check(cudaMallocHost(reinterpret_cast<void**>(&emb_pin), stride), "DFlash2 embedding staging");
+            embedding = {rows, stride, kWidth, 2, Q4_0};
+        } else embedding = load(t, "token_embd.weight", {kWidth, kVocab}, {Q4_0});
+        if (head_mode == 4 || head_mode == 8)
+            phead = pack({map(t, "output.weight", {kWidth, kVocab}, {Q6_K})}, true);
+        else if (borrow.head != nullptr) {
+            if (borrow.head_stride != kWidth / 256 * 210) throw std::invalid_argument("DFlash2: the borrowed head is not Q6_K rows");
+            head = {static_cast<const uint8_t*>(borrow.head), borrow.head_stride, kWidth, kVocab, Q6_K};
+        } else head = load(t, "output.weight", {kWidth, kVocab}, {Q6_K});
+        if (packed) {
+            pfc = pack({source(sensitive, "fc.weight", kTapWidth, kWidth)});
+            psel = pack({source(sensitive, "selector_hidden.weight", kWidth, kRank)});
+        } else {
+            fc = mat(sensitive, "fc.weight", kTapWidth, kWidth);
+            bulk_fc = expand(fc);
+            selector = mat(sensitive, "selector_hidden.weight", kWidth, kRank);
+        }
         cn = param(f, "enc.output_norm.weight", {kWidth});
         fin = param(f, "output_norm.weight", {kWidth});
-        selector = mat(f, "selector_hidden.weight", kWidth, kRank);
-        pred = mat(f, "selector_predecessor.weight", kRank, kVocab);
-        succ = mat(f, "selector_successor.weight", kRank, kVocab);
+        pred = mat(books, "selector_predecessor.weight", kRank, kVocab);
+        succ = mat(books, "selector_successor.weight", kRank, kVocab);
         for (int i = 0; i < kLayers; ++i) {
             auto& l = layers[i];
             const auto name = [&](const char* suffix) { return "blk." + std::to_string(i) + '.' + suffix; };
@@ -530,17 +664,29 @@ struct Drafter::Impl {
             l.kn = param(f, name("attn_k_norm.weight"), {kH});
             l.abase = param(f, name("attn_conv_base"), {kWidth, 2, 2});
             l.fbase = param(f, name("ffn_conv_base"), {kWidth, 2, 2});
-            l.ap = mat(f, name("attn_conv_proj.weight"), kWidth, kDyn);
-            l.fp = mat(f, name("ffn_conv_proj.weight"), kWidth, kDyn);
-            l.q = mat(f, name("attn_q.weight"), kWidth, kQ);
-            l.k = mat(f, name("attn_k.weight"), kWidth, kKV);
-            l.v = mat(f, name("attn_v.weight"), kWidth, kKV);
-            l.o = mat(f, name("attn_output.weight"), kQ, kWidth);
-            l.gate = mat(f, name("ffn_gate.weight"), kWidth, kFF);
-            l.up = mat(f, name("ffn_up.weight"), kWidth, kFF);
-            l.down = mat(f, name("ffn_down.weight"), kFF, kWidth);
-            l.bulk_k = expand(l.k);
-            l.bulk_v = expand(l.v);
+            if (packed) {
+                l.pap = pack({source(sensitive, name("attn_conv_proj.weight"), kWidth, kDyn)});
+                l.pfp = pack({source(f, name("ffn_conv_proj.weight"), kWidth, kDyn)});
+                l.qkv = pack({source(sensitive, name("attn_q.weight"), kWidth, kQ),
+                              source(sensitive, name("attn_k.weight"), kWidth, kKV),
+                              source(sensitive, name("attn_v.weight"), kWidth, kKV)});
+                l.po = pack({source(sensitive, name("attn_output.weight"), kQ, kWidth)});
+                l.gu = pack({source(f, name("ffn_gate.weight"), kWidth, kFF),
+                             source(f, name("ffn_up.weight"), kWidth, kFF)});
+                l.pdown = pack({source(f, name("ffn_down.weight"), kFF, kWidth)});
+            } else {
+                l.ap = mat(sensitive, name("attn_conv_proj.weight"), kWidth, kDyn);
+                l.fp = mat(f, name("ffn_conv_proj.weight"), kWidth, kDyn);
+                l.q = mat(sensitive, name("attn_q.weight"), kWidth, kQ);
+                l.k = mat(sensitive, name("attn_k.weight"), kWidth, kKV);
+                l.v = mat(sensitive, name("attn_v.weight"), kWidth, kKV);
+                l.o = mat(sensitive, name("attn_output.weight"), kQ, kWidth);
+                l.gate = mat(f, name("ffn_gate.weight"), kWidth, kFF);
+                l.up = mat(f, name("ffn_up.weight"), kWidth, kFF);
+                l.down = mat(f, name("ffn_down.weight"), kFF, kWidth);
+                l.bulk_k = expand(l.k);
+                l.bulk_v = expand(l.v);
+            }
             l.kc = alloc<__half>(kWindow * kKV);
             l.vc = alloc<__half>(kWindow * kKV);
         }
@@ -564,14 +710,25 @@ struct Drafter::Impl {
         up = alloc<float>(kFF * kBlock);
         gated = alloc<float>(kFF * kBlock);
         hidden = alloc<float>(kWidth * kBlock);
-        logits = alloc<float>(kVocab * kSteps);
+        if (!head_mode) logits = alloc<float>(kVocab * kSteps);
+        if (int8) {
+            const auto scratch = [&](size_t n) {
+                return Quant{alloc<int8_t>(n), alloc<float>(n / 32), alloc<int32_t>(n / 32)};
+            };
+            aq = scratch(kContextBatch * kTapWidth);
+            aq2 = scratch(kBlock * kFF);
+            if (!packed) rounded = alloc<float>(kContextBatch * kTapWidth);
+        }
         sel = alloc<float>(kRank * kSteps);
         edges = alloc<float>(kTop * kTop * kSteps);
         partial = alloc<float>(kKVHeads * kMaxParts * (kBlock * 4) * (kH + 2));
-        parts = alloc<Candidate>(kTopParts * kTop * kSteps);
+        parts = alloc<Candidate>((head_mode ? kHeadLists : kTopParts) * kTop * kSteps);
         result = alloc<DeviceResult>(1);
         check(cudaMallocHost(reinterpret_cast<void**>(&readback), sizeof(DeviceResult)), "allocate DFlash2 readback");
         check(cudaStreamSynchronize(st), "initialize DFlash2 weights");
+        if (int8 || head_mode || profile != "native")
+            std::cout << "DRAFFAST int8=" << int8 << " planar=" << packed << " profile=" << profile
+                      << " head=" << hmode << " private_head_bytes=" << head_bytes << " layout=" << ly << '\n';
     }
 
     void linear(Matrix w, const float* in, float* out, int rows) {
@@ -591,50 +748,134 @@ struct Drafter::Impl {
         blas_check(cublasSgemm(blas, CUBLAS_OP_T, CUBLAS_OP_N, w.out, n, w.in, &alpha,
                                dense, w.in, in, w.in, &beta, out, w.out), "DFlash2 context GEMM");
     }
+    void quantize(const float* in, int cols, int rows, Quant a) {
+        quantize_kernel<true><<<dim3(ceil_div(cols, 256), rows), 256, 0, st>>>(in, cols, a.q, a.d, a.sum);
+    }
+    void norm_quant(const float* in, const float* w, float* out, int n, Quant a) {
+        rms_norm_quantize_kernel<true><<<n, 256, 0, st>>>(in, w, out, a.q, a.d, a.sum, kWidth, kEps);
+    }
+    const float* activation(const float* in, int cols, int rows) {
+        if (!int8) return in;
+        quantize(in, cols, rows, aq);
+        const int count = cols * rows;
+        roundtrip_kernel<<<ceil_div(count, 256), 256, 0, st>>>(aq, rounded, count);
+        return rounded;
+    }
+    void dense(Packed w, Quant a, float* y, int n, int hint = 0) {
+        packed_product(w, a, {{y, nullptr, nullptr}, {w.out, 0, 0}}, n, layout ? layout : hint, st);
+    }
     void append(const float* taps, int64_t p, int n) {
-        context_product(fc, bulk_fc, taps, x, n);
-        rms_kernel<<<n, 256, 0, st>>>(x, cn, h);
+        if (packed) {
+            quantize(taps, kTapWidth, n, aq);
+            dense(pfc, aq, x, n, 2);
+            norm_quant(x, cn, nullptr, n, aq);
+        } else {
+            context_product(fc, bulk_fc, activation(taps, kTapWidth, n), x, n);
+            rms_kernel<<<n, 256, 0, st>>>(x, cn, h);
+        }
+        const float* inp = packed ? nullptr : activation(h, kWidth, n);
         for (auto& l : layers) {
-            context_product(l.k, l.bulk_k, h, k, n);
-            context_product(l.v, l.bulk_v, h, v, n);
+            if (packed) {
+                packed_product(l.qkv.slice(kQ, 2 * kKV), aq, {{k, v, nullptr}, {kKV, kKV, 0}}, n, 2, st);
+            } else {
+                context_product(l.k, l.bulk_k, inp, k, n);
+                context_product(l.v, l.bulk_v, inp, v, n);
+            }
             norm_rope_kernel<<<dim3(kKVHeads, n), 64, 0, st>>>(k, l.kn, freq, kr, p);
             store_kernel<<<dim3(n, 2), 256, 0, st>>>(kr, v, l.kc, l.vc, p);
         }
         check(cudaGetLastError(), "append DFlash2 context");
     }
+    void block_packed(int32_t anchor, int64_t p, int n) {
+        embed_rows(anchor, n);
+        const int64_t first = empty ? p : std::max(lo, p - (kWindow - n));
+        const int visible = int(p - first), np = ceil_div(visible + n, kChunk);
+        const dim3 conv_grid(kWidth / 256, n);
+        for (const auto& l : layers) {
+            norm_quant(x, l.an, h, n, aq);
+            dense(l.pap, aq, dyn, n, 2);
+            conv_quantize_kernel<true><<<conv_grid, 256, 0, st>>>(h, dyn, l.abase, 0, aq.q, aq.d, aq.sum);
+            packed_product(l.qkv, aq, {{q, k, v}, {kQ, kKV, kKV}}, n, layout, st);
+            norm_rope_kernel<<<dim3(kQHeads, n), 64, 0, st>>>(q, l.qn, freq, qr, p);
+            norm_rope_kernel<<<dim3(kKVHeads, n), 64, 0, st>>>(k, l.kn, freq, kr, p);
+            attend3_part_kernel<<<dim3(kKVHeads, np), 256, 0, st>>>(qr, kr, v, l.kc, l.vc, first, visible, n, partial);
+            attention_merge<<<dim3(kKVHeads, n * 4), kH, 0, st>>>(partial, np, n * 4, att);
+            quantize(att, kQ, n, aq);
+            dense(l.po, aq, projected, n, 2);
+            conv_kernel<<<conv_grid, 256, 0, st>>>(projected, dyn, l.abase, 1, x);
+            norm_quant(x, l.fn, h, n, aq);
+            dense(l.pfp, aq, dyn, n, 2);
+            conv_quantize_kernel<true><<<conv_grid, 256, 0, st>>>(h, dyn, l.fbase, 0, aq.q, aq.d, aq.sum);
+            packed_product(l.gu, aq, {{gate, up, nullptr}, {kFF, kFF, 0}}, n, layout ? layout : 1, st);
+            swiglu_quantize_kernel<true><<<dim3(kFF / 256, n), 256, 0, st>>>(gate, up, kFF, aq.q, aq.d, aq.sum);
+            dense(l.pdown, aq, projected, n, 2);
+            conv_kernel<<<conv_grid, 256, 0, st>>>(projected, dyn, l.fbase, 1, x);
+        }
+        norm_quant(x, fin, hidden, n, aq2);
+    }
     void block_layers(int32_t anchor, int64_t p, int n) {
-        embed_kernel<<<dim3(kWidth / 256, n), 256, 0, st>>>(embedding, anchor, x);
+        embed_rows(anchor, n);
         const int64_t first = empty ? p : std::max(lo, p - (kWindow - n));
         const int visible = int(p - first), np = ceil_div(visible + n, kChunk);
         const dim3 conv_grid(kWidth / 256, n);
         for (const auto& l : layers) {
             rms_kernel<<<n, 256, 0, st>>>(x, l.an, h);
-            linear(l.ap, h, dyn, n);
+            linear(l.ap, activation(h, kWidth, n), dyn, n);
             conv_kernel<<<conv_grid, 256, 0, st>>>(h, dyn, l.abase, 0, prepared);
-            linear(l.q, prepared, q, n);
-            linear(l.k, prepared, k, n);
-            linear(l.v, prepared, v, n);
+            const float* a = activation(prepared, kWidth, n);
+            linear(l.q, a, q, n);
+            linear(l.k, a, k, n);
+            linear(l.v, a, v, n);
             norm_rope_kernel<<<dim3(kQHeads, n), 64, 0, st>>>(q, l.qn, freq, qr, p);
             norm_rope_kernel<<<dim3(kKVHeads, n), 64, 0, st>>>(k, l.kn, freq, kr, p);
             attention_parts<<<dim3(kKVHeads, np), 256, 0, st>>>(qr, kr, v, l.kc, l.vc, first, visible, n, partial);
             attention_merge<<<dim3(kKVHeads, n * 4), kH, 0, st>>>(partial, np, n * 4, att);
-            linear(l.o, att, projected, n);
+            linear(l.o, activation(att, kQ, n), projected, n);
             conv_kernel<<<conv_grid, 256, 0, st>>>(projected, dyn, l.abase, 1, x);
             rms_kernel<<<n, 256, 0, st>>>(x, l.fn, h);
-            linear(l.fp, h, dyn, n);
+            linear(l.fp, activation(h, kWidth, n), dyn, n);
             conv_kernel<<<conv_grid, 256, 0, st>>>(h, dyn, l.fbase, 0, prepared);
-            linear(l.gate, prepared, gate, n);
-            linear(l.up, prepared, up, n);
+            const float* b = activation(prepared, kWidth, n);
+            linear(l.gate, b, gate, n);
+            linear(l.up, b, up, n);
             swiglu_kernel<<<ceil_div(n * kFF, 256), 256, 0, st>>>(gate, up, gated, n * kFF);
-            linear(l.down, gated, projected, n);
+            linear(l.down, activation(gated, kFF, n), projected, n);
             conv_kernel<<<conv_grid, 256, 0, st>>>(projected, dyn, l.fbase, 1, x);
         }
-        rms_kernel<<<n, 256, 0, st>>>(x, fin, hidden);
+        if (int8) norm_quant(x, fin, hidden, n, aq2);
+        else rms_kernel<<<n, 256, 0, st>>>(x, fin, hidden);
+    }
+    template <int M> void run_fast_head() {
+        if (int8) packed_head<M>(phead, head, aq2.slice(kWidth, 1), parts, result, st);
+        else packed_float_head<M>(phead, hidden + kWidth, parts, result, st);
+    }
+    void run_head(int steps) {
+        if (!head_mode) {
+            // Reference mode always uses the original float-activation head.
+            linear(head, hidden + kWidth, logits, steps);
+            top_parts<<<dim3(kTopParts, steps), 64, 0, st>>>(logits, parts);
+            top_merge<<<steps, 256, 0, st>>>(parts, result);
+            return;
+        }
+        switch (steps) {
+#define STEPS(M) case M: run_fast_head<M>(); break
+            STEPS(1); STEPS(2); STEPS(3); STEPS(4); STEPS(5); STEPS(6); STEPS(7);
+#undef STEPS
+            default: throw std::logic_error("invalid DFlash2 steps");
+        }
+    }
+    void select(int steps, int anchor) {
+        if (packed) dense(psel, aq2.slice(kWidth, 1), sel, steps, 2);
+        else linear(selector, activation(hidden + kWidth, kWidth, steps), sel, steps);
+        edges_kernel<<<steps, 256, 0, st>>>(result, sel, pred, succ, anchor, edges);
+        walk_kernel<<<1, 1, 0, st>>>(result, edges, steps);
     }
 };
 
-Drafter::Drafter(const std::string& draft, const std::string& target, int device) : impl_(std::make_unique<Impl>(device)) {
+Drafter::Drafter(const std::string& draft, const std::string& target, int device, Borrow borrow)
+    : impl_(std::make_unique<Impl>(device)) {
     const OnDevice on(device);
+    impl_->borrow = borrow;
     impl_->init(draft, target);
 }
 Drafter::~Drafter() = default;
@@ -669,15 +910,12 @@ Result Drafter::ask(int32_t anchor, int64_t p, int n, Timing* timing, float* hos
     const auto mark = [&](int i) { if (timing) check(cudaEventRecord(d.events[i], d.st), "record ask timing"); };
     const int steps = n - 1;
     mark(0);
-    d.block_layers(anchor, p, n);
+    if (d.packed) d.block_packed(anchor, p, n);
+    else d.block_layers(anchor, p, n);
     mark(1);
-    d.linear(d.head, d.hidden + kWidth, d.logits, steps);
-    top_parts<<<dim3(kTopParts, steps), 64, 0, d.st>>>(d.logits, d.parts);
-    top_merge<<<steps, 256, 0, d.st>>>(d.parts, d.result);
+    d.run_head(steps);
     mark(2);
-    d.linear(d.selector, d.hidden + kWidth, d.sel, steps);
-    edges_kernel<<<steps, 256, 0, d.st>>>(d.result, d.sel, d.pred, d.succ, anchor, d.edges);
-    walk_kernel<<<1, 1, 0, d.st>>>(d.result, d.edges, steps);
+    d.select(steps, anchor);
     mark(3);
     check(cudaGetLastError(), "launch DFlash2 ask");
     check(cudaMemcpyAsync(d.readback, d.result, sizeof(DeviceResult), cudaMemcpyDeviceToHost, d.st), "read DFlash2 candidates");

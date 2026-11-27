@@ -30,9 +30,18 @@ struct Timing {
 
 // One request/cache per instance, not thread-safe. Owns a nonblocking stream and all scratch.
 // Model files are read-only; only the target embedding and output tensors are uploaded.
+// Engine integration: the drafter can borrow the target's resident Q6_K output head (unchanged GGUF rows on the
+// drafter's device) instead of uploading its own copy, and read the two embedding rows an ask needs from the host
+// file instead of uploading the whole Q4_0 table.
+struct Borrow {
+    const void* head = nullptr;   // device, [kVocab] rows of head_stride bytes (Q6_K), on the drafter's device
+    size_t head_stride = 0;
+    bool host_embed = false;
+};
+
 class Drafter {
 public:
-    Drafter(const std::string& draft_gguf, const std::string& target_shard, int device = 0);
+    Drafter(const std::string& draft_gguf, const std::string& target_shard, int device = 0, Borrow borrow = {});
     ~Drafter();
     Drafter(const Drafter&) = delete;
     Drafter& operator=(const Drafter&) = delete;

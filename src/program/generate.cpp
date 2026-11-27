@@ -63,6 +63,12 @@
 #include "strata/core/native_head.hpp"
 #include "strata/core/verify.hpp"
 #include "strata/core/mtp.hpp"
+#if defined(STRATA_HIP_GFX906)
+#include "../core/dflash2_qwen.hpp"
+#endif
+#include "strata/kernels/dflash_qwen.hpp"
+#include "strata/kernels/native_mmvq.hpp"
+#include "strata/spec/dflash2_policy.hpp"
 #include "strata/prefill/prefill.hpp"
 #if defined(STRATA_PREFILL_MMQ)
 #include "strata/prefill/moe_mmq.hpp"
@@ -5481,6 +5487,52 @@ int main(int argc, char** argv) {
             }
         }
     }
+#if defined(STRATA_HIP_GFX906)
+    // STRATA_DFLASH2=<draft gguf> (opt-in, serve, no --mtp, --pipeline-windows 0): the native Qwen3.8 DFlash2 drafter
+    // (src/core/dflash2_qwen.hpp) proposes up to 7 tokens a window.  It lives on STRATA_DFLASH2_DEV (default: the last
+    // stage's GPU) and is allocated here, before the expert caches are sized, so they are sized around it.
+    std::unique_ptr<strata::core::dflash2_qwen::Drafter> df2;
+    int df2_dev = -1;
+    if (const char* dfp = std::getenv("STRATA_DFLASH2"); dfp != nullptr && dfp[0] != 0) {
+        const char* why = !o.serve ? "it needs --serve" : !o.mtp.empty() ? "it replaces --mtp (leave it out)"
+                        : o.pipeline_windows > 0 ? "it needs --pipeline-windows 0" : o.batch > 0 ? "it does not support --batch"
+                        : o.spec < 2 ? "it needs --spec T (2..8)" : nullptr;
+        if (why != nullptr) { std::fprintf(stderr, "strata generate: STRATA_DFLASH2: %s\n", why); return 2; }
+        const char* dv = std::getenv("STRATA_DFLASH2_DEV");
+        df2_dev = dv != nullptr ? std::atoi(dv) : (last_st ? last_st->dev : primary_device);
+        const char* tg = std::getenv("STRATA_DFLASH2_TARGET");
+        const std::string target = tg != nullptr ? std::string(tg)
+                                 : !o.native_head_gguf.empty() ? o.native_head_gguf : o.native_shards.front();
+        size_t f0 = 0, t0 = 0;
+        { const strata::core::OnDevice on(df2_dev); cudaMemGetInfo(&f0, &t0); }
+        const auto df_t0 = std::chrono::steady_clock::now();
+        try {
+            // STRATA_DFLASH2_BORROW=1 (default): the last stage's resident Q6_K head (on the drafter's GPU) instead of
+            // a copy, and the two embedding rows of an ask from the host file instead of the whole table
+            strata::core::dflash2_qwen::Borrow bw;
+            const char* bv = std::getenv("STRATA_DFLASH2_BORROW");
+            if (bv == nullptr || bv[0] != '0') {
+                bw.host_embed = true;
+                if (last_st && last_st->dev == df2_dev && last_st->head.loaded() && last_st->head.type() == 14 &&
+                    !strata::kernels::native_q6_k_packed_enabled()) {
+                    bw.head = last_st->head.weights();
+                    bw.head_stride = last_st->head.row_bytes();
+                }
+            }
+            std::fprintf(stderr, "strata generate: STRATA_DFLASH2: head %s, embeddings %s\n",
+                         bw.head ? "borrowed from the last stage" : "own copy", bw.host_embed ? "from the host file" : "uploaded");
+            df2 = std::make_unique<strata::core::dflash2_qwen::Drafter>(dfp, target, df2_dev, bw);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "strata generate: STRATA_DFLASH2: %s%s\n", e.what(), vram_free_note().c_str());
+            return 1;
+        }
+        size_t f1 = 0;
+        { const strata::core::OnDevice on(df2_dev); cudaMemGetInfo(&f1, &t0); }
+        std::fprintf(stderr, "strata generate: STRATA_DFLASH2: native drafter %s on CUDA%d (target %s): %.0f MiB of VRAM, %.1f s\n",
+                     dfp, df2_dev, target.c_str(), (double) (f0 - f1) / 1048576.0,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - df_t0).count());
+    }
+#endif
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
     // everything allocated after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after
     // it and ate most of the 700 MiB: 128K IQ3_S ended with 30 MiB free, the driver paged, and a request stalled for
@@ -14402,6 +14454,8 @@ int main(int argc, char** argv) {
                 if (mt < 2) return -1;
                 return std::max(a0, n - mt);
             };
+            // STRATA_DFLASH2: the drafter's context is this prompt's (and then this sequence's) last 2048 rows
+            strata::kernels::dflash_qwen::sink_begin(n - 2048 - 16);
             for (const int64_t to : cuts) {
                 if (to <= at) continue;
                 err.clear();
@@ -14535,6 +14589,57 @@ int main(int argc, char** argv) {
             for (int64_t i = 0; i < p; ++i) consumed.push_back((int32_t) ids[(size_t) i]);
             const char* finish = "length";
             const Clock::time_point d0 = Clock::now();
+#if defined(STRATA_HIP_GFX906)
+            // STRATA_DFLASH2 state of this request: the drafter's context reaches df2_hi (-1: empty); df2_k proposals for
+            // the next window are in drafts[0..df2_k)
+            int64_t df2_hi = -1;
+            int df2_k = 0;
+            // STRATA_DFLASH2_T: the window width (1..8), or 0 (the default): ask a full block and verify the prefix the
+            // policy prices best (strata/spec/dflash2_policy.hpp; one learned state for greedy and one for sampled requests)
+            static const int df2_T = [] {
+                const char* e = std::getenv("STRATA_DFLASH2_T");
+                return std::clamp(e != nullptr ? std::atoi(e) : 0, 0, 8);
+            }();
+            static strata::spec::Dflash2Policy df2_pols[2];
+            strata::spec::Dflash2Policy& df2_pol = df2_pols[req_sp.greedy ? 0 : 1];
+            float df2_margin[8] = {};
+            double df2_ask_last = 3.5;
+            int64_t df2_k_sum = 0, df2_k_n = 0;
+            double df2_ctx_ms = 0, df2_ask_ms = 0;
+            int64_t df2_asks = 0, df2_ctx_rows = 0;
+            float* df2_buf = nullptr;   // [128][5][n_embd] on the drafter's GPU
+            if (df2) {
+                df2->reset();
+                const strata::core::OnDevice on(df2_dev);
+                if (cudaMalloc(&df2_buf, (size_t) 128 * 5 * (size_t) g.n_embd * sizeof(float)) != cudaSuccess) {
+                    std::printf("ERR STRATA_DFLASH2: the context staging buffer failed\n");
+                    return 1;
+                }
+            }
+            struct Df2BufFree { float* p; int dev; ~Df2BufFree() { if (p) { const strata::core::OnDevice on(dev); cudaFree(p); } } }
+                df2_buf_free{df2_buf, df2_dev};
+            // the drafter's context through position end - 1 (the committed rows; at most the last 2048)
+            auto df2_feed = [&](int64_t end) -> bool {
+                namespace dq = strata::kernels::dflash_qwen;
+                const Clock::time_point c0 = Clock::now();
+                const int64_t a = std::max<int64_t>(df2_hi < 0 ? 0 : df2_hi, end - 2048);
+                const int64_t s0 = dq::sink_complete_from(a, end);
+                if (df2_hi >= 0 && s0 != df2_hi) { df2->reset(); df2_hi = -1; }   // a gap: start the context again
+                for (int64_t q = s0; q < end;) {
+                    const int cnt = (int) std::min<int64_t>({128, end - q, dq::sink_wrap_rows(q)});
+                    const strata::core::OnDevice on(df2_dev);
+                    if (cudaMemcpyAsync(df2_buf, dq::sink_row(q), (size_t) cnt * 5 * (size_t) g.n_embd * sizeof(float),
+                                        cudaMemcpyHostToDevice, df2->stream()) != cudaSuccess) return false;
+                    df2->context(df2_buf, q, cnt);
+                    if (cudaStreamSynchronize(df2->stream()) != cudaSuccess) return false;
+                    q += cnt;
+                    df2_ctx_rows += cnt;
+                }
+                if (s0 < end) df2_hi = end;
+                df2_ctx_ms += std::chrono::duration<double, std::milli>(Clock::now() - c0).count();
+                return true;
+            };
+#endif
             // STRATA_DECODE_TIMING=1: where a request's decode time goes (one line per request)
             static const bool dec_timing = std::getenv("STRATA_DECODE_TIMING") != nullptr;
             struct DecSnap {
@@ -15241,6 +15346,9 @@ int main(int argc, char** argv) {
                     T = 1;
                     while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
                 }
+#if defined(STRATA_HIP_GFX906)
+                if (df2) T = 1 + df2_k;   // the drafter's proposals are in drafts[0..df2_k)
+#endif
                 if (first_window) T = merge_T > 0 ? merge_T : 1;
                 const bool merged = first_window && merge_T > 0;   // the prompt's last tokens and the first token
                 // a repeat of earlier context (prompt lookup) where the MTP's own first guess agrees: the policy takes it
@@ -15388,6 +15496,9 @@ int main(int argc, char** argv) {
                 }
                 int a = merged ? T - 1 : 0;   // a merged window commits every row, as the prompt windows do
                 while (a < T - 1 && window[(size_t) a + 1] == outv[(size_t) a]) ++a;
+#if defined(STRATA_HIP_GFX906)
+                if (df2 && !first_window && T > 1) df2_pol.observe_accept(df2_margin, T - 1, a);
+#endif
                 // Merged windows contain prompt rows: all must be committed. Keep raw acceptance for the policy.
                 const int kept_rows = merged ? T : strata::core::serve_stop_bound(a + 1, max_new - produced_n, outv.data(), [&](int32_t y) {
                     return std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
@@ -15459,6 +15570,69 @@ int main(int argc, char** argv) {
                     mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 const bool drafted = !use_mtp || eos || produced_n >= max_new ||
                                      mtp.draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(), (float) req_spec_min_p);
+#if defined(STRATA_HIP_GFX906)
+                df2_k = 0;
+                if (df2 && !eos && produced_n < max_new && !stop_req.load()) {
+                    // the kept rows' taps are in the ring (every stage's commit); the next window's anchor is pending
+                    const int64_t np = p + kept_rows;
+                    const int B = (int) std::min<int64_t>({(int64_t) (df2_T > 0 ? df2_T : 8), (int64_t) S, o.max_context - np});
+                    if (!df2_feed(np)) { std::printf("ERR STRATA_DFLASH2: the drafter's context failed\n"); return 1; }
+                    if (B >= 2 && df2_hi == np) {
+                        const Clock::time_point k0 = Clock::now();
+                        try {
+                            // STRATA_DFLASH2_RECORD=<file>: every ask's block {p, anchor, B, tokens} is appended;
+                            // STRATA_DFLASH2_REPLAY=<file>: the recorded blocks are proposed instead (the key must
+                            // match: the same trajectory), so verifier variants run the same speculative work
+                            static std::FILE* rec = [] { const char* f = std::getenv("STRATA_DFLASH2_RECORD"); return f ? std::fopen(f, "ab") : nullptr; }();
+                            static std::FILE* rep = [] { const char* f = std::getenv("STRATA_DFLASH2_REPLAY"); return f ? std::fopen(f, "rb") : nullptr; }();
+                            const int32_t anchor = outv[(size_t) kept_rows - 1];
+                            if (rep != nullptr) {
+                                int64_t key[3];
+                                int32_t tok[7];
+                                if (std::fread(key, sizeof key, 1, rep) != 1 || std::fread(tok, sizeof tok, 1, rep) != 1 ||
+                                    key[0] != np || key[1] != anchor || key[2] != B) {
+                                    std::printf("ERR STRATA_DFLASH2_REPLAY: the trajectory diverged at p %lld\n", (long long) np);
+                                    return 1;
+                                }
+                                for (int i = 0; i < B - 1; ++i) drafts[(size_t) i] = tok[i];
+                                df2_k = B - 1;
+                            } else {
+                                const auto r = df2->ask(anchor, np, B);
+                                for (int i = 0; i < r.steps; ++i) drafts[(size_t) i] = r.tokens[(size_t) i];
+                                df2_k = r.steps;
+                                // the proposal's unary margin: its target-head logit minus the best other candidate's
+                                for (int i = 0; i < r.steps; ++i) {
+                                    const float* u = r.unary.data() + (size_t) i * strata::core::dflash2_qwen::kTop;
+                                    const int32_t* id = r.top_ids.data() + (size_t) i * strata::core::dflash2_qwen::kTop;
+                                    float mine = -INFINITY, other = -INFINITY;
+                                    for (int j = 0; j < strata::core::dflash2_qwen::kTop; ++j)
+                                        (id[j] == r.tokens[(size_t) i] ? mine : other) = std::max(id[j] == r.tokens[(size_t) i] ? mine : other, u[j]);
+                                    df2_margin[i] = mine - other;
+                                }
+                                if (rec != nullptr) {
+                                    const int64_t key[3] = {np, anchor, B};
+                                    int32_t tok[7] = {};
+                                    for (int i = 0; i < r.steps; ++i) tok[i] = r.tokens[(size_t) i];
+                                    std::fwrite(key, sizeof key, 1, rec);
+                                    std::fwrite(tok, sizeof tok, 1, rec);
+                                    std::fflush(rec);
+                                }
+                            }
+                        } catch (const std::exception& e) {
+                            std::printf("ERR STRATA_DFLASH2: %s\n", e.what());
+                            return 1;
+                        }
+                        df2_ask_last = std::chrono::duration<double, std::milli>(Clock::now() - k0).count();
+                        df2_ask_ms += df2_ask_last;
+                        ++df2_asks;
+                        if (df2_T == 0 && df2_k > 0) {
+                            df2_k = df2_pol.choose(df2_margin, df2_k, df2_ask_last);
+                            df2_k_sum += df2_k;
+                            ++df2_k_n;
+                        }
+                    }
+                }
+#endif
                 // Includes skipped drafts, EOS, cancellation, and draft failure. Drain before cache/next-window work.
                 bool primary_drained = true;
                 if (defer_primary_commit) {
@@ -15471,6 +15645,9 @@ int main(int argc, char** argv) {
                     const Clock::time_point tw3 = Clock::now();
                     auto msd = [](Clock::time_point a0, Clock::time_point b0) { return std::chrono::duration<double, std::milli>(b0 - a0).count(); };
                     dt_run += msd(tw0, tw1); dt_commit += msd(tw1, tw2); dt_draft += msd(tw2, tw3);
+#if defined(STRATA_HIP_GFX906)
+                    if (df2 && !first_window) df2_pol.observe_cost(T, msd(tw0, tw2));
+#endif
                     ++dec_windows; dec_T += merged ? 1 : T;   // a merged window's prompt rows are not decode rows
                 }
                 pcie_auto_step(req_pcie_frac);   // the default share, refined from the CPU pool's speed (PcieAuto); a request's own share is left alone
@@ -15504,6 +15681,22 @@ int main(int argc, char** argv) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
+#if defined(STRATA_HIP_GFX906)
+            if (df2 && dec_windows > 0) {
+                std::string depth;
+                for (int d = 0; d < 7; ++d)
+                    if (dp_tested[d] > 0) depth += " " + std::to_string(dp_ok[d]) + "/" + std::to_string(dp_tested[d]);
+                std::string wt;
+                for (int t = 1; t <= 8; ++t) { char b[24]; std::snprintf(b, sizeof b, " %.1f", df2_pol.cost(t)); wt += b; }
+                std::fprintf(stderr, "strata dflash2: policy %s, mean k %.2f, W(T)%s ms\n", req_sp.greedy ? "greedy" : "sampled",
+                             df2_k_n ? (double) df2_k_sum / (double) df2_k_n : 0.0, wt.c_str());
+                std::fprintf(stderr, "strata dflash2: %lld windows, %lld tokens, T %d, %lld asks %.2f ms, context %lld rows %.2f ms "
+                                     "(per window %.2f ms), accepted %lld/%lld, by depth%s\n",
+                             (long long) dec_windows, (long long) produced_n, df2_T, (long long) df2_asks,
+                             df2_asks ? df2_ask_ms / (double) df2_asks : 0.0, (long long) df2_ctx_rows, df2_ctx_ms,
+                             df2_ctx_ms / (double) dec_windows, (long long) draft_accepted, (long long) draft_offered, depth.c_str());
+            }
+#endif
             if (dec_timing && dec_windows > 0) {
                 const DecSnap d1 = dec_snap();
                 const double w = (double) dec_windows, L = (double) g.n_layers;

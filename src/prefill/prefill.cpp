@@ -4899,6 +4899,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (const int tk = strata::kernels::dflash_qwen::tap_of_layer(l);
                 tk >= 0 && strata::kernels::dflash_qwen::taps_dump_enabled())
                 strata::kernels::dflash_qwen::taps_dump_residual(m.R, (int) T, (int) HC, (int) N, tk, p0, m.cs);
+            if (const int tk = strata::kernels::dflash_qwen::tap_of_layer(l);
+                tk >= 0 && strata::kernels::dflash_qwen::sink_enabled())   // STRATA_DFLASH2: the drafter's prompt context
+                strata::kernels::dflash_qwen::sink_residual(m.R, (int) T, (int) HC, (int) N, tk, p0, m.cs);
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
         if (issuer.joinable()) {

@@ -3,6 +3,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
@@ -78,5 +79,132 @@ void taps_dump_residual(const float* R, int rows, int hc, int n, int tap, int64_
     }
     cudaFree(tmp);
 }
+
+namespace {
+struct Sink {
+    float* ring = nullptr;     // [kSinkRows][kTaps][n] pinned, portable
+    int64_t* tag = nullptr;    // [kSinkRows][kTaps]: the position each slice holds, -1: none
+    int n = 0;
+    int64_t lo = 0;
+};
+Sink g_sink;
+std::mutex g_sink_mu;   // allocation only; slices of different taps/positions are disjoint
+}  // namespace
+
+bool sink_enabled() {
+    static const bool on = [] { const char* v = std::getenv("STRATA_DFLASH2"); return v != nullptr && v[0] != 0; }();
+    return on;
+}
+
+void sink_begin(int64_t lo) {
+    if (!sink_enabled()) return;
+    g_sink.lo = lo < 0 ? 0 : lo;
+    if (g_sink.tag != nullptr)
+        for (size_t i = 0; i < (size_t) kSinkRows * kTaps; ++i) g_sink.tag[i] = -1;
+}
+
+namespace {
+void sink_alloc(int n) {
+    std::lock_guard<std::mutex> lk(g_sink_mu);
+    if (g_sink.ring != nullptr) return;
+    void* r = nullptr;
+    if (cudaHostAlloc(&r, (size_t) kSinkRows * kTaps * (size_t) n * sizeof(float), cudaHostAllocPortable) != cudaSuccess) {
+        std::fprintf(stderr, "dflash_qwen: the taps ring (%zu MiB pinned) cannot be allocated\n",
+                     ((size_t) kSinkRows * kTaps * (size_t) n * sizeof(float)) >> 20);
+        std::exit(1);
+    }
+    g_sink.ring = (float*) r;
+    g_sink.tag = new int64_t[(size_t) kSinkRows * kTaps];
+    for (size_t i = 0; i < (size_t) kSinkRows * kTaps; ++i) g_sink.tag[i] = -1;
+    g_sink.n = n;
+}
+// rows [a, b) of `dev` (row 0 at pos0) into the ring, enqueued; returns the first position copied (b: none)
+int64_t sink_copy(const float* dev, int rows, int64_t ld, int n, int tap, int64_t pos0, cudaStream_t s) {
+    sink_alloc(n);
+    if (n != g_sink.n) { std::fprintf(stderr, "dflash_qwen: taps ring width %d != %d\n", n, g_sink.n); std::exit(1); }
+    int64_t a = pos0 > g_sink.lo ? pos0 : g_sink.lo;
+    const int64_t b = pos0 + rows;
+    if (b - a > kSinkRows) a = b - kSinkRows;
+    const int64_t first = a < b ? a : b;
+    while (a < b) {
+        const int64_t slot = a % kSinkRows;
+        const int64_t cnt = std::min<int64_t>(b - a, kSinkRows - slot);
+        const cudaError_t e = cudaMemcpy2DAsync(g_sink.ring + ((size_t) slot * kTaps + tap) * n, (size_t) kTaps * n * sizeof(float),
+                                                dev + (size_t) (a - pos0) * ld, (size_t) ld * sizeof(float), (size_t) n * sizeof(float),
+                                                (size_t) cnt, cudaMemcpyDeviceToHost, s);
+        if (e != cudaSuccess) { std::fprintf(stderr, "dflash_qwen: taps ring copy: %s\n", cudaGetErrorString(e)); std::exit(1); }
+        a += cnt;
+    }
+    return first;
+}
+}  // namespace
+
+void sink_stage_rows(const float* dev, int rows, int64_t ld, int n, int tap, int64_t pos0, void* stream) {
+    if (!sink_enabled() || rows <= 0 || tap < 0 || tap >= kTaps) return;
+    const int64_t b = pos0 + rows;
+    for (int64_t q = std::max<int64_t>(pos0, b - kSinkRows); q < b; ++q)   // a slot being rewritten is not complete
+        if (g_sink.tag != nullptr) g_sink.tag[(size_t) (q % kSinkRows) * kTaps + tap] = -1;
+    (void) sink_copy(dev, rows, ld, n, tap, pos0, (cudaStream_t) stream);
+}
+
+void sink_tag_rows(int tap, int64_t pos0, int rows) {
+    if (!sink_enabled() || rows <= 0 || g_sink.tag == nullptr) return;
+    const int64_t b = pos0 + rows;
+    for (int64_t q = std::max({pos0, g_sink.lo, b - kSinkRows}); q < b; ++q) g_sink.tag[(size_t) (q % kSinkRows) * kTaps + tap] = q;
+}
+
+void sink_rows(const float* dev, int rows, int64_t ld, int n, int tap, int64_t pos0, void* stream) {
+    if (!sink_enabled() || rows <= 0 || tap < 0 || tap >= kTaps) return;
+    sink_alloc(n);
+    const int64_t b = pos0 + rows;
+    for (int64_t q = std::max<int64_t>(pos0, b - kSinkRows); q < b; ++q) g_sink.tag[(size_t) (q % kSinkRows) * kTaps + tap] = -1;
+    const int64_t first = sink_copy(dev, rows, ld, n, tap, pos0, (cudaStream_t) stream);
+    if (first >= b) return;
+    const cudaError_t e = cudaStreamSynchronize((cudaStream_t) stream);
+    if (e != cudaSuccess) { std::fprintf(stderr, "dflash_qwen: taps ring sync: %s\n", cudaGetErrorString(e)); std::exit(1); }
+    for (int64_t q = first; q < b; ++q) g_sink.tag[(size_t) (q % kSinkRows) * kTaps + tap] = q;
+}
+
+void sink_residual(const float* R, int rows, int hc, int n, int tap, int64_t pos0, void* stream) {
+    if (!sink_enabled() || rows <= 0) return;
+    // only the rows the ring keeps
+    int64_t a = pos0 > g_sink.lo ? pos0 : g_sink.lo;
+    const int64_t b = pos0 + rows;
+    if (b - a > kSinkRows) a = b - kSinkRows;
+    if (a >= b) return;
+    constexpr int kChunk = 256;
+    static thread_local float* tmp = nullptr;
+    static thread_local int tmp_dev = -1;
+    int dev = -1;
+    (void) cudaGetDevice(&dev);
+    if (tmp == nullptr || tmp_dev != dev) {
+        if (cudaMalloc(&tmp, (size_t) kChunk * (size_t) n * sizeof(float)) != cudaSuccess) {
+            std::fprintf(stderr, "dflash_qwen: taps ring scratch failed\n");
+            std::exit(1);
+        }
+        tmp_dev = dev;   // (a thread's scratch on one device; never freed - a few MiB)
+    }
+    for (int64_t r0 = a; r0 < b; r0 += kChunk) {
+        const int nr = (int) std::min<int64_t>(kChunk, b - r0);
+        hc_stream_mean(R + (size_t) (r0 - pos0) * hc * n, nr, hc, n, tmp, n, stream);
+        sink_rows(tmp, nr, n, n, tap, r0, stream);
+    }
+}
+
+int64_t sink_complete_from(int64_t a, int64_t b) {
+    if (g_sink.tag == nullptr) return b;
+    int64_t s = b;
+    while (s > a) {
+        const int64_t q = s - 1;
+        bool ok = true;
+        for (int k = 0; k < kTaps && ok; ++k) ok = g_sink.tag[(size_t) (q % kSinkRows) * kTaps + k] == q;
+        if (!ok) break;
+        s = q;
+    }
+    return s;
+}
+
+const float* sink_row(int64_t pos) { return g_sink.ring + (size_t) (pos % kSinkRows) * kTaps * (size_t) g_sink.n; }
+int64_t sink_wrap_rows(int64_t pos) { return kSinkRows - pos % kSinkRows; }
 
 }  // namespace strata::kernels::dflash_qwen

@@ -175,7 +175,7 @@ void latency(df::Drafter& d, const std::string& stem, int reps) {
     append_from_file(d, taps, p - df::kWindow, p, buf);
     std::cout << "LATENCY fixture=" << stem << " pos=" << p << " ring=" << df::kWindow
               << " window=trtllm reps=" << reps << " warmups=" << warmups << '\n';
-    for (int b : {4, 8}) {
+    for (int b : {2, 4, 6, 8}) {
         for (int i = 0; i < warmups; ++i) (void)d.ask(token, p, b);
         std::vector<double> layers, head, selector, total, wall;
         for (int i = 0; i < reps; ++i) {
@@ -190,32 +190,78 @@ void latency(df::Drafter& d, const std::string& stem, int reps) {
                   << " head_ms=" << median(head) << " selector_ms=" << median(selector)
                   << " wall_ms=" << median(wall) << '\n';
     }
-    // Input already GPU-resident: repeat the real anchor's tap row while advancing the full ring.
-    taps.seekg(p * tap_bytes);
-    read(taps, buf.host, df::kTapWidth);
-    check(cudaMemcpyAsync(buf.device, buf.host, tap_bytes, cudaMemcpyHostToDevice, d.stream()), "stage context timing row");
-    for (int i = 0; i < warmups; ++i) { d.context(buf.device, p, 1); ++p; }
+    // Keep input GPU-resident and use the same 128 real tap rows for every variant.
+    const int64_t src = std::min<int64_t>(p, n - batch);
+    taps.seekg(src * tap_bytes);
+    read(taps, buf.host, batch * df::kTapWidth);
+    check(cudaMemcpyAsync(buf.device, buf.host, batch * tap_bytes, cudaMemcpyHostToDevice, d.stream()), "stage context timing rows");
     Events e;
-    std::vector<double> times;
-    for (int i = 0; i < reps; ++i) {
-        check(cudaEventRecord(e.start, d.stream()), "record context start");
-        d.context(buf.device, p, 1); ++p;
-        check(cudaEventRecord(e.stop, d.stream()), "record context stop");
-        check(cudaEventSynchronize(e.stop), "complete timed context append");
-        float ms = 0;
-        check(cudaEventElapsedTime(&ms, e.start, e.stop), "time context append");
-        times.push_back(ms);
+    for (int rows : {1, 8, batch}) {
+        for (int i = 0; i < warmups; ++i) { d.context(buf.device, p, rows); p += rows; }
+        std::vector<double> times;
+        for (int i = 0; i < reps; ++i) {
+            check(cudaEventRecord(e.start, d.stream()), "record context start");
+            d.context(buf.device, p, rows); p += rows;
+            check(cudaEventRecord(e.stop, d.stream()), "record context stop");
+            check(cudaEventSynchronize(e.stop), "complete timed context append");
+            float ms = 0;
+            check(cudaEventElapsedTime(&ms, e.start, e.stop), "time context append");
+            times.push_back(ms);
+        }
+        std::cout << "CONTEXT rows_per_call=" << rows << " gpu_ms=" << median(times)
+                  << " gpu_ms_per_row=" << median(times) / rows << '\n';
     }
-    std::cout << "CONTEXT rows_per_call=1 gpu_ms_per_row=" << median(times) << '\n';
+}
+
+using Histogram = std::array<std::array<int, df::kBlock>, df::kBlock + 1>;
+void acceptance(df::Drafter& d, const std::string& stem, Histogram& all) {
+    auto ids_file = open(stem + ".ids.bin"), start = open(stem + ".start"), taps = open(stem + ".taps.f32");
+    const auto bytes = length(ids_file);
+    const int64_t n = bytes / sizeof(int32_t);
+    int64_t p = 0;
+    if (bytes % sizeof(int32_t) || n < 2 || !(start >> p) || p < 0 || p >= n - 1 || length(taps) != n * tap_bytes)
+        throw std::runtime_error("invalid acceptance trajectory");
+    ids_file.seekg(0);
+    std::vector<int32_t> ids(n);
+    read(ids_file, ids.data(), n);
+    if (std::any_of(ids.begin(), ids.end(), [](int id) { return id < 0 || id >= df::kVocab; }))
+        throw std::runtime_error("invalid trajectory token ID");
+    Buffer staged(batch * df::kTapWidth);
+    d.reset();
+    append_from_file(d, taps, std::max<int64_t>(0, p - df::kWindow + 1), p, staged);
+    Histogram hist{};
+    const int64_t stop = std::min<int64_t>(p + 160, n - 1);
+    for (; p < stop; ++p) {
+        for (int b : {2, 4, 8}) {
+            if (p + b > n) continue;  // Same width-specific stops as accept_study.py.
+            const auto res = d.ask(ids[p], p, b);
+            int accepted = 0;
+            while (accepted < b - 1 && res.tokens[accepted] == ids[p + accepted + 1]) ++accepted;
+            ++hist[b][accepted];
+            ++all[b][accepted];
+        }
+        if (p + 1 < stop) append_from_file(d, taps, p, p + 1, staged);
+    }
+    const auto name = stem.substr(stem.find_last_of('/') + 1);
+    for (int b : {2, 4, 8}) {
+        int count = 0, sum = 0;
+        for (int i = 0; i < b; ++i) { count += hist[b][i]; sum += i * hist[b][i]; }
+        std::cout << "ACCEPT " << name << " B=" << b << " N=" << count << " sum=" << sum
+                  << " mean=" << (count ? double(sum) / count : 0) << " hist=";
+        for (int i = 0; i < b; ++i) std::cout << (i ? "," : "") << hist[b][i];
+        std::cout << std::endl;
+    }
 }
 }  // namespace
 
 int main(int argc, char** argv) try {
     const bool val = argc >= 4 && std::string(argv[3]) == "validate";
     const bool bench = argc == 6 && std::string(argv[3]) == "latency";
-    if ((!val || argc < 6 || argc % 2) && !bench) {
+    const bool study = argc >= 5 && std::string(argv[3]) == "accept";
+    if ((!val || argc < 6 || argc % 2) && !bench && !study) {
         std::cerr << "usage: " << argv[0] << " DRAFT_GGUF TARGET_SHARD validate TAP_STEM ORACLE [TAP_STEM ORACLE ...]\n"
-                  << "       " << argv[0] << " DRAFT_GGUF TARGET_SHARD latency TAP_STEM REPS\n";
+                  << "       " << argv[0] << " DRAFT_GGUF TARGET_SHARD latency TAP_STEM REPS\n"
+                  << "       " << argv[0] << " DRAFT_GGUF TARGET_SHARD accept TAP_STEM [TAP_STEM ...]\n";
         return 2;
     }
     check(cudaSetDevice(0), "set benchmark device 0");
@@ -223,7 +269,24 @@ int main(int argc, char** argv) try {
     check(cudaGetDeviceProperties(&props, 0), "read GPU properties");
     std::cout << "DEVICE " << props.name << " arch=" << props.gcnArchName << " wave=" << props.warpSize
               << " draft=" << argv[1] << '\n' << std::setprecision(8);
+    size_t free_before = 0, free_after = 0, mem_total = 0;
+    check(cudaMemGetInfo(&free_before, &mem_total), "read free VRAM");
     df::Drafter model(argv[1], argv[2]);
+    check(cudaMemGetInfo(&free_after, &mem_total), "read initialized free VRAM");
+    std::cout << "VRAM init_delta_bytes=" << (int64_t(free_before) - int64_t(free_after)) << '\n';
+    if (study) {
+        Histogram all{};
+        for (int i = 4; i < argc; ++i) acceptance(model, argv[i], all);
+        for (int b : {2, 4, 8}) {
+            int count = 0, sum = 0;
+            for (int i = 0; i < b; ++i) { count += all[b][i]; sum += i * all[b][i]; }
+            std::cout << "ACCEPT ALL B=" << b << " N=" << count << " sum=" << sum
+                      << " mean=" << (count ? double(sum) / count : 0) << " hist=";
+            for (int i = 0; i < b; ++i) std::cout << (i ? "," : "") << all[b][i];
+            std::cout << '\n';
+        }
+        return 0;
+    }
     if (val) {
         std::array<Metrics, df::kBlock + 1> all{};
         for (int i = 4; i < argc; i += 2) validate(model, argv[i], argv[i + 1], all);

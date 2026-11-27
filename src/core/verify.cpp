@@ -3238,6 +3238,20 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     // own (a captured kernel would replay the same draws forever).  Row t's draw is Philox(seed, pos0 + t): tied to
     // the POSITION it samples, not to how the text was cut into windows, so a seed replays the same text whatever
     // the drafts were. Exact: a rejected row's draw is discarded, and no kept decision depends on a reused draw.
+    if (strata::kernels::dflash_qwen::sink_enabled() && taps_ != nullptr) {
+        // STRATA_DFLASH2: this stage's taps of all T rows go to the host ring now, behind the later stages' work; the
+        // commit marks the kept ones once this copy has landed (sink_ev_)
+        namespace dq = strata::kernels::dflash_qwen;
+        if (sink_ev_ == nullptr && cudaEventCreateWithFlags(&sink_ev_, cudaEventDisableTiming) != cudaSuccess) {
+            err = "verify: DFlash2 taps event";
+            return false;
+        }
+        const int64_t le = le_ < 0 ? g.n_layers : le_;
+        for (int k = 0; k < dq::kTaps; ++k)
+            if (dq::kTapLayers[k] + 1 >= lb_ && dq::kTapLayers[k] + 1 < le)
+                dq::sink_stage_rows(taps_ + (size_t) k * g.n_embd, T, (int64_t) dq::kTaps * g.n_embd, (int) g.n_embd, k, pos0, cs_);
+        if (cudaEventRecord(sink_ev_, cs_) != cudaSuccess) { err = "verify: DFlash2 taps event record"; return false; }
+    }
     if (le_ < g.n_layers) {   // a layer split's earlier stage: the hand-off is written (synced above)
         ++windows;
         return next_ == nullptr || next_->run(T, tokens, pos0, pool, next_user_, out, err);
@@ -3521,6 +3535,15 @@ bool Verifier::commit(int n_keep, std::string& err, const PrimaryCommitContext* 
             if (dq::kTapLayers[k] + 1 >= lb_ && dq::kTapLayers[k] + 1 < le)
                 dq::taps_dump_rows(taps_ + (size_t) k * g_->n_embd, n_keep, (int64_t) dq::kTaps * g_->n_embd,
                                    (int) g_->n_embd, k, last_pos0_, cs_);
+    }
+    if (strata::kernels::dflash_qwen::sink_enabled() && g_ != nullptr && taps_ != nullptr && sink_ev_ != nullptr) {
+        // STRATA_DFLASH2: the window's taps were copied to the ring when its stage finished (run); the kept rows count
+        namespace dq = strata::kernels::dflash_qwen;
+        const cudaError_t se = cudaEventSynchronize(sink_ev_);
+        if (se != cudaSuccess) { err = std::string("verify: DFlash2 taps copy: ") + cudaGetErrorString(se); return false; }
+        const int64_t le = le_ < 0 ? g_->n_layers : le_;
+        for (int k = 0; k < dq::kTaps; ++k)
+            if (dq::kTapLayers[k] + 1 >= lb_ && dq::kTapLayers[k] + 1 < le) dq::sink_tag_rows(k, last_pos0_, n_keep);
     }
     const Clock::time_point t0 = Clock::now();
     h_commit_[0] = n_keep;
