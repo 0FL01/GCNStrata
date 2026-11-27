@@ -1,243 +1,190 @@
-<h1 align="center">Strata</h1>
+<h1 align="center">GCNStrata</h1>
 
-**English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
+<p align="center"><b>Hardware-specialized LLM inference for AMD gfx906</b><br>
+Vega 20 · ROCm / HIP · Multi-GPU · Long-context agents</p>
 
-<p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
-NVIDIA or AMD graphics card (12 GB or more) · Windows or Linux · free and open source</p>
+GCNStrata is an independent, hardware-specialized fork of [Strata](https://github.com/Niko1221/Strata).
+Its focus is efficient local inference of **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)**
+and **[Inkling-2-Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini)** on AMD Vega 20 GPUs.
 
-<p align="center"><a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4"><img src="docs/media/pagoda-preview.webp" width="720" alt="A voxel pagoda garden that Strata's model wrote, running in the browser"></a><br>
-<sub>A voxel pagoda garden, 1 shot prompt running on an RTX 5070 with Strata (IQ3_S, 128K context) ·
-<a href="https://github.com/Niko1221/Strata/releases/download/v0.1.10/Pagoda.mp4">full video (49 s)</a></sub></p>
+The project develops native wave64 kernels, quantized MoE execution, phase-adaptive multi-GPU scheduling,
+speculative decoding, and efficient long-context session handling. The objective is lower end-to-end latency
+for coding agents and multi-turn tool workflows, not just higher isolated kernel throughput.
 
-Strata runs **[Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next)** on a normal PC. This is a
-large, smart AI model that usually needs a server. It chats, writes code, reads pictures and works with your apps
-and coding agents. Nothing leaves your PC.
+## Hardware scope
 
-## How fast is it?
+- **Target ISA:** AMD gfx906 (Vega 20), including Instinct MI50 / MI60, Radeon VII and Radeon Pro VII.
+- **Qualified reference system:** four 16 GiB gfx906 GPUs (64 GiB total VRAM), Intel Xeon E5-2698B v3
+  (16 cores / 32 threads), 121 GiB usable system RAM, Linux and community ROCm/HIP 7.14.
+- **Multi-GPU:** PCIe peer-to-peer transfers and topology-aware execution. The optimized four-GPU
+  Inkling paths require the appropriate peer access and memory budget.
+- **Other hardware:** the repository retains inherited Strata backends, but other GCN generations,
+  RDNA, NVIDIA, Intel and macOS are outside this fork's qualification scope. Sharing an ISA does
+  not by itself qualify a different board, driver, or GPU count.
 
-We measured it on two ordinary gaming PCs. A token is about ¾ of a word.
+For RDNA2-specific work, see [RedStrata](https://github.com/0FL01/RedStrata).
 
-- **Writes answers:** how fast the reply appears in a short chat. 60 tokens per second is faster than you can read.
-- **Reads your prompt:** how fast it takes in what you send (here a 32K-token document, code or chat history).
+## Model backends
 
-<table>
-<tr><th>NVIDIA: RTX 5070 (12 GB), Ryzen 5 7600, 64 GB RAM</th><th>AMD: RX 9070 XT (16 GB), Ryzen 9 3900X, 47 GB RAM</th></tr>
-<tr><td>
+### Inkling-2-Mini — `strata-poly`
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 94 tokens/s | 2,650 tokens/s |
-| **IQ2_XS** | 79 tokens/s | 2,090 tokens/s |
-| **IQ3_XXS** | 62 tokens/s | 1,750 tokens/s |
-| **IQ3_S** | 53 tokens/s | 1,620 tokens/s |
-| **Coder** | 55 tokens/s | 2,180 tokens/s |
+The current four-GPU production path uses a Q4_0 target, Q8_0 KV cache, a configured 256K context limit
+and a native mixed-precision DFlash2 drafter.
 
-</td><td>
+- Fully GPU-resident routed experts on a TP2 target pair, with additional co-resident stage weights on the other pair.
+- Width-invariant speculative verification, row-shared quantized GEMV and multiplicity-aware expert kernels.
+- Native [DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2), fused private vocabulary head and
+  zero-lag provisional context updates.
+- Phase-adaptive DualTP prefill with overlapped pipeline stages, asynchronous KV deltas and balanced microbatches.
+- Four-GPU target vocabulary projection, persistent attention helpers, exact filtered sampling and suffix-aware restore.
+- Optional CPU image encoder ([vision build guide](tools/vision/INKLING.md)).
 
-| Size | Writes answers | Reads your prompt |
-| --- | ---: | ---: |
-| **Q2_0** | 60 tokens/s | 1,160 tokens/s |
-| **IQ2_XS** | 52 tokens/s | 1,110 tokens/s |
-| **Coder** | 44 tokens/s | 1,420 tokens/s |
+### Qwen3.8-Flash-Next — `strata`
 
-</td></tr>
-</table>
+The native Qwen backend targets a much larger hybrid CPU/GPU model. The previously qualified B3 Q4_0
+configuration uses four layer-split GPUs, adaptive expert residency in HBM, host-resident experts and
+N-gram/PLE data, INT8 KV and MTP speculative decoding.
 
-NVIDIA: Q2_0 with engine 0.1.36, the other rows with 0.1.26 (4K answers, 32K prompts). The full tables are in
-[DETAILS.md](docs/DETAILS.md#speed-measured). A card with more VRAM is faster: an RTX 3090 (24 GB) should write
-about 100-140 tokens per second. Long chats and other cards: [speed of each model](docs/MODELS.md#how-fast-is-each-size),
-[community results](docs/COMMUNITY_BENCHMARKS.md).
+Its gfx906-specific work includes optimized Gated Residual / hyper-connection operations,
+Gated DeltaNet recurrence, Qwen Sparse Attention, grouped MoE MMQ, pipeline scheduling and
+adaptive vocabulary head splitting.
 
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a><br>
-<sub>Strata is free. If it runs well on your PC, a coffee keeps the work on it going.</sub></p>
+Porting the latest Inkling execution improvements to Qwen, and integrating
+[Qwen3.8-Flash-Next-DFlash2](https://huggingface.co/incoai/Qwen3.8-Flash-Next-DFlash2), are active research
+directions. Qwen DFlash2 is not yet a qualified native feature of this fork.
 
-## What you need
+## Measured performance
 
-| | |
-| --- | --- |
-| **Graphics card** | **NVIDIA** GeForce RTX 20, 30, 40 or 50 series, or **AMD** Radeon RX 7900 XT / XTX, RX 7800 XT / 7700 XT, RX 9060 XT, RX 9070 / 9070 XT, Radeon AI PRO R9700 or RX 6800 / 6900 series. It needs **12 GB of VRAM or more**. |
-| **RAM** | 32 GB or more. Your RAM decides [which model](#which-model-should-i-pick) fits. 64 GB runs every size. |
-| **Disk** | About 80 GB free. Use an SSD if you can: the first start is much faster. |
-| **System** | Windows 10 / 11 or Linux, and a current graphics driver from NVIDIA or AMD. |
+All numbers below refer to specific measured configurations of the four-GPU reference system,
+not guaranteed performance on every gfx906 card or quantization.
 
-The installer sets up everything else. Two or three cards can share the model ([multi-GPU](docs/MULTI_GPU.md)).
+### Inkling-2-Mini
 
-Experimental, written and tested by community members on their own machines:
+**V8-R3, November 27, 2026** — Q4_0 target, mixed-precision DFlash2, Q8_0 KV,
+[engine commit `bd13ef75`](https://github.com/0FL01/GCNStrata/commit/bd13ef75708dfa70cf27561d37ce682583db0870).
 
-- **Older graphics cards** (Tesla P40 / V100, GTX 10, Radeon VII / MI50, RX 6700 XT, RX 5500 XT): [Older GPUs](docs/OLDER_GPUS.md).
-- **Intel Arc**, built from source on Linux: [Intel Arc](docs/INTEL_ARC.md).
-- **Apple Silicon Macs (M1 to M5)**, built from source by `./setup.sh` (the Metal engine): [Mac](docs/MAC.md).
-- **AMD Ryzen AI Max (Strix Halo)**, built from source on Linux: [Strix Halo](docs/STRIX_HALO.md).
-- **Older processors without AVX2**: they work, but slowly. [Older CPUs](docs/INSTALL.md#older-cpus-experimental).
+| Workload | Measured result |
+| --- | ---: |
+| Cold prefill, 19,127 fresh tokens | **2,113 tok/s** (9.05 s) |
+| Long prefill, 49,152 fresh + 16,384 reused | **1,455 tok/s** (33.77 s) |
+| Sampled AgentOps decode, 1,553 output tokens across nine turns | **90.1 tok/s** |
+| Full nine-turn AgentOps client wall time | **33.30 s** |
+| Restore, 23,283 reused + 1 fresh token | **42.3 ms** engine prompt time |
+| Filtered decode, 2K prompt, top-k 0 / top-p 0.95 | **46.3 tok/s** (previously 22.7) |
+| Filtered decode, 2K prompt, top-k 0 / min-p 0.05 | **133.4 tok/s** (previously 29.4) |
 
-The full list: [docs/INSTALL.md](docs/INSTALL.md#what-you-need).
+The filtered cases use different sampling distributions; they are not interchangeable measures of model speed.
+The V8 qualification matched the checked output SHA fingerprints across eight serving phases and nine
+AgentOps turns. Kernel and sampler tests separately check bitwise arithmetic and RNG parity.
 
-## Install
+[Qualification summary, baselines and limitations](bench/results/2026-11-27-gfx906-inkling2-v8/README.md).
 
-### Let your AI set it up
+### Qwen3.8-Flash-Next
 
-Do you use an AI coding assistant (Claude Code, Cursor, Codex, GitHub Copilot, ...)? Paste this into it:
+**Historical B3 Q4_0 baseline, November 22, 2026** —
+[engine commit `453e60db`](https://github.com/0FL01/GCNStrata/commit/453e60db),
+four gfx906 GPUs, native MTP, INT8 KV, adaptive expert residency.
+
+| Workload | Measured result |
+| --- | ---: |
+| Cold prefill, ~4K | 729 tok/s |
+| Cold prefill, ~16K | 1,270 tok/s |
+| Cold prefill, 60–64K | **1,756 tok/s** |
+| Append ~4K after 60–64K | 574 tok/s |
+| Sampled coding / explanation / review workloads | 67.9–82.1 tok/s |
+
+These Qwen results predate the Inkling V4–V8 research. They are not estimates of the upcoming Qwen port.
+[Prefill qualification and raw measurements](bench/results/2026-11-22-gfx906-prefill/after-direct/README.md).
+
+## Phase-adaptive execution
+
+The current Inkling path uses the same physical GPUs differently depending on the inference phase.
 
 ```text
-Set up Strata on this PC for me: https://github.com/Niko1221/Strata - follow docs/AI_SETUP.md in that repository.
+Cold / medium prefill
+  GPU 0 + GPU 1   Stage A (TP2)
+        |        asynchronous activation handoff
+  GPU 2 + GPU 3   Stage B (TP2)
+
+Autoregressive / speculative decode
+  GPU 0 + GPU 1   canonical target verifier (TP2)
+  GPU 2 + GPU 3   DFlash2 + context-dependent attention helpers
+  GPU 0..3       sharded target vocabulary projection
 ```
 
-It checks your graphics card, RAM and disk and picks the model that fits. Then it installs and starts it and tells
-you how to connect your apps. AI tools can also install, start and stop Strata through its
-[MCP server](docs/MCP_SERVER.md).
+Stage weights remain resident across phase transitions. The engine preserves canonical target state
+while overlapping data movement and useful compute. A scheduler chooses execution geometry for
+fresh prompts, incremental appends and decode rather than forcing one layout onto every workload.
 
-### Or do it yourself
+Qwen's much larger weight footprint requires a different memory and scheduling strategy: all four
+GPUs hold target stages and expert caches, with host RAM supplying non-resident data. Inkling's
+co-resident TP2 layout is not simply copied to Qwen.
 
-[Download Strata](https://github.com/Niko1221/Strata/archive/refs/heads/main.zip) and unzip it (or `git clone` it).
-**Windows:** double-click **`START-HERE.bat`**. **Linux:** run **`./setup.sh`** in the Strata folder.
+## Build on Linux
 
-**Mac (Apple Silicon, M1 to M5, macOS 15 or newer):** install Apple's Command Line Tools once
-(`xcode-select --install` in Terminal; Xcode itself is not needed). Then open Terminal in the Strata folder and run
-**`./setup.sh`**. It builds the Mac engine on your Mac (about 7 minutes), asks the same questions, downloads the model
-and starts it. Next time, `./setup.sh` starts it right away. Which size fits your Mac and how fast it is:
-[docs/MAC.md](docs/MAC.md).
+Use a ROCm/HIP toolchain with working gfx906 libraries. The reference build uses the community
+[`mixa3607/rocm-gfx906:7.14-complete`](https://hub.docker.com/r/mixa3607/rocm-gfx906) image.
+The inherited wave32 HIP backend is not the gfx906 backend.
 
-The steps are the same for NVIDIA and AMD. The installer finds your card and sets up the right engine for it. It
-asks you a few questions:
+Inside a suitable build environment with CMake, Ninja, Git, Python and the ROCm Clang toolchain:
 
-- which model and which size,
-- how much context (how much text the model keeps in mind),
-- whether it should read pictures.
+```sh
+git clone https://github.com/0FL01/GCNStrata.git
+cd GCNStrata
 
-Press Enter each time for the recommended answer. Then it downloads the model (about 70 GB) and starts it. If the
-download stops, run it again: it continues where it left off. Your browser opens the Strata app at
-`http://127.0.0.1:8080`.
+cmake -S . -B build-906 -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSTRATA_HIP_GFX906=ON \
+  -DCMAKE_HIP_ARCHITECTURES=gfx906 \
+  -DSTRATA_NATIVE_EXPERTS=ON \
+  -DSTRATA_PREFILL_MMQ=ON \
+  -DCMAKE_C_COMPILER=/opt/rocm/llvm/bin/clang \
+  -DCMAKE_CXX_COMPILER=/opt/rocm/llvm/bin/clang++
 
-> **While the model starts, your PC can be slow or stop responding for 1-3 minutes** (longest the first time).
-> Strata loads 35-55 GB into your RAM and locks part of it for the graphics card. This is normal. Wait, and don't
-> close the window. The window shows what Strata is doing.
-
-**Next time**, run `START-HERE.bat` (or `./setup.sh`) again. It starts right away and downloads nothing twice. Close
-its window to stop the model. `UPDATE.bat` (`./update.sh`) updates Strata without starting it. Updating, Docker,
-several cards, where the files go and every option: [docs/INSTALL.md](docs/INSTALL.md).
-
-**Is it fast on your PC?** Run `BENCH.bat` (`./bench.sh`): about 5-10 minutes, it measures chat, 4K/16K prompts and an agent-style session with your own settings and writes a report to share ([how](docs/COMMUNITY_BENCHMARKS.md#run-the-benchmark)).
-
-## Which model should I pick?
-
-The installer recommends one for your RAM. The same model comes in several sizes, compressed more or less. Smaller
-sizes are faster. Larger sizes are a bit smarter.
-
-| Your RAM | Take | Why |
-| --- | --- | --- |
-| **32 GB** | **Coder** | it fits 32 GB, and it is made for code (with a 24 GB card, Q2_0 and IQ2_XS run too) |
-| **48 GB** | **IQ2_XS** (or Q2_0, the fastest) | the larger sizes do not fit |
-| **64 GB** | **IQ2_XS** (recommended), or IQ3_XXS / IQ3_S | every size fits; IQ3_S is the best and the slowest |
-| **96 GB or more** | **IQ3_S**, or Unsloth's UD-IQ4_XS (~4-bit) | room for the largest sizes with everything else open |
-
-- **[Coder](docs/MODELS.md#coder):** a coding version with half of the experts removed. It reaches 91% of the full
-  model's SWE-bench Verified score (measured by its authors) and fits 32 GB of RAM. It is weaker outside code,
-  including Chinese and other CJK text (#438). For those, take Q2_0, IQ2_XS or IQ3_S, which keep every expert.
-- **[Swift 1.5](docs/MODELS.md#swift-15):** a fine-tune that thinks for a much shorter time before it answers. You
-  get the answer sooner, at about the same quality.
-- **[Unsloth UD-IQ4_XS](docs/MODELS.md#unsloth-ud-iq4_xs):** Unsloth's ~4-bit version, between IQ3_S and
-  UD-Q4_K_XL in quality. A 94 GB download. With less than ~80 GB of RAM, Strata reads part of it from the SSD
-  while it answers, so it is slower there (an NVMe SSD helps).
-- **[Unsloth UD-Q4_K_XL, UD-Q5_K_XL, UD-Q6_K_XL and Q8_0](docs/MODELS.md#unsloths-files-ud-iq4_xs-to-q8_0):**
-  4- to 8-bit, closer to the full model (93-95% the same next token as Q8_0). Fast where every expert fits in RAM
-  (~88 GB for UD-Q4_K_XL up to ~136 GB for Q8_0); with less RAM Strata reads part of them from the SSD while it
-  answers, which is much slower (7-8.5 tokens/s for UD-Q4_K_XL on a 64 GB PC).
-- **[OrcaRouter's Uncensored IQ3_XXS](docs/MODELS.md#orcarouter-uncensored-iq3_xxs):** you set it up by hand. It is
-  not in the installer's menu.
-
-Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add another model later, run
-`SETUP.bat` (Linux: `./setup.sh --setup`).
-
-## Using it
-
-<p align="center"><img src="docs/media/runpagoda.png" width="900" alt="The Strata app's Monitor tab next to a coding agent"><br>
-<sub>The Strata app's <b>Monitor</b> (left) while a coding agent writes the pagoda garden from the video (right)</sub></p>
-
-- **In the browser:** open `http://127.0.0.1:8080`. It has **Chat**, a live **Monitor** of the model and your
-  GPU/CPU/RAM, and **About** with the settings and addresses.
-- **Your apps and coding agents:** add an "OpenAI-compatible" provider with the base URL
-  **`http://127.0.0.1:8080/v1`**. Any API key and any model name work.
-  - Apps that use Anthropic's API: `http://127.0.0.1:8080/v1/messages` (Claude Code:
-    `ANTHROPIC_BASE_URL=http://127.0.0.1:8080`).
-  - Codex CLI and other apps that use the OpenAI Responses API: `/v1/responses`
-    ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
-- **Thinking:** choose **off, low, medium or high** in the chat menu or in your app's "reasoning effort". Off is the
-  fastest. High is best for hard questions.
-- **Pictures:** say yes to "Images?" in setup. Then click **Picture** in the chat, or attach pictures in your app.
-  AMD cards read pictures on Linux through the processor; on Windows they can't yet.
-- **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
-- **One request at a time:** by default Strata answers one request, and the others wait. To answer several at once,
-  set `"parallel": 2` ([BATCHING.md](docs/BATCHING.md)). On a 12 GB card this makes each answer slower.
-- **Long prompts:** Strata reads the first message of a chat in full, about 1 minute per 30,000 tokens. Follow-up
-  messages start in seconds.
-
-More: [where your chats are stored](docs/INSTALL.md#where-things-are-stored), [the API](docs/DETAILS.md#using-it).
-
-### Optional: more speed on one card when the whole model fits in RAM
-
-Two opt-in settings (by RubenTorney, #1904 and #1905). They help when you run one graphics card and your RAM holds
-every expert (Strata's arena mode, for example Q2_0 or IQ3_XXS on a 64 GB PC). Open your config,
-`strata-<model>.json` in the Strata data folder ([where](docs/INSTALL.md#where-things-are-stored)), and add:
-
-- **Faster decode:** `"--adapt-async", "1"` to the `"args"` list. The expert cache then updates on a helper thread
-  instead of pausing the answer. Measured on an RTX 5070 (Windows, Q2_0): +4-5% decode, +7-10% on code and long
-  documents. Answers can differ slightly from the default (they stay the same from run to run).
-- **Faster prompt reading on Windows:** `"STRATA_PIN_BY_NEED": "1"` in the `"env"` block. Windows can lock only about
-  half the RAM for the graphics card; this locks the experts the card actually needs first. Measured on the RTX 5070:
-  +4.4% prompt reading.
-
-```json
-"args": [ ..., "--adapt-async", "1" ],
-"env": { "STRATA_PIN_BY_NEED": "1" }
+cmake --build build-906 --target strata strata-poly
 ```
 
-Restart Strata (`START-HERE.bat` or `./setup.sh`) after the change. To undo, remove the two entries.
+CMake fetches the pinned llama.cpp dependency unless `STRATA_GGML_DIR` points to a compatible local
+checkout. See [AMD HIP build and kernel notes](docs/AMD_HIP.md) for dependencies, gfx906 compatibility,
+optional Qwen HC build flags, and runtime tuning. Container execution requires access to `/dev/kfd`
+and `/dev/dri`.
 
-## Something went wrong?
+This is the source-build entry point, not a complete model-specific launch preset. Download compatible
+model weights separately, prepare the Qwen pack when required, and choose an explicit configuration
+for your hardware. Most specialized execution paths are opt-in; compiling the binaries alone does not
+reproduce the benchmark settings.
 
-- **My PC froze the first time Strata started.** This is normal while it loads the model. Wait, and don't close the
-  window. Still frozen after 10 minutes? Restart the PC, close other programs and try again, or pick a smaller size.
-- **It stopped while downloading or installing.** Run `START-HERE.bat` (or `./setup.sh`) again. It continues where
-  it stopped.
-- **It's very slow and the disk light keeps blinking, or it says "the engine stopped unexpectedly".** Your PC does
-  not have enough free RAM. Close other programs (browsers use a lot), or pick a smaller size (Q2_0 or IQ2_XS).
-- **It says port 8080 is already in use.** Strata is already running. Look for its window.
+## Serving and AgentOps
 
-More problems and their fixes: [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md). Still stuck? Open an
-[issue](https://github.com/Niko1221/Strata/issues) and attach `strata-<model>.log` from the Strata folder. Found a
-security problem? Report it privately: [SECURITY.md](SECURITY.md).
+The Python server in `serve/` exposes OpenAI- and Anthropic-compatible APIs, including streaming,
+reasoning, tool calls and model-dependent image support. Configure the appropriate native executable
+(`strata` or `strata-poly`) and model paths before starting it.
 
-## How does it work?
+Use `http://127.0.0.1:8080/v1` as the OpenAI-compatible base URL for a local server configured on port
+8080. Require an API key before exposing it to another machine. See the
+[API and server reference](docs/DETAILS.md) and [reverse proxy guide](docs/REVERSE_PROXY.md).
+Some inherited setup instructions target the upstream project rather than the qualified gfx906 path.
 
-Models like this one usually run on servers with hundreds of gigabytes of graphics memory. Your graphics card has
-12-24 GB. Strata makes the model fit by **sharing the work across your whole PC**. Think of a kitchen: the things
-you use all the time stay on the counter, and the rest waits in the pantry.
+## Research priorities
 
-<p align="center"><img src="docs/media/how-it-works.svg" width="860" alt="The model's 24,576 experts: the busiest on the graphics card, all of them in RAM, a lookup table on the SSD"></p>
+- **Qwen3.8-Flash-Next:** native DFlash2 integration, width-invariant GDN/QSA verification, HC fusion,
+  residency-aware multi-row MoE and cross-architecture ports from Inkling.
+- **Inkling-2-Mini:** long-context attention, adaptive speculation, exact sampling, GPU-resident
+  session state and further phase-aware scheduling.
+- **Shared infrastructure:** wave64 quantized kernels, PCIe-aware execution, low-overhead state
+  transfers, reproducible kernel and end-to-end benchmarks.
 
-- **The model is a team of 24,576 small specialists ("experts").** Each word needs only 10 of them.
-- **Your graphics card** keeps the few thousand experts that are used most often. **Your RAM** holds all of them,
-  and **your processor** works on the rest at the same time. **Your SSD** holds a big lookup table.
-
-<p align="center"><img src="docs/media/guess-and-check.svg" width="860" alt="A small helper guesses the next words; the big model checks them all at once and keeps the right ones"></p>
-
-- **Guess, then check:** a small helper guesses the next few words. The big model checks them all at once. You get
-  the same answer, 1.6-1.8x sooner.
-- **Long texts are read in big pieces** (up to 8,192 tokens at a time), at over 1,000 tokens per second.
-
-The longer explanation: [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md). Every part and its numbers:
-[the details](docs/DETAILS.md#how-it-works) and the [paper](docs/paper/Strata-Paper.pdf).
+Performance changes are evaluated on real hardware with paired controls, output/state correctness
+checks and documented negative results. See [AGENTS.md](AGENTS.md) for development and qualification rules.
 
 ## Credits and license
 
-The model is [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team. It was
-compressed by [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF), UkisAI (Swift 1.5)
-and Unsloth. Strata uses parts of [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp). All credits:
-[docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md#credits). Strata is open source under the [MIT License](LICENSE). A few
-parts and every model have their own licenses ([which ones](docs/HOW_IT_WORKS.md#license)).
+GCNStrata builds on [Niko1221/Strata](https://github.com/Niko1221/Strata) and the work of its contributors.
+The Inkling backend draws on PolyStrata / [RedStrata](https://github.com/0FL01/RedStrata);
+the model and drafter work comes from the respective Qwen, Thinking Machines and Inco AI teams.
+The project uses [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) and other dependencies.
+Quantized weights and model derivatives are distributed by their respective authors.
 
-## Support Strata
-
-Strata is free and open source. If it is useful to you, you can support its development:
-
-<p align="center"><a href="https://buymeacoffee.com/strataengine"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" height="50"></a></p>
+The inherited engine is open source under the [MIT License](LICENSE). Individual dependencies
+and model weights have their own licenses. Upstream architecture and historical benchmark
+documentation remain in the repository for attribution and technical reference.

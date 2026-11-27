@@ -43,7 +43,7 @@ exactness controls. They are not proof for every production profile, language or
 Smaller draft vocabulary can improve or worsen acceptance. Validate representative
 requests under the actual deployment settings before adopting it.
 
-The [pinned research report](https://github.com/0FL01/Strata/blob/05e996d7ec2e11107eff65eb2d22997e7e911950/docs/goals/2026-10-31-qengine-gfx906-results.md)
+The [pinned research report](https://github.com/0FL01/GCNStrata/blob/05e996d7ec2e11107eff65eb2d22997e7e911950/docs/goals/2026-10-31-qengine-gfx906-results.md)
 contains the full measurements, negative experiments and limitations. The mechanism was
 already in Strata; no QEngine implementation or asset was copied.
 

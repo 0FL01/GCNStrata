@@ -1,24 +1,14 @@
 # AGENTS.md
 
-This fork targets **AMD gfx906 only** (MI50 / Radeon Pro VII). Other upstream backend sources are retained,
-but NVIDIA CUDA, other AMD architectures and SYCL are not supported qualification targets. It has a C++/HIP engine
-(`src/`, `include/`), a Python server with an OpenAI- and Anthropic-compatible API and a web app (`serve/`), and a
-one-click installer (`setup.py`, started by `START-HERE.bat` / `setup.sh`).
+GCNStrata is a hardware-specialized fork of [Strata](https://github.com/Niko1221/Strata) targeting **AMD gfx906 only** (Vega 20: Instinct MI50 / MI60, Radeon VII / Radeon Pro VII). The maintained qualification platform is four 16 GiB gfx906 GPUs on Linux with ROCm/HIP. Other upstream backend sources are retained, but NVIDIA CUDA, other AMD architectures and SYCL are not supported qualification targets.
 
-Focus development and optimization on **Inkling 2 Mini** inference in `strata-poly` (`src/poly/`) on gfx906.
-Use [PolyStrata's Inkling 2 Mini inference graph](https://github.com/0FL01/PolyStrata/blob/main/docs/INKLING2.md)
-as the architecture reference. Qwen-specific work is deferred.
+Focus development and optimization on **both Qwen3.8-Flash-Next and Inkling-2-Mini** on gfx906. Qwen uses the native `strata` engine (`src/program/`); Inkling uses `strata-poly` (`src/poly/`). Use [RedStrata's Inkling architecture reference](https://github.com/0FL01/RedStrata/blob/main/docs/INKLING2.md) as a donor reference, not as a substitute for measurement on gfx906.
 
-For Qwen only: compare four-MI50 prefill against the [B3 Q4_0 baseline](bench/results/2026-11-22-gfx906-prefill/README.md),
-not the older Q4_1 deployment. Use `--adapt-every 0` and greedy decoding for token-divergence checks because the
-adaptive expert cache makes outputs depend on timing.
+For Qwen, compare against the [qualified B3 Q4_0 baseline](bench/results/2026-11-22-gfx906-prefill/after-direct/README.md), not the older Q4_1 deployment. Use `--adapt-every 0` and greedy decoding for token-divergence checks because the adaptive expert cache makes outputs depend on timing. Native DFlash2 for Qwen is a research goal, not an already qualified feature. For Inkling, use the [V8 qualification baseline](bench/results/2026-11-27-gfx906-inkling2-v8/README.md).
 
-## Installing Strata for a user
+## Installing GCNStrata for a user
 
-Follow **[docs/AI_SETUP.md](docs/AI_SETUP.md)**: check the PC, pick the model by RAM, run setup non-interactively,
-start and verify the server, and connect the user's apps. Never expose the server beyond `127.0.0.1` without
-`--api-key`. As an alternative to shell commands, Strata's MCP server ([docs/MCP_SERVER.md](docs/MCP_SERVER.md))
-offers the same steps as tools.
+Use the manual gfx906 source-build route in [README.md](README.md) and [docs/AMD_HIP.md](docs/AMD_HIP.md). Check GPU ISA, ROCm libraries, VRAM, RAM and disk before preparing model weights and an explicit engine/server configuration. Do not assume the inherited one-click installer selects the qualified gfx906 path. Start and verify the server, then connect the user's apps. Never expose the server beyond `127.0.0.1` without `--api-key`. Existing engine names (`strata`, `strata-poly`), environment variables and API contracts remain unchanged.
 
 ## Working on the code
 
