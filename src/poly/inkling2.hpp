@@ -144,11 +144,23 @@ private:
     bool phase_dualtp_active_ = false;
     int phase_dualtp_min_calls_ = 2;
     std::unique_ptr<Inkling2> stage_b_;
+    struct StageBWorker;
+    std::unique_ptr<StageBWorker> stage_b_worker_;
+    bool dualtp_sched_v8_ = false, dualtp_2inbox_ = false, dualtp_chunk_v8_ = false;
+    bool dualtp_async_df_ = false, dualtp_df_pending_ = false;
+    struct CutInbox {
+        float *depth0 = nullptr, *prelude = nullptr, *bank0 = nullptr, *bank1 = nullptr;
+        float *residual = nullptr, *tap0 = nullptr, *tap1 = nullptr;
+        cudaEvent_t ready = nullptr, unpacked = nullptr;
+        bool used = false;
+    };
+    std::array<CutInbox, 2> cut_inbox_{};
+    int cut_slot_ = 0;
+    cudaEvent_t sync_to_b_done_ = nullptr, sb_taps_ready_ = nullptr;
     int64_t stage_b_kv_valid_ = 0;
     cudaStream_t cut_st_ = nullptr;
     cudaEvent_t cut_ev_ = nullptr;
     Inkling2* cut_dst_ = nullptr;
-    float *cut_depth0_ = nullptr, *cut_prelude_ = nullptr, *cut_bank0_ = nullptr, *cut_bank1_ = nullptr;
     cudaStream_t kv_ret_st_ = nullptr;
     cudaEvent_t kv_ret_ev_ = nullptr, inbox_free_ev_ = nullptr;
     bool stage_b_want_df2_ = false, sb_capture_df2_ = false;
@@ -156,13 +168,16 @@ private:
     void phase_dualtp_init(const Options& o);
     void destroy_phase_dualtp_handles();
     void phase_dualtp_sync_to_b(int64_t pos);
+    void phase_dualtp_acquire_cut(int slot);
     void phase_dualtp_handoff_cut(int n, bool send_df_taps, int df_first);
+    void phase_dualtp_unpack_cut(int slot, int n, bool send_df_taps, int df_first);
     void phase_dualtp_run_b(int64_t chunk_pos, int n, bool do_df_taps, int df_first, uint8_t* checkpoint,
-                            size_t r0_state_n, size_t r1_state_n);
+                            size_t r0_state_n, size_t r1_state_n, int slot, bool async_df);
     void phase_dualtp_save_range(int first_v, int last_v, int64_t pos, uint8_t* dst,
                                  size_t r0_state_n, size_t r1_state_n);
     void phase_dualtp_sync_from_b(int64_t final_pos);
-    void phase_dualtp_df_kept(int64_t chunk_pos, int m, int first);
+    void phase_dualtp_df_kept(int64_t chunk_pos, int m, int first, bool async);
+    void phase_dualtp_join_df();
     bool gpu_route_supported() const;
     bool gpu_decode_supported() const;
     void init_gpu_route(bool decode, bool prefill);
@@ -255,7 +270,12 @@ private:
     void save_rows_pinned(int64_t first, int64_t n, uint8_t* dst);
     void load_rows_pinned(const uint8_t* src, int64_t from, int64_t count, int64_t first, int64_t n);
 #endif
-    void depth_mix(const float* query, float* dst, int first, int n);
+    void depth_mix(const float* query, float* dst, int first, int n, float* pair_half = nullptr);
+#if defined(STRATA_HIP_GFX906)
+    bool stageb_fuse_ = false, stageb_mix_fuse_ = false;
+    bool stageb_loop(int n) const { return n >= 128 && n_embd_ == kWidth && !windowed_ && messages(); }
+    bool stageb_mix(int n) const { return stageb_mix_fuse_ && stageb_loop(n) && depth_n_ < 5; }
+#endif
     void control(const Block& b, int il, int stream, float* in, int n, const float* shared_depth = nullptr);
     void ring_state(int visit, int64_t pos, const uint8_t* src, uint8_t* dst);
     bool try_pack_state(uint8_t* dst);

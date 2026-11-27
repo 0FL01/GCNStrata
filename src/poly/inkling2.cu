@@ -17,6 +17,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -39,6 +40,12 @@ namespace strata::poly {
 namespace {
 
 constexpr int kThreads = 128;
+#if defined(STRATA_HIP_GFX906)
+bool enabled(const char* name) {
+    const char* v = std::getenv(name);
+    return v && std::strcmp(v, "1") == 0;
+}
+#endif
 #ifdef STRATA_HIP_GFX906
 constexpr int kMixThreads = 576;  // 9 wave64s x float4 = 2304 floats/row; avoids 108-VGPR/thread spill
 #else
@@ -590,6 +597,208 @@ __global__ void control_from_shared(const float* depth, float* cur, const float*
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) cur[i] = (1.f - tanhf(forget[i])) * depth[i] + tanhf(gain[i]) * msg[i];
 }
+
+__device__ __forceinline__ float4 stageb_load4(const float* p) { return *reinterpret_cast<const float4*>(p); }
+__device__ __forceinline__ void stageb_store4(float* p, float4 v) { *reinterpret_cast<float4*>(p) = v; }
+
+// Stage K-major LDS from aligned float4 global loads. Each K quartet
+// rotates row groups across the 32 LDS banks for the transpose writes;
+// the inverse (same XOR) keeps four adjacent rows aligned on reads.
+template <int BK, int LD>
+__device__ __forceinline__ void stage_control4(float (&s)[BK][LD], int r, int k, float4 v) {
+    r ^= (k / 4) * (128 / BK);
+    s[k][r] = v.x;
+    s[k + 1][r] = v.y;
+    s[k + 2][r] = v.z;
+    s[k + 3][r] = v.w;
+}
+
+// 256 lanes, 4 tokens x 4 adjacent output dims per lane. Each down
+// value is shared by both projections, and each accumulator follows
+// rocBLAS's ascending K chain without any split-K combine or partial write.
+template <int kRank>
+__global__ void __launch_bounds__(256)
+stageb_control_out(const float* __restrict__ x, const float* __restrict__ wg, const float* __restrict__ wf,
+                  const float* depth, const float* msg, float* y, int rows) {
+    constexpr int BM = 64, BN = 64, BK = 16, Threads = 256, Tile = 4, Pad = 8;
+    static_assert(kRank == 64 && kRowWidth % BM == 0 && kRank % BK == 0 && BN * BM == Threads * Tile * Tile);
+    static_assert(BM % 32 == 0 && BN % 32 == 0 && (BK == 16 || BK == 32));
+    __shared__ __align__(16) float a[BK][BN + Pad], b[BK][BM + Pad], f[BK][BM + Pad];
+    const int tid = threadIdx.x;
+    const int t0 = int(blockIdx.x) * BN, o0 = int(blockIdx.y) * BM;
+    const int tr = Tile * (tid / (BM / Tile)), oc = Tile * (tid % (BM / Tile));
+    float g[Tile][Tile] = {}, h[Tile][Tile] = {};
+#pragma unroll 1
+    for (int kb = 0; kb < kRank; kb += BK) {
+#pragma unroll
+        for (int i = Tile * tid; i < BN * BK; i += Tile * Threads) {
+            const int r = i / BK, t = t0 + r, k = i % BK;
+            stage_control4(a, r, k, t < rows ? stageb_load4(x + size_t(t) * kRank + kb + k) : make_float4(0.f, 0.f, 0.f, 0.f));
+        }
+#pragma unroll
+        for (int i = Tile * tid; i < BM * BK; i += Tile * Threads) {
+            const int r = i / BK, o = o0 + r, k = i % BK;
+            stage_control4(b, r, k, stageb_load4(wg + size_t(o) * kRank + kb + k));
+            stage_control4(f, r, k, stageb_load4(wf + size_t(o) * kRank + kb + k));
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (int k = 0; k < BK; ++k) {
+            const int skew = (k / 4) * (128 / BK);
+            const float4 av = stageb_load4(a[k] + (tr ^ skew));
+            const float4 bv = stageb_load4(b[k] + (oc ^ skew));
+            const float4 fv = stageb_load4(f[k] + (oc ^ skew));
+            const float ta[Tile] = {av.x, av.y, av.z, av.w};
+            const float wb[Tile] = {bv.x, bv.y, bv.z, bv.w};
+            const float wf_[Tile] = {fv.x, fv.y, fv.z, fv.w};
+#pragma unroll
+            for (int i = 0; i < Tile; ++i) {
+#pragma unroll
+                for (int j = 0; j < Tile; ++j) {
+                    g[i][j] = fmaf(ta[i], wb[j], g[i][j]);
+                    h[i][j] = fmaf(ta[i], wf_[j], h[i][j]);
+                }
+            }
+        }
+        if (kb + BK < kRank) __syncthreads(); // Do not overwrite LDS while peers read it.
+    }
+#pragma unroll
+    for (int i = 0; i < Tile; ++i) {
+        const int t = t0 + tr + i;
+        if (t < rows) {
+            const size_t idx = size_t(t) * kRowWidth + o0 + oc;
+            const float4 d = stageb_load4(depth + idx), m = stageb_load4(msg + idx);
+            stageb_store4(y + idx, make_float4(
+                (1.f - tanhf(h[i][0])) * d.x + tanhf(g[i][0]) * m.x,
+                (1.f - tanhf(h[i][1])) * d.y + tanhf(g[i][1]) * m.y,
+                (1.f - tanhf(h[i][2])) * d.z + tanhf(g[i][2]) * m.z,
+                (1.f - tanhf(h[i][3])) * d.w + tanhf(g[i][3]) * m.w));
+        }
+    }
+}
+
+// Match kernels.cu's rms_norm_row: 32-lane XOR reduction (two per wave64),
+// sequential sum of the 32 partials, then a precise sqrt and division.
+__device__ __forceinline__ void stageb_rms_row(const float* x, const float* w, float* y, int n, float eps) {
+    __shared__ float part[32];
+    float ss = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) ss += x[i] * x[i];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffff, ss, o, 32);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = ss;
+    __syncthreads();
+    float s = 0.f;
+    for (int k = 0; k < int(blockDim.x) / 32; ++k) s += part[k];
+    __syncthreads();
+    const float scale = 1.f / sqrtf(s / float(n) + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = w ? x[i] * scale * w[i] : x[i] * scale;
+}
+
+__device__ __forceinline__ float stageb_mix_scale(float ss) {
+    // The stock gfx906 path rounds FP32 division before adding epsilon.
+    // Multiplying by a rounded reciprocal (with or without FMA) is not equivalent.
+    return rsqrtf(ss / kRowWidth + 1.e-6f);
+}
+
+// Specializing the bank count makes all register array indices static. The
+// 576 participating lanes are nine complete wave64s; all 1024 lanes execute
+// every CTA barrier. Preserve the stock mix_row arithmetic and add order.
+template <int count>
+__device__ __forceinline__ void stageb_mix_to_lds(const MixInputs& in, const float* query, size_t row,
+                                         float4* mixed) {
+    static_assert(count >= 1 && count <= 5);
+    constexpr int kW = kMixThreads / 64;
+    static_assert(kMixThreads * 4 == kRowWidth && kMixThreads % 64 == 0);
+    const int tid = threadIdx.x;
+    const int lane = tid & 63, wave = tid >> 6;
+    __shared__ float waves[2 * count][kW];
+
+    float4 xv[count];
+    if (tid < kMixThreads) {
+        const float4 q = reinterpret_cast<const float4*>(query)[tid];
+#pragma unroll
+        for (int j = 0; j < count; ++j) {
+            const float4 x = reinterpret_cast<const float4*>(in.x[j] + row)[tid];
+            xv[j] = x;
+            float ss = __fmaf_rn(x.x, x.x, __fmaf_rn(x.y, x.y, __fmaf_rn(x.z, x.z, x.w * x.w)));
+            float dot = __fmaf_rn(x.x, q.x, __fmaf_rn(x.y, q.y, __fmaf_rn(x.z, q.z, x.w * q.w)));
+            ss = wave64_sum_mix(ss);
+            dot = wave64_sum_mix(dot);
+            if (lane == 0) {
+                waves[2 * j][wave] = ss;
+                waves[2 * j + 1][wave] = dot;
+            }
+        }
+    }
+    __syncthreads();
+    if (tid < 2 * count) {
+        float s = 0.f;
+#pragma unroll
+        for (int w = 0; w < kW; ++w) s += waves[tid][w];
+        waves[tid][0] = s;
+    }
+    __syncthreads();
+    if (tid < kMixThreads) {
+        float scale[count], w[count], top = -INFINITY;
+#pragma unroll
+        for (int j = 0; j < count; ++j) {
+            scale[j] = stageb_mix_scale(waves[2 * j][0]);
+            w[j] = waves[2 * j + 1][0] * scale[j] * rsqrtf((float) kRowWidth);
+            top = fmaxf(top, w[j]);
+        }
+        float sum = 0.f;
+        {
+            // Stock subtracts the max from an already rounded logit. Unrolling
+            // exposes the logit multiply here; prevent it fusing into the subtraction.
+#pragma clang fp contract(off)
+#pragma unroll
+            for (int j = 0; j < count; ++j) sum += (w[j] = expf(w[j] - top));
+        }
+        const float inv_sum = 1.f / sum;
+        float4 res = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+        for (int j = 0; j < count; ++j) {
+            const float c = w[j] * scale[j] * inv_sum;
+            res.x = __fmaf_rn(c, xv[j].x, res.x);
+            res.y = __fmaf_rn(c, xv[j].y, res.y);
+            res.z = __fmaf_rn(c, xv[j].z, res.z);
+            res.w = __fmaf_rn(c, xv[j].w, res.w);
+        }
+        mixed[tid] = res;
+    }
+}
+
+template <int count>
+__global__ void __launch_bounds__(1024)
+stageb_mix_rms(MixInputs in, const float* query, const float* norm_weight,
+              float* pair_half, float* raw_out, int n, float eps) {
+    __shared__ float4 mixed[kMixThreads]; // 2304 floats, 9216 B (plus reduction partials)
+    const size_t row = size_t(blockIdx.x) * kRowWidth;
+    stageb_mix_to_lds<count>(in, query, row, mixed);
+    __syncthreads();
+    // Reuse the stock row function, including its dynamic FP32 divisor. A
+    // compile-time constant divisor can lower differently from the stock path.
+    stageb_rms_row(reinterpret_cast<const float*>(mixed), norm_weight,
+                   pair_half + size_t(blockIdx.x) * (2 * kRowWidth), n, eps);
+    if (raw_out && threadIdx.x < kMixThreads)
+        reinterpret_cast<float4*>(raw_out + row)[threadIdx.x] = mixed[threadIdx.x];
+}
+
+void launch_stageb_mix(MixInputs in, int count, const float* query, float* raw, float* pair_half,
+                       int n, cudaStream_t stream) {
+    switch (count) {
+#define STAGEB_MIX(N) case N: stageb_mix_rms<N><<<n, 1024, 0, stream>>>(in, query, nullptr, pair_half, raw, kRowWidth, 1.e-6f); break
+        STAGEB_MIX(1);
+        STAGEB_MIX(2);
+        STAGEB_MIX(3);
+        STAGEB_MIX(4);
+        STAGEB_MIX(5);
+#undef STAGEB_MIX
+        default: throw std::logic_error("Stage B mix bank count");
+    }
+    ck(cudaGetLastError(), "Stage B fused mix/RMS");
+}
+
 #endif
 
 // One thread owns one channel and keeps its raw input history across the chunk. In GGUF the static taps
@@ -1321,6 +1530,9 @@ void Inkling2::load_geometry() {
 #if defined(STRATA_HIP_GFX906)
     const char* mix_rms = std::getenv("STRATA_INKLING_MIX_RMS_FUSE");
     mix_rms_fuse_ = decode_ && gfx906 && p.warpSize == 64 && mix_rms && std::strcmp(mix_rms, "1") == 0;
+    const bool stageb_ok = gfx906 && p.warpSize == 64 && !opt_.dump;
+    stageb_fuse_ = stageb_ok && enabled("STRATA_INKLING_STAGEB_FUSE");
+    stageb_mix_fuse_ = stageb_ok && enabled("STRATA_INKLING_STAGEB_MIX_FUSE");
     const char* pfuse = std::getenv("STRATA_INKLING_PREFILL_FUSE");
     prefill_fuse_ = gfx906 && p.warpSize == 64 && !opt_.dump && pfuse && std::strcmp(pfuse, "1") == 0;
     if (prefill_fuse_ && tp_rank_ == 0 && !prefill_only_)
@@ -1653,6 +1865,68 @@ LogitShards Inkling2::project_target_shards(const float* h, int rows, bool windo
 }
 #endif
 
+#if defined(STRATA_HIP_GFX906)
+// At most one Stage B host job. Stage A may fill the other inbox while the
+// job is in flight. The worker never takes ownership of a caller's checkpoint.
+struct Inkling2::StageBWorker {
+    std::mutex mu;
+    std::condition_variable cv;
+    std::function<void()> job;
+    std::exception_ptr error;
+    std::atomic<bool> wake{false};
+    bool busy = false, stop = false;
+    std::thread thread{[this] { run(); }};
+
+    void run() {
+        for (;;) {
+            const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(400);
+            while (!wake.load(std::memory_order_relaxed) && std::chrono::steady_clock::now() < until) {
+#if defined(__x86_64__) || defined(_M_X64)
+                _mm_pause();
+#else
+                std::this_thread::yield();
+#endif
+            }
+            std::unique_lock<std::mutex> lock(mu);
+            cv.wait(lock, [&] { return stop || bool(job); });
+            if (stop) return;
+            auto fn = std::exchange(job, {});
+            wake.store(false, std::memory_order_relaxed);
+            lock.unlock();
+            std::exception_ptr failure;
+            try { fn(); } catch (...) { failure = std::current_exception(); }
+            lock.lock();
+            error = failure;
+            busy = false;
+            cv.notify_all();
+        }
+    }
+    void go(std::function<void()> fn) {
+        std::lock_guard<std::mutex> lock(mu);
+        if (busy) throw std::logic_error("PhaseDualTP Stage B job already running");
+        busy = true;
+        job = std::move(fn);
+        wake.store(true, std::memory_order_relaxed);
+        cv.notify_all();
+    }
+    void wait() {
+        std::unique_lock<std::mutex> lock(mu);
+        cv.wait(lock, [&] { return !busy; });
+        if (auto e = std::exchange(error, {})) std::rethrow_exception(e);
+    }
+    ~StageBWorker() {
+        try { wait(); } catch (...) {}
+        {
+            std::lock_guard<std::mutex> lock(mu);
+            stop = true;
+            wake.store(true, std::memory_order_relaxed);
+        }
+        cv.notify_all();
+        thread.join();
+    }
+};
+#endif
+
 Inkling2::Inkling2() = default;
 
 cudaStream_t Inkling2::df_stream() const { return df_gpu23_ ? df_gpu23_->s2 : cs(st_); }
@@ -1660,6 +1934,20 @@ cudaStream_t Inkling2::df_stream() const { return df_gpu23_ ? df_gpu23_->s2 : cs
 Inkling2::~Inkling2() {
     stop_peer_thread();
 #if defined(STRATA_HIP_GFX906)
+    stage_b_worker_.reset();
+    try { phase_dualtp_join_df(); } catch (...) {}  // drain s2 before freeing Stage B's taps
+    if (cut_st_) {
+        int prev = 0;
+        if (cudaGetDevice(&prev) == cudaSuccess) {
+            // Cut copies on either A rank can still read their sources and
+            // write B's inboxes if a prefill failed partway through.
+            for (Inkling2* a : {this, peer_.get()}) {
+                if (a && a->cut_st_ && cudaSetDevice(a->device_) == cudaSuccess)
+                    (void) cudaStreamSynchronize(a->cut_st_);
+            }
+            (void) cudaSetDevice(prev);
+        }
+    }
     stage_b_.reset();
     destroy_phase_dualtp_handles();
     free_v7r4_bufs();
@@ -1753,10 +2041,6 @@ std::unique_ptr<Engine> Inkling2::open_tp2(const Options& o) {
         ck(cudaSetDevice(1), "tp2 setDevice 1");
     }
 #if defined(STRATA_HIP_GFX906)
-    const auto enabled = [](const char* name) {
-        const char* v = std::getenv(name);
-        return v && !std::strcmp(v, "1");
-    };
     const bool want_decode = enabled("STRATA_INKLING_GPU_ROUTE");
     const bool want_prefill_any = enabled("STRATA_INKLING_GPU_PREFILL_ANY");
     const bool want_prefill = enabled("STRATA_INKLING_GPU_PREFILL") || want_prefill_any;
@@ -2012,10 +2296,14 @@ void Inkling2::stop_peer_thread() {
 
 void Inkling2::before_state_access() {
     if (std::exchange(peer_pending_keep_, false)) peer_wait();
+#if defined(STRATA_HIP_GFX906)
+    phase_dualtp_join_df();
+#endif
 }
 
 void Inkling2::peer_dispatch(PeerCmd cmd, int n, size_t snap_idx) {
-    before_state_access();
+    // Ordinary model and target-head jobs do not consume Stage B's draft tail.
+    if (std::exchange(peer_pending_keep_, false)) peer_wait();
     {
         std::lock_guard<std::mutex> lk(peer_mu_);
         peer_done_ = false;
@@ -3257,10 +3545,20 @@ void Inkling2::assign_scratch() {
 #if defined(STRATA_HIP_GFX906)
     if (prefill_fuse_ && rec_n_ > 0) state_next_ = fbuf(rec_n_);
     if (prefill_only_) {
-        cut_depth0_ = fbuf(width);
-        cut_prelude_ = fbuf(width);
-        cut_bank0_ = fbuf(width);
-        cut_bank1_ = fbuf(width);
+        for (int i = 0; i < (dualtp_2inbox_ ? 2 : 1); ++i) {
+            auto& inbox = cut_inbox_[i];
+            inbox.depth0 = fbuf(width);
+            inbox.prelude = fbuf(width);
+            inbox.bank0 = fbuf(width);
+            inbox.bank1 = fbuf(width);
+            if (dualtp_2inbox_) {
+                inbox.residual = fbuf(width);
+                if (stage_b_want_df2_) {
+                    inbox.tap0 = fbuf(width);
+                    inbox.tap1 = fbuf(width);
+                }
+            }
+        }
         if (stage_b_want_df2_) {
             sb_tap0_ = fbuf(width);
             sb_tap1_ = fbuf(width);
@@ -3456,12 +3754,18 @@ void Inkling2::attention(const Block& b, int n, const float* k_in, const float* 
 #endif
 }
 
-void Inkling2::depth_mix(const float* query, float* dst, int first, int n) {
+void Inkling2::depth_mix(const float* query, float* dst, int first, int n, [[maybe_unused]] float* pair_half) {
     static_assert(kWidth == kRowWidth);
     const size_t at = (size_t) first * kWidth;
     MixInputs m{};
     for (int i = 0; i < depth_n_; ++i) m.x[i] = depth_[i] + at;
     m.x[depth_n_] = r_ + at;
+#if defined(STRATA_HIP_GFX906)
+    if (pair_half) {
+        launch_stageb_mix(m, depth_n_ + 1, query, dst, pair_half, n, cs(st_));
+        return;
+    }
+#endif
     mix_kernel<<<n, kMixThreads, 0, cs(st_)>>>(m, depth_n_ + 1, query, dst);
 }
 
@@ -3482,6 +3786,12 @@ void Inkling2::control(const Block& b, int il, int stream, float* in, int n, con
                              ? fp(b.msg_query) + (size_t) stream * kWidth
                              : fp(stream == 0 || stream == 3 ? loop_query_ : loop_kv_query_) + row * kWidth;
     if (fused(n)) control_in_kernel<<<n, kMixThreads, 0, cs(st_)>>>(bank0_, bank1_, query, in, msg_, pair_);
+#if defined(STRATA_HIP_GFX906)
+    else if (stageb_mix(n)) {
+        // The caller has already materialized raw depth and pair_'s first half.
+        launch_stageb_mix(MixInputs{{bank0_, bank1_}}, 2, query, msg_, pair_ + kWidth, n, cs(st_));
+    }
+#endif
     else {
         mix_kernel<<<n, kMixThreads, 0, cs(st_)>>>(MixInputs{{bank0_, bank1_}}, 2, query, msg_);
         if (!shared_depth) rms_norm(in, nullptr, pair_, kWidth, n, 1.e-6f, st_, 2 * kWidth);
@@ -3496,6 +3806,18 @@ void Inkling2::control(const Block& b, int il, int stream, float* in, int n, con
         return;
     }
     lin(c.down, pair_, rank_, n);
+#if defined(STRATA_HIP_GFX906)
+    const auto projection = [](const Dev& w) {
+        return w.p && w.type == kTypeF32 && w.scale == 1.f && w.n_in == kRank && w.n_out == kWidth;
+    };
+    if (stageb_fuse_ && stageb_loop(n) && projection(c.gain) && projection(c.forget)) {
+        // One thread owns each output; depth may alias in, but shared depth must survive q/k/v.
+        stageb_control_out<kRank><<<dim3(div_up(n, 64), kWidth / 64), 256, 0, cs(st_)>>>(
+            rank_, fp(c.gain), fp(c.forget), shared_depth ? shared_depth : in, msg_, in, n);
+        ck(cudaGetLastError(), "Stage B fused control output");
+        return;
+    }
+#endif
     lin(c.gain, rank_, gain_, n);
     lin(c.forget, rank_, forget_, n);
 #if defined(STRATA_HIP_GFX906)
@@ -3709,7 +4031,7 @@ void Inkling2::run_visits_local(int n, [[maybe_unused]] bool gpu_route) {
         if (visit_ == kStart) {
             axpy(r_, 1.f, prelude_, n * kWidth, false, st_);
 #if defined(STRATA_HIP_GFX906)
-            if (cut_dst_) push_cut_async(prelude_, cut_dst_->cut_prelude_);
+            if (cut_dst_) push_cut_async(prelude_, cut_dst_->cut_inbox_[cut_slot_].prelude);
 #endif
         }
         if (visit_ == kStart + kCore || visit_ == kStart + 2 * kCore) {
@@ -3720,9 +4042,9 @@ void Inkling2::run_visits_local(int n, [[maybe_unused]] bool gpu_route) {
             if (cut_dst_ && visit_ == kStart + kCore) {
                 ck(cudaEventRecord(cut_ev_, cs(st_)), "PhaseDualTP banks ready");
                 ck(cudaStreamWaitEvent(cut_st_, cut_ev_, 0), "PhaseDualTP banks wait");
-                ck(cudaMemcpyPeerAsync(cut_dst_->cut_bank0_, cut_dst_->device_, bank0_, device_, cut_bytes, cut_st_),
+                ck(cudaMemcpyPeerAsync(cut_dst_->cut_inbox_[cut_slot_].bank0, cut_dst_->device_, bank0_, device_, cut_bytes, cut_st_),
                    "PhaseDualTP stagger bank0");
-                ck(cudaMemcpyPeerAsync(cut_dst_->cut_bank1_, cut_dst_->device_, bank1_, device_, cut_bytes, cut_st_),
+                ck(cudaMemcpyPeerAsync(cut_dst_->cut_inbox_[cut_slot_].bank1, cut_dst_->device_, bank1_, device_, cut_bytes, cut_st_),
                    "PhaseDualTP stagger bank1");
             }
 #endif
@@ -3752,7 +4074,7 @@ void Inkling2::run_visits_local(int n, [[maybe_unused]] bool gpu_route) {
 #endif
             layer(il, n);
 #if defined(STRATA_HIP_GFX906)
-        if (cut_dst_ && visit_ == 0) push_cut_async(depth_[0], cut_dst_->cut_depth0_);
+        if (cut_dst_ && visit_ == 0) push_cut_async(depth_[0], cut_dst_->cut_inbox_[cut_slot_].depth0);
 #endif
     }
 #if defined(STRATA_HIP_GFX906)
@@ -3828,8 +4150,8 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
         if (prefill_depth_share_ && swa && loop && !windowed_ && n >= kStageRows) {
             // Only SWA shares a depth query. Keep its raw mix in input_[2] until V's control reads it,
             // then V's final norm overwrites it on the same stream. Each bank norm writes only pair_'s second half.
-            depth_mix(fp(b.aquery), input_[2], 0, n);
-            rms_norm(input_[2], nullptr, pair_, kWidth, n, 1.e-6f, st_, 2 * kWidth);
+            depth_mix(fp(b.aquery), input_[2], 0, n, stageb_mix(n) ? pair_ : nullptr);
+            if (!stageb_mix(n)) rms_norm(input_[2], nullptr, pair_, kWidth, n, 1.e-6f, st_, 2 * kWidth);
             shared_depth = input_[2];
         }
 #endif
@@ -3870,7 +4192,13 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
             }
 #endif
             if (il == 0) axpy(r_, 1.f, cur_, n * kWidth, false, st_);
-            else if (!shared_depth) depth_mix(fp(b.aquery) + (swa ? 0 : i * kWidth), cur_, 0, n);
+            else if (!shared_depth) {
+                float* pair_half = nullptr;
+#if defined(STRATA_HIP_GFX906)
+                if (loop && stageb_mix(n)) pair_half = pair_;
+#endif
+                depth_mix(fp(b.aquery) + (swa ? 0 : i * kWidth), cur_, 0, n, pair_half);
+            }
             if (loop) control(b, il, i, cur_, n, shared_depth);
             // this stream's norm and its Q8_1 in one launch; K and V write their own single-row buffers
             if (norm_q8_ && mmv && (streams == 1 || n == 1)) {
@@ -4077,7 +4405,11 @@ void Inkling2::layer_head_impl(Layer& L, int il, int n, bool gpu_route) {
         } else
 #endif
         {
-            depth_mix(fp(b.fquery), cur_, 0, n);
+            float* pair_half = nullptr;
+#if defined(STRATA_HIP_GFX906)
+            if (stageb_mix(n)) pair_half = pair_;
+#endif
+            depth_mix(fp(b.fquery), cur_, 0, n, pair_half);
             control(b, il, 3, cur_, n);
         }
 #if defined(STRATA_HIP_GFX906)
@@ -4995,6 +5327,9 @@ void Inkling2::on_verify_rows(int n) {
 // The kept rows' context: [tap 5, tap 23, tap 41, final norm] -> fc -> hidden_norm, and each layer's K (k_norm, RoPE at
 // the row's position) and V into its ring. A prompt's rows that no block will see (df_skip_) are left out.
 void Inkling2::df_kept(int n) {
+#if defined(STRATA_HIP_GFX906)
+    phase_dualtp_join_df();
+#endif
     namespace d2 = dflash2;
     auto* gpu = df_gpu23_.get();
     const bool commit = gpu && std::exchange(gpu->prov_valid, false) && gpu->prov_pos == pos_ && n <= gpu->prov_n;
@@ -5103,6 +5438,9 @@ void Inkling2::drafter_guesses(int32_t token) {
 }
 
 void Inkling2::df_ask(int32_t token) {
+#if defined(STRATA_HIP_GFX906)
+    phase_dualtp_join_df();
+#endif
     namespace d2 = dflash2;
     const auto stream = df_stream();
     const int64_t a = pos_;
@@ -5247,6 +5585,12 @@ void Inkling2::destroy_phase_dualtp_handles() {
         if (kv_ret_st_) { (void) cudaStreamDestroy(kv_ret_st_); kv_ret_st_ = nullptr; }
         if (kv_ret_ev_) { (void) cudaEventDestroy(kv_ret_ev_); kv_ret_ev_ = nullptr; }
         if (inbox_free_ev_) { (void) cudaEventDestroy(inbox_free_ev_); inbox_free_ev_ = nullptr; }
+        if (sync_to_b_done_) (void) cudaEventDestroy(sync_to_b_done_);
+        if (sb_taps_ready_) (void) cudaEventDestroy(sb_taps_ready_);
+        for (auto& box : cut_inbox_) {
+            if (box.ready) (void) cudaEventDestroy(box.ready);
+            if (box.unpacked) (void) cudaEventDestroy(box.unpacked);
+        }
         (void) cudaSetDevice(prev);
     }
 }
@@ -5289,6 +5633,11 @@ void Inkling2::phase_dualtp_init(const Options& o) {
     enable_p2p(0, 2); enable_p2p(2, 0);
     enable_p2p(1, 3); enable_p2p(3, 1);
 
+    dualtp_sched_v8_ = enabled("STRATA_INKLING_DUALTP_SCHED_V8");
+    dualtp_2inbox_ = dualtp_sched_v8_ || enabled("STRATA_INKLING_DUALTP_2INBOX");
+    dualtp_chunk_v8_ = dualtp_sched_v8_ || enabled("STRATA_INKLING_DUALTP_CHUNK_V8");
+    dualtp_async_df_ = enabled("STRATA_INKLING_DUALTP_ASYNC_DF") && df_gpu23_;
+
     const int max_floats = std::max(o.prompt_batch, 8) * kWidth;
     auto comm_b = Tp2Comm::create(2, 3, max_floats);
     auto b0 = std::make_unique<Inkling2>();
@@ -5306,6 +5655,7 @@ void Inkling2::phase_dualtp_init(const Options& o) {
         b->lo_ = kStart;
         b->end_ = -1;
         b->prefill_only_ = true;
+        b->dualtp_2inbox_ = dualtp_2inbox_;
         b->swa_ring_win_ = opt_.window;
         b->compact_swa_asked_ = compact_swa_asked_;
         b->prefill_depth_share_ = prefill_depth_share_;
@@ -5355,10 +5705,22 @@ void Inkling2::phase_dualtp_init(const Options& o) {
         ck(cudaSetDevice(a->device_), "PhaseDualTP stream dev A");
         ck(cudaStreamCreateWithFlags(&a->cut_st_, cudaStreamNonBlocking), "PhaseDualTP cut_st");
         ck(cudaEventCreateWithFlags(&a->cut_ev_, cudaEventDisableTiming), "PhaseDualTP cut_ev");
+        if (dualtp_sched_v8_)
+            ck(cudaEventCreateWithFlags(&a->sync_to_b_done_, cudaEventDisableTiming), "PhaseDualTP sync_to_b_done");
+        if (dualtp_2inbox_)
+            for (auto& inbox : a->cut_inbox_)
+                ck(cudaEventCreateWithFlags(&inbox.ready, cudaEventDisableTiming), "PhaseDualTP cut inbox ready");
         ck(cudaSetDevice(b->device_), "PhaseDualTP stream dev B");
         ck(cudaStreamCreateWithFlags(&b->kv_ret_st_, cudaStreamNonBlocking), "PhaseDualTP kv_ret_st");
         ck(cudaEventCreateWithFlags(&b->kv_ret_ev_, cudaEventDisableTiming), "PhaseDualTP kv_ret_ev");
-        ck(cudaEventCreateWithFlags(&b->inbox_free_ev_, cudaEventDisableTiming), "PhaseDualTP inbox_free_ev");
+        if (dualtp_2inbox_) {
+            for (auto& inbox : b->cut_inbox_)
+                ck(cudaEventCreateWithFlags(&inbox.unpacked, cudaEventDisableTiming), "PhaseDualTP inbox unpacked");
+        } else {
+            ck(cudaEventCreateWithFlags(&b->inbox_free_ev_, cudaEventDisableTiming), "PhaseDualTP inbox_free_ev");
+        }
+        if (dualtp_async_df_ && r == 0)
+            ck(cudaEventCreateWithFlags(&b->sb_taps_ready_, cudaEventDisableTiming), "PhaseDualTP taps ready");
     }
 
     ck(cudaSetDevice(2), "PhaseDualTP peer thread dev 2");
@@ -5373,6 +5735,7 @@ void Inkling2::phase_dualtp_init(const Options& o) {
                  "GPU2 free=%zu MiB, GPU3 free=%zu MiB)\n",
                  b0->cached_, f2 >> 20, f3 >> 20);
     stage_b_ = std::move(b0);
+    if (dualtp_2inbox_) stage_b_worker_ = std::make_unique<StageBWorker>();
     stage_b_kv_valid_ = 0;
 }
 
@@ -5397,7 +5760,21 @@ void Inkling2::phase_dualtp_sync_to_b(int64_t pos) {
         Inkling2& a = *src[r];
         Inkling2& b = *dst[r];
         ck(cudaSetDevice(a.device_), "PhaseDualTP sync_to_b dev");
-        ck(cudaStreamSynchronize(cs(a.st_)), "PhaseDualTP sync_to_b drain A");
+        if (dualtp_sched_v8_) {
+            // A_0 executes visits [0,24) only. ShortConv, SWA and full KV are
+            // indexed by *visit*, not the reused physical layer. These reads
+            // touch only [24,48), including the ShortConv commit range.
+            ck(cudaEventRecord(a.cut_ev_, cs(a.st_)), "PhaseDualTP sync_to_b A producer");
+            ck(cudaStreamWaitEvent(a.cut_st_, a.cut_ev_, 0), "PhaseDualTP wait A producer");
+            // A reset can have queued B writes (e.g. ShortConv zeroing).
+            // The previous end-of-read has already drained B; this covers reset too.
+            ck(cudaSetDevice(b.device_), "PhaseDualTP sync_to_b B dev");
+            ck(cudaEventRecord(b.kv_ret_ev_, cs(b.st_)), "PhaseDualTP prior B state ready");
+            ck(cudaSetDevice(a.device_), "PhaseDualTP sync_to_b A dev");
+            ck(cudaStreamWaitEvent(a.cut_st_, b.kv_ret_ev_, 0), "PhaseDualTP wait prior B state");
+        } else {
+            ck(cudaStreamSynchronize(cs(a.st_)), "PhaseDualTP sync_to_b drain A");
+        }
         // Sync missing full KV rows [stage_b_kv_valid_, pos) for Stage B's 4 full visits.
         if (stage_b_kv_valid_ < pos) {
             const int64_t rows = pos - stage_b_kv_valid_;
@@ -5418,13 +5795,31 @@ void Inkling2::phase_dualtp_sync_to_b(int64_t pos) {
         ck(cudaMemcpyPeerAsync(b.state_, b.device_,
                                a.state_ + (size_t) 24 * conv_floats_, a.device_, conv_bytes, a.cut_st_),
            "PhaseDualTP sync ShortConv to B");
+        if (dualtp_sched_v8_) {
+            ck(cudaEventRecord(a.sync_to_b_done_, a.cut_st_), "PhaseDualTP record sync_to_b_done");
+            ck(cudaSetDevice(b.device_), "PhaseDualTP sync_to_b wait dev B");
+            ck(cudaStreamWaitEvent(cs(b.st_), a.sync_to_b_done_, 0), "PhaseDualTP B_0 waits for its history");
+        }
     }
-    for (int r = 0; r < 2; ++r) {
+    if (!dualtp_sched_v8_) for (int r = 0; r < 2; ++r) {
         ck(cudaSetDevice(src[r]->device_), "PhaseDualTP sync_to_b wait");
         ck(cudaStreamSynchronize(src[r]->cut_st_), "PhaseDualTP sync_to_b wait");
     }
     stage_b_->pos_ = stage_b_->peer_->pos_ = pos;
     stage_b_kv_valid_ = pos;
+}
+
+void Inkling2::phase_dualtp_acquire_cut(int slot) {
+    DfOnDevice on_a(device_);
+    Inkling2* src[2] = {this, peer_.get()};
+    Inkling2* dst[2] = {stage_b_.get(), stage_b_->peer_.get()};
+    for (int r = 0; r < 2; ++r) {
+        Inkling2& a = *src[r];
+        a.cut_slot_ = slot;
+        if (!dualtp_2inbox_ || !a.cut_inbox_[slot].used) continue;
+        ck(cudaSetDevice(a.device_), "PhaseDualTP inbox acquire dev");
+        ck(cudaStreamWaitEvent(a.cut_st_, dst[r]->cut_inbox_[slot].unpacked, 0), "PhaseDualTP wait inbox unpacked");
+    }
 }
 
 void Inkling2::phase_dualtp_handoff_cut(int n, bool send_df_taps, int df_first) {
@@ -5433,6 +5828,33 @@ void Inkling2::phase_dualtp_handoff_cut(int n, bool send_df_taps, int df_first) 
     Inkling2* src[2] = {this, peer_.get()};
     Inkling2* dst[2] = {stage_b_.get(), stage_b_->peer_.get()};
     const size_t bytes = (size_t) n * kWidth * sizeof(float);
+
+    if (dualtp_2inbox_) {
+        for (int r = 0; r < 2; ++r) {
+            Inkling2& a = *src[r];
+            Inkling2& b = *dst[r];
+            auto& box = b.cut_inbox_[a.cut_slot_];
+            auto& producer = a.cut_inbox_[a.cut_slot_];
+            ck(cudaSetDevice(a.device_), "PhaseDualTP inbox send dev");
+            ck(cudaEventRecord(a.cut_ev_, cs(a.st_)), "PhaseDualTP residual ready");
+            ck(cudaStreamWaitEvent(a.cut_st_, a.cut_ev_, 0), "PhaseDualTP cut wait residual");
+            ck(cudaMemcpyPeerAsync(box.residual, b.device_, a.r_, a.device_, bytes, a.cut_st_), "PhaseDualTP inbox r");
+            if (send_df_taps && box.tap0) {
+                const size_t off = (size_t) df_first * kWidth;
+                const size_t tbytes = (size_t) (n - df_first) * kWidth * sizeof(float);
+                const size_t plane = (size_t) a.rows_ * kWidth;
+                ck(cudaMemcpyPeerAsync(box.tap0 + off, b.device_, a.ds_taps_ + off, a.device_, tbytes, a.cut_st_),
+                   "PhaseDualTP inbox tap0");
+                ck(cudaMemcpyPeerAsync(box.tap1 + off, b.device_, a.ds_taps_ + plane + off, a.device_, tbytes, a.cut_st_),
+                   "PhaseDualTP inbox tap1");
+            }
+            ck(cudaEventRecord(producer.ready, a.cut_st_), "PhaseDualTP inbox ready");
+            // Until the transfer ends, the next A chunk may not overwrite its live sources.
+            ck(cudaStreamWaitEvent(cs(a.st_), producer.ready, 0), "PhaseDualTP protect A sources");
+            producer.used = true;
+        }
+        return;
+    }
 
     // Ensure Stage B's previous chunk finished reading its live buffers.
     for (int r = 0; r < 2; ++r) {
@@ -5465,15 +5887,46 @@ void Inkling2::phase_dualtp_handoff_cut(int n, bool send_df_taps, int df_first) 
         Inkling2& a = *src[r];
         Inkling2& b = *dst[r];
         ck(cudaSetDevice(b.device_), "PhaseDualTP handoff unpack B");
-        ck(cudaMemcpyAsync(b.depth_[0], b.cut_depth0_, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP d0");
-        ck(cudaMemcpyAsync(b.prelude_, b.cut_prelude_, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP pre");
-        ck(cudaMemcpyAsync(b.depth_[1], b.cut_prelude_, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP d1");
-        ck(cudaMemcpyAsync(b.bank0_, b.cut_bank0_, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP b0");
-        ck(cudaMemcpyAsync(b.bank1_, b.cut_bank1_, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP b1");
+        ck(cudaMemcpyAsync(b.depth_[0], b.cut_inbox_[0].depth0, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP d0");
+        ck(cudaMemcpyAsync(b.prelude_, b.cut_inbox_[0].prelude, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP pre");
+        ck(cudaMemcpyAsync(b.depth_[1], b.cut_inbox_[0].prelude, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP d1");
+        ck(cudaMemcpyAsync(b.bank0_, b.cut_inbox_[0].bank0, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP b0");
+        ck(cudaMemcpyAsync(b.bank1_, b.cut_inbox_[0].bank1, bytes, cudaMemcpyDeviceToDevice, cs(b.st_)), "PhaseDualTP b1");
         b.depth_n_ = 2;
         ck(cudaEventRecord(b.inbox_free_ev_, cs(b.st_)), "PhaseDualTP inbox_free");
         ck(cudaSetDevice(a.device_), "PhaseDualTP handoff wait inbox_free");
         ck(cudaStreamWaitEvent(a.cut_st_, b.inbox_free_ev_, 0), "PhaseDualTP cut_st wait inbox_free");
+    }
+}
+
+void Inkling2::phase_dualtp_unpack_cut(int slot, int n, bool send_df_taps, int df_first) {
+    DfOnDevice on_b(stage_b_->device_);
+    Inkling2* src[2] = {this, peer_.get()};
+    Inkling2* dst[2] = {stage_b_.get(), stage_b_->peer_.get()};
+    const size_t bytes = (size_t) n * kWidth * sizeof(float);
+    for (int r = 0; r < 2; ++r) {
+        Inkling2& b = *dst[r];
+        const auto& box = b.cut_inbox_[slot];
+        ck(cudaSetDevice(b.device_), "PhaseDualTP inbox unpack dev");
+        const auto st = cs(b.st_);
+        ck(cudaStreamWaitEvent(st, src[r]->cut_inbox_[slot].ready, 0), "PhaseDualTP B waits for inbox ready");
+        const auto unpack = [&](float* out, const float* in, size_t size) {
+            ck(cudaMemcpyAsync(out, in, size, cudaMemcpyDeviceToDevice, st), "PhaseDualTP unpack inbox");
+        };
+        unpack(b.r_, box.residual, bytes);
+        unpack(b.depth_[0], box.depth0, bytes);
+        unpack(b.prelude_, box.prelude, bytes);
+        unpack(b.depth_[1], box.prelude, bytes);
+        unpack(b.bank0_, box.bank0, bytes);
+        unpack(b.bank1_, box.bank1, bytes);
+        if (send_df_taps && box.tap0) {
+            const size_t off = (size_t) df_first * kWidth;
+            const size_t tbytes = (size_t) (n - df_first) * kWidth * sizeof(float);
+            unpack(b.sb_tap0_ + off, box.tap0 + off, tbytes);
+            unpack(b.sb_tap1_ + off, box.tap1 + off, tbytes);
+        }
+        ck(cudaEventRecord(box.unpacked, st), "PhaseDualTP inbox unpacked");
+        b.depth_n_ = 2;
     }
 }
 
@@ -5547,11 +6000,17 @@ void Inkling2::phase_dualtp_save_range(int first_v, int last_v, int64_t pos, uin
     }
 }
 
-void Inkling2::phase_dualtp_df_kept(int64_t chunk_pos, int m, int first) {
+void Inkling2::phase_dualtp_join_df() {
+    if (!dualtp_df_pending_) return;
+    DfOnDevice on2(2);
+    ck(cudaStreamSynchronize(df_gpu23_->s2), "PhaseDualTP join draft tail");
+    dualtp_df_pending_ = false;
+}
+
+void Inkling2::phase_dualtp_df_kept(int64_t chunk_pos, int m, int first, bool async) {
     namespace d2 = dflash2;
     auto* gpu = df_gpu23_.get();
     if (!gpu || !stage_b_ || !stage_b_->sb_tap0_) return;
-    gpu->prov_valid = false;
     // Drain any prior decode-turn tap transfers before reusing df_ctx_.
     {
         DfOnDevice on2(2);
@@ -5564,7 +6023,13 @@ void Inkling2::phase_dualtp_df_kept(int64_t chunk_pos, int m, int first) {
         gpu->last_taps[0] = gpu->last_taps[1] = nullptr;
         const int64_t at = chunk_pos + first;
         if (at > df_hi_ || at < df_lo_) df_lo_ = at;
-        ck(cudaStreamSynchronize(cs(stage_b_->st_)), "PhaseDualTP Stage B taps ready");
+        if (async) {
+            ck(cudaEventRecord(stage_b_->sb_taps_ready_, cs(stage_b_->st_)), "PhaseDualTP Stage B taps ready");
+            ck(cudaStreamWaitEvent(gpu->s2, stage_b_->sb_taps_ready_, 0), "PhaseDualTP draft waits for B taps");
+            dualtp_df_pending_ = true;
+        } else {
+            ck(cudaStreamSynchronize(cs(stage_b_->st_)), "PhaseDualTP Stage B taps ready");
+        }
         const d2::Taps taps{{stage_b_->sb_tap0_, stage_b_->sb_tap1_, stage_b_->sb_tap2_, stage_b_->sb_hn_}};
         for (int done = first; done < m;) {
             const int sub = std::min(kDfSub, m - done);
@@ -5572,17 +6037,18 @@ void Inkling2::phase_dualtp_df_kept(int64_t chunk_pos, int m, int first) {
             df_context(df_ctx_, chunk_pos + done, sub, false);
             done += sub;
         }
-        ck(cudaStreamSynchronize(gpu->s2), "PhaseDualTP df_context done");
+        if (!async) ck(cudaStreamSynchronize(gpu->s2), "PhaseDualTP df_context done");
         df_hi_ = chunk_pos + m;
     }
 }
 
 void Inkling2::phase_dualtp_run_b(int64_t chunk_pos, int n, bool do_df_taps, int df_first, uint8_t* checkpoint,
-                                  size_t r0_state_n, size_t r1_state_n) {
+                                  size_t r0_state_n, size_t r1_state_n, int slot, bool async_df) {
     Inkling2& b0 = *stage_b_;
     Inkling2& b1 = *b0.peer_;
     ck(cudaSetDevice(b0.device_), "PhaseDualTP run_b dev 2");
     b0.cover(chunk_pos + n);
+    if (dualtp_2inbox_) phase_dualtp_unpack_cut(slot, n, do_df_taps, df_first);
     b0.pos_ = chunk_pos;
     b0.tok_ = nullptr;
     b0.windowed_ = false;
@@ -5610,7 +6076,7 @@ void Inkling2::phase_dualtp_run_b(int64_t chunk_pos, int n, bool do_df_taps, int
         }
     }
     b0.pos_ = b1.pos_ = chunk_pos + n;
-    if (do_df_taps) phase_dualtp_df_kept(chunk_pos, n, df_first);
+    if (do_df_taps) phase_dualtp_df_kept(chunk_pos, n, df_first, async_df);
     if (checkpoint) b0.phase_dualtp_save_range(24, kVisits, chunk_pos + n, checkpoint, r0_state_n, r1_state_n);
 }
 
@@ -5676,7 +6142,38 @@ bool Inkling2::read_custom(const int32_t* tokens, int n, const Mark* marks, int 
     }();
     std::vector<Call> local_calls;
     const std::vector<Call>* use_calls = &calls_;
-    if (balanced && n >= 768 && n <= 4096) {
+    if (dualtp_chunk_v8_ && n >= 768 && n <= 4096) {
+        // Work on each mark-bounded span independently for stand-alone medium reads
+        // (768..4096 tok): stage sizes never cross a checkpoint, each mark attaches
+        // to its last call, and long bulk reads (n > 4096) keep full 2048-row chunks.
+        for (int at = 0, k = 0; at < n;) {
+            const int end = k < n_marks ? marks[k].at : n;
+            const int span = end - at;
+            const bool hot = pos_ + at >= 8192;
+            int p = at;
+            const auto push = [&](int target) {
+                const int m = std::min({rows_, target, end - p});
+                local_calls.push_back({p, m, p + m == end && k < n_marks ? k : -1});
+                p += m;
+            };
+            if (span >= 768 && span <= 4096) {
+                const int parts = span <= 1152 || (span <= 1536 && !hot) ? 2
+                                  : span <= 3072 ? 3 : 4;
+                const int target = std::min(rows_, div_up(div_up(span, parts), 16) * 16);
+                for (int i = 0; i + 1 < parts && p < end; ++i) {
+                    // For hot short triples, leave the non-aligned tail in the
+                    // last call, keeping the first two below the 480-row cliff.
+                    const int m = i == 1 && parts == 3 && span <= 1440 && target >= 432 && target <= 448
+                                    ? target - 16 : target;
+                    push(m);
+                }
+            }
+            while (p < end) push(rows_);
+            at = end;
+            if (k < n_marks) ++k;
+        }
+        use_calls = &local_calls;
+    } else if (balanced && n >= 768 && n <= 4096) {
         // Rebalance mark-free spans of 768..4096 tokens into 2..4 equal 16-aligned microbatches
         // so both DualTP stages stay saturated without unbalanced tails (e.g., 2564 -> 864+864+836).
         for (int at = 0, k = 0; at < n;) {
@@ -5716,6 +6213,10 @@ bool Inkling2::read_custom(const int32_t* tokens, int n, const Mark* marks, int 
 
     if (kv_helper_) inkling::kv_helpers::invalidate(*kv_helper_, pos0);
     if (peer_->kv_helper_) inkling::kv_helpers::invalidate(*peer_->kv_helper_, pos0);
+    // Establish the producer on rank 1 before capturing its stream event.
+    // A deferred keep may not yet have enqueued the canonical ShortConv state.
+    if (dualtp_sched_v8_ && std::exchange(peer_pending_keep_, false)) peer_wait();
+    phase_dualtp_join_df();  // the single live set of Stage B taps belongs to this read next
     phase_dualtp_sync_to_b(pos0);
 
     struct PhaseGuard {
@@ -5740,6 +6241,16 @@ bool Inkling2::read_custom(const int32_t* tokens, int n, const Mark* marks, int 
     peer_->cut_dst_ = stage_b_->peer_.get();
 
     StageBehind behind;
+    const auto wait_b = [&] {
+        if (stage_b_worker_) stage_b_worker_->wait();
+        else behind.wait();
+    };
+    // A throwing callback or Stage A error must not leave a worker using a
+    // caller-owned marks buffer after this function unwinds.
+    struct JobGuard {
+        StageBWorker* worker;
+        ~JobGuard() { if (worker) { try { worker->wait(); } catch (...) {} } }
+    } jobs{stage_b_worker_.get()};
     bool cancelled = false;
     int64_t completed_pos = pos0;
     for (int c = 0; c < n_calls; ++c) {
@@ -5752,13 +6263,19 @@ bool Inkling2::read_custom(const int32_t* tokens, int n, const Mark* marks, int 
                                  : call.m;
         const bool do_df = (draft_ && df2_ && df_gpu23_ && df_first < call.m);
 
+        const int slot = dualtp_2inbox_ ? c & 1 : 0;
+        const bool async_df = dualtp_async_df_ && c + 1 == n_calls;
         ck(cudaSetDevice(device_), "PhaseDualTP Stage A dev");
+        if (dualtp_2inbox_) phase_dualtp_acquire_cut(slot);
         run(tokens + call.at, call.m);
-        behind.wait();
+        if (!dualtp_2inbox_) wait_b();
         phase_dualtp_handoff_cut(call.m, do_df, df_first);
-        behind.go([this, chunk_pos, m = call.m, do_df, df_first, checkpoint, r0_state_n, r1_state_n] {
-            phase_dualtp_run_b(chunk_pos, m, do_df, df_first, checkpoint, r0_state_n, r1_state_n);
-        });
+        if (dualtp_2inbox_) wait_b();  // only the B host job; no drain of B's compute streams
+        auto job = [this, chunk_pos, m = call.m, do_df, df_first, checkpoint, r0_state_n, r1_state_n, slot, async_df] {
+            phase_dualtp_run_b(chunk_pos, m, do_df, df_first, checkpoint, r0_state_n, r1_state_n, slot, async_df);
+        };
+        if (stage_b_worker_) stage_b_worker_->go(std::move(job));
+        else behind.go(std::move(job));
         pos_ = chunk_pos + call.m;
         peer_->pos_ = pos_;
         stats_.tokens += call.m;
@@ -5769,7 +6286,7 @@ bool Inkling2::read_custom(const int32_t* tokens, int n, const Mark* marks, int 
             break;
         }
     }
-    behind.wait();
+    wait_b();
     phase_dualtp_sync_from_b(completed_pos);
     const int64_t sb_exp_after = stage_b_->stats_.gpu_experts + stage_b_->peer_->stats_.gpu_experts;
     stats_.gpu_experts += (sb_exp_after - sb_exp_before);
