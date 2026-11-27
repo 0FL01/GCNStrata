@@ -3546,6 +3546,7 @@ bool Verifier::commit(int n_keep, std::string& err, const PrimaryCommitContext* 
             if (dq::kTapLayers[k] + 1 >= lb_ && dq::kTapLayers[k] + 1 < le) dq::sink_tag_rows(k, last_pos0_, n_keep);
     }
     const Clock::time_point t0 = Clock::now();
+    bool sync_after_next = false;
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;
     for (int t = 0; t < max_t_; ++t) h_commit_[2 + t] = t < n_keep ? (int32_t) (last_pos0_ + t) : -1;
@@ -3580,7 +3581,12 @@ bool Verifier::commit(int n_keep, std::string& err, const PrimaryCommitContext* 
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
         // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
         // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
-        if (!defer_this && (!g_commit_async || next_ != nullptr)) {
+        // STRATA_COMMIT_PARALLEL=1 (opt-in): an earlier stage's commit graph is waited for after the later stages' have been
+        // launched (the same graphs and streams; only the host's waiting order changes), so the four cards commit at once
+        static const bool commit_parallel = [] { const char* v = std::getenv("STRATA_COMMIT_PARALLEL"); return v != nullptr && v[0] == '1'; }();
+        if (!defer_this && (!g_commit_async || next_ != nullptr) && commit_parallel && next_ != nullptr) {
+            sync_after_next = true;
+        } else if (!defer_this && (!g_commit_async || next_ != nullptr)) {
             const cudaError_t se = cudaStreamSynchronize(cs_);
             if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
         } else {
@@ -3607,6 +3613,11 @@ bool Verifier::commit(int n_keep, std::string& err, const PrimaryCommitContext* 
         }
     ms_commit += ms_since(t0);
     if (next_ != nullptr && !next_->commit(n_keep, err)) return false;
+    if (sync_after_next) {
+        const OnDevice again(device_);
+        const cudaError_t se = cudaStreamSynchronize(cs_);
+        if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
+    }
     // Even if legacy global async mode was enabled elsewhere, the drafter's stage must be complete.
     return !defer_this || next_->wait_commit(err);
 }

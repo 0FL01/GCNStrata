@@ -15688,8 +15688,10 @@ int main(int argc, char** argv) {
                     if (dp_tested[d] > 0) depth += " " + std::to_string(dp_ok[d]) + "/" + std::to_string(dp_tested[d]);
                 std::string wt;
                 for (int t = 1; t <= 8; ++t) { char b[24]; std::snprintf(b, sizeof b, " %.1f", df2_pol.cost(t)); wt += b; }
-                std::fprintf(stderr, "strata dflash2: policy %s, mean k %.2f, W(T)%s ms\n", req_sp.greedy ? "greedy" : "sampled",
-                             df2_k_n ? (double) df2_k_sum / (double) df2_k_n : 0.0, wt.c_str());
+                char ptab[512];
+                df2_pol.table(ptab, sizeof ptab);
+                std::fprintf(stderr, "strata dflash2: policy %s, mean k %.2f, W(T)%s ms; p(depth|margin bucket)%s\n",
+                             req_sp.greedy ? "greedy" : "sampled", df2_k_n ? (double) df2_k_sum / (double) df2_k_n : 0.0, wt.c_str(), ptab);
                 std::fprintf(stderr, "strata dflash2: %lld windows, %lld tokens, T %d, %lld asks %.2f ms, context %lld rows %.2f ms "
                                      "(per window %.2f ms), accepted %lld/%lld, by depth%s\n",
                              (long long) dec_windows, (long long) produced_n, df2_T, (long long) df2_asks,
