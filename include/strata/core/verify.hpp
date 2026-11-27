@@ -22,6 +22,7 @@
 #pragma once
 
 #include <cstdio>
+#include <cstdlib>
 
 #include "strata/core/expert_source.hpp"
 #include "strata/core/layer.hpp"
@@ -657,6 +658,12 @@ private:
     void* arena_ = nullptr;
     int32_t *tok_ = nullptr, *step_ = nullptr, *pos_ = nullptr, *commit_ = nullptr;
     float *ple_ = nullptr, *emb_ = nullptr, *R_ = nullptr, *mixed_ = nullptr, *bo_ = nullptr;
+    float* taps_ = nullptr;   ///< DFlash2 target taps of the window's rows, [max_t][5][n_embd] (the stages' own taps only)
+    static bool taps_on() {   ///< STRATA_DFLASH2_TAPS=1 or the taps dump: the window graphs compute the stage's taps
+        static const bool on = [] { const char* v = std::getenv("STRATA_DFLASH2_TAPS"); return (v != nullptr && v[0] == '1') ||
+                                                                 std::getenv("STRATA_DFLASH2_TAPS_DUMP") != nullptr; }();
+        return on;
+    }
     float *inj_ = nullptr, *inj2_ = nullptr, *lo_ = nullptr, *rs_ = nullptr, *xn_ = nullptr;
     unsigned* hcs_ = nullptr;   // the HC read's sync words (gfx906 one-kernel read), kFusedGrSyncWords
     uint8_t* xq_ = nullptr;                                   // T columns of q8_1

@@ -1,6 +1,7 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/batch_rows.hpp"
 #include "strata/core/sm75_series.hpp"
+#include "strata/kernels/dflash_qwen.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/core/verify.hpp"
 #if !defined(STRATA_USE_HIP) && !defined(STRATA_HIP_GFX906)
@@ -817,6 +818,8 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         pos_ = b.take<int32_t>(T * (NH + NKV + IQ)); commit_ = b.take<int32_t>(2 + T);
         ple_ = b.take<float>(T * N); emb_ = b.take<float>(T * N); R_ = b.take<float>(T * HC * N);
         mixed_ = b.take<float>(T * N); bo_ = b.take<float>(T * N);
+        // DFlash2 target taps [T][5][N], only when they are computed (the arena, and so the expert cache, is unchanged otherwise)
+        taps_ = taps_on() ? b.take<float>(T * (uint64_t) strata::kernels::dflash_qwen::kTaps * N) : nullptr;
         inj_ = b.take<float>(T * HC); inj2_ = b.take<float>(T * HC);
         lo_ = b.take<float>(T * (uint64_t) g.hc_lr); rs_ = b.take<float>(T * HC); xn_ = b.take<float>(T * HC * N);
         hcs_ = b.take<unsigned>(strata::kernels::kFusedGrSyncWords);
@@ -1311,6 +1314,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                 (int) (l * kProfPer + (half == 0 ? 27 : 30)), hcs_);
         };
         const bool q8_attn = gr_read_group(0, pending, inj2_, inj_);   // true: xq_ holds mixed's q8_1 (STRATA_QFUSE)
+        // DFlash2: the first read of layer l folded layer l-1's FFN write into R, so R is layer l-1's full residual here
+        if (const int tk = strata::kernels::dflash_qwen::tap_of_layer(l - 1); tk >= 0 && taps_ != nullptr) {
+            constexpr int KT = strata::kernels::dflash_qwen::kTaps;
+            strata::kernels::dflash_qwen::hc_stream_mean(Rt(tb), n, (int) HC, (int) N, taps_ + ((size_t) tb * KT + tk) * N,
+                                                         (int64_t) KT * N, cs);
+        }
         {   // measurement only: STRATA_DUMMY_NODES=k adds k empty kernel nodes per layer (what one node costs in a window)
             static const int dummy = [] { const char* e = std::getenv("STRATA_DUMMY_NODES"); return e != nullptr ? std::atoi(e) : 0; }();
             for (int d = 0; d < dummy; ++d) gpu_noop(cs);
@@ -3505,6 +3514,14 @@ bool Verifier::commit(int n_keep, std::string& err, const PrimaryCommitContext* 
         return false;
     }
     if (n_keep < 1 || n_keep > last_t_) { err = "verify: commit count out of range"; return false; }
+    if (strata::kernels::dflash_qwen::taps_dump_enabled() && g_ != nullptr && taps_ != nullptr) {   // measurement: the kept rows' taps
+        namespace dq = strata::kernels::dflash_qwen;
+        const int64_t le = le_ < 0 ? g_->n_layers : le_;
+        for (int k = 0; k < dq::kTaps; ++k)
+            if (dq::kTapLayers[k] + 1 >= lb_ && dq::kTapLayers[k] + 1 < le)
+                dq::taps_dump_rows(taps_ + (size_t) k * g_->n_embd, n_keep, (int64_t) dq::kTaps * g_->n_embd,
+                                   (int) g_->n_embd, k, last_pos0_, cs_);
+    }
     const Clock::time_point t0 = Clock::now();
     h_commit_[0] = n_keep;
     h_commit_[1] = n_keep - 1;

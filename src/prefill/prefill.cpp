@@ -8,6 +8,7 @@
 #include "hc_bf16_n4.hpp"
 #endif
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
+#include "strata/kernels/dflash_qwen.hpp"
 #include "strata/kernels/fused_gr.hpp"
 #include "strata/kernels/gfx_arch.hpp"
 #include "strata/prefill/prefill.hpp"
@@ -4894,6 +4895,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (steered && !cv_fused)   // --control-vector-scaled
                     strata::kernels::cvec_apply(m.R, l, T, D, nullptr, 0, nullptr, 0, false, m.cs);
             }
+            // measurement (STRATA_DFLASH2_TAPS_DUMP): layer l's full residual is in R after its FFN write
+            if (const int tk = strata::kernels::dflash_qwen::tap_of_layer(l);
+                tk >= 0 && strata::kernels::dflash_qwen::taps_dump_enabled())
+                strata::kernels::dflash_qwen::taps_dump_residual(m.R, (int) T, (int) HC, (int) N, tk, p0, m.cs);
         }
         if (!ple_land()) return false;   // a stage that ends before layer 1: the rows land anyway, the next gather starts
         if (issuer.joinable()) {

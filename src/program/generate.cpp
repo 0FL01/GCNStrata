@@ -16713,6 +16713,13 @@ int main(int argc, char** argv) {
                 for (size_t i = 0; i < n_floats * sizeof(float); ++i) h = (h ^ bytes[i]) * 1099511628211ull;
                 std::fprintf(hashes, "%lld %lld %d %016llx", (long long) rounds, (long long) p, T, (unsigned long long) h);
                 for (int i = 0; i < T; ++i) std::fprintf(hashes, " %d", (int) outv[(size_t) i]);
+                // per row (position p + i): its own FNV-1a, so windows of different widths compare row by row
+                const size_t row_bytes = (size_t) (g.hc * g.n_embd) * sizeof(float);
+                for (int i = 0; i < T; ++i) {
+                    uint64_t hr = 1469598103934665603ull;
+                    for (size_t b = 0; b < row_bytes; ++b) hr = (hr ^ bytes[(size_t) i * row_bytes + b]) * 1099511628211ull;
+                    std::fprintf(hashes, " r%016llx", (unsigned long long) hr);
+                }
                 std::fprintf(hashes, "\n");
             }
             if (!follow.empty()) {   // the continuation stands in for the argmax

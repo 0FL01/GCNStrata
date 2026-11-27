@@ -412,6 +412,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/native_gdn.cu
                           src/kernels/cuda/native_gr_postops.cu
                           src/kernels/cuda/native_router.cu
+                          src/kernels/cuda/dflash_qwen.cu
                           src/kernels/cuda/route_prior.cu
                           src/kernels/cuda/native_gdn_preprocess.cu
                           src/kernels/cuda/native_qsa.cu
@@ -2184,7 +2185,7 @@ if(STRATA_NATIVE_EXPERTS AND STRATA_HIP_GFX906)
                                                              ${_strata_gpu_include_directories})
   target_link_libraries(poly_inkling_attend_test PRIVATE ${_strata_gpu_runtime_target})
 
-  if(STRATA_HIP_GFX906 AND STRATA_BUILD_TESTS)
+  if(STRATA_HIP_GFX906 AND STRATA_BUILD_TESTS AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/src/poly/inkling_dflash2_test.cu)
     add_executable(poly_inkling_dflash2_test src/poly/inkling_dflash2_test.cu src/poly/inkling_dflash2.cu)
     target_compile_definitions(poly_inkling_dflash2_test PRIVATE STRATA_DFLASH2_TEST=1)
     target_include_directories(poly_inkling_dflash2_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
