@@ -1468,7 +1468,9 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, 0, cs_, probs_, m_prob_);
     if (ok) g_mp.stamp(16, cs_);
     g_mp.base = -1;
-    if (ok && force_on_ && !coupled) force_token(tok_, m_force_, 0, cs_);   // chain_launch: step 1's input
+    // chain_launch: step 1's input (coupled graphs too: a pipelined sampled request's chain is coupled under
+    // STRATA_PIPELINE_COUPLED=1; draft() clears the table first, so its own launches are unaffected)
+    if (ok && force_on_) force_token(tok_, m_force_, 0, cs_);
     return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
 }
 
@@ -1498,7 +1500,7 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
     if (ok) g_mp.stamp(16, cs_);
     g_mp.base = -1;
-    if (ok && force_on_ && !coupled) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
+    if (ok && force_on_) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
 }
 
@@ -1913,6 +1915,12 @@ bool MtpDrafter::prepare_chain(std::string& err) {
         if (!capture_round(T, false, err)) return false;
     for (int j = 1; j <= max_t_ - 2; ++j)
         if (!capture_step(j, false, err)) return false;
+    if (coupled_ok_) {   // the coupled chain of a sampled request (STRATA_PIPELINE_COUPLED=1)
+        for (int T = 1; T <= max_t_; ++T)
+            if (!capture_round(T, true, err)) return false;
+        for (int j = 1; j <= max_t_ - 2; ++j)
+            if (!capture_step(j, true, err)) return false;
+    }
     if (ev_chain_ == nullptr && cudaEventCreateWithFlags(&ev_chain_, cudaEventDisableTiming) != cudaSuccess) {
         err = "mtp: event creation failed";
         return false;
@@ -1935,9 +1943,13 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
         err = "mtp: chain arguments out of range";
         return false;
     }
-    if (round_exec_[T] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
+    // a sampled request with coupled drafting: its chain picks with the target's chain and draw per position
+    const bool cp = coupled_active_;
+    cudaGraphExec_t* rx = cp ? round_exec_c_ : round_exec_;
+    cudaGraphExec_t* sx = cp ? step_exec_c_ : step_exec_;
+    if (rx[T] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
     for (int j = 1; j < n_out; ++j)
-        if (step_exec_[j] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
+        if (sx[j] == nullptr) { err = "mtp: chain graphs not prepared"; return false; }
     const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
     auto put = [&](int row, int64_t cell) {
@@ -1959,10 +1971,10 @@ bool MtpDrafter::chain_launch(int T, const int32_t* tokens, int64_t p, int a, co
     std::atomic_thread_fence(std::memory_order_seq_cst);
     if (!stage_source_R(T, err)) return false;
     chain_early_ = std::max(0, std::min(n_early, n_out));
-    bool ok = cudaGraphLaunch(round_exec_[T], cs_) == cudaSuccess;
+    bool ok = cudaGraphLaunch(rx[T], cs_) == cudaSuccess;
     if (ok && chain_early_ >= 1) ok = cudaEventRecord(ev_step_[0], cs_) == cudaSuccess;
     for (int j = 1; ok && j < n_out; ++j) {
-        ok = cudaGraphLaunch(step_exec_[j], cs_) == cudaSuccess;
+        ok = cudaGraphLaunch(sx[j], cs_) == cudaSuccess;
         if (ok && j < chain_early_) ok = cudaEventRecord(ev_step_[j], cs_) == cudaSuccess;
     }
     if (!ok || cudaEventRecord(ev_chain_, cs_) != cudaSuccess) {

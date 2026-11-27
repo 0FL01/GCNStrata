@@ -14674,9 +14674,17 @@ int main(int argc, char** argv) {
             // (with STRATA_IQ_MT_MIN=1 bit for bit; sampled requests with the same Philox draw per position).
             bool pl_ran = false;
             const bool pl_want = pipe && pl_pw >= 2 && pl_snap_ok;
+            // STRATA_PIPELINE_COUPLED=1 (opt-in): a coupled sampled request (--coupled-draft) stays pipelined - its
+            // chain picks every guess with the target's chain and draw at the row that will check it (with
+            // STRATA_SPEC_GUMBEL=1 both sides take the Gumbel-max pick: the same exact sample of p, noise keyed by
+            // the token), so B's bonus guess and the drafts follow the target's sample instead of the drafter's argmax
+            static const bool pl_coupled_ok = [] {
+                const char* e = std::getenv("STRATA_PIPELINE_COUPLED");
+                return e != nullptr && std::atoi(e) != 0;
+            }();
             const char* pl_serial = !pl_want ? nullptr
                                   : hist_n > 0 ? "repetition penalties (penalty_last_n)"
-                                  : mtp.coupled() ? "coupled draft sampling" : nullptr;
+                                  : mtp.coupled() && !pl_coupled_ok ? "coupled draft sampling" : nullptr;
             if (pl_serial != nullptr) {   // said once per reason
                 static std::set<std::string> said;
                 if (said.insert(pl_serial).second)

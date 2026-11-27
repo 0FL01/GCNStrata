@@ -695,8 +695,12 @@ __device__ __forceinline__ void warp_merge_lists(const int2* lists, int nl, int 
 /// (row-major: row t, block b, entry i at `(t * n_blocks + b) * k + i`, as (id, value bits)).
 __global__ void __launch_bounds__(kSplitWarps * 32)
 sampler_split_part_kernel(const float* __restrict__ logits, int n_vocab, const int* __restrict__ history,
-                          int history_len, const SamplerParams p, int k, int n_blocks, int2* __restrict__ cand) {
+                          int history_len, const SamplerParams p, int k, int n_blocks, int2* __restrict__ cand,
+                          const SamplerParams* __restrict__ kdp = nullptr) {
     const int t = blockIdx.y;
+    // kdp (the coupled drafter's device parameters): its request's top_k bounds the rounds, the list stride stays k
+    // (a merge reads at most top_k entries of each list: the first top_k of a union lie in the first top_k of each)
+    const int kr = kdp != nullptr ? min(k, sampled_k(kdp->top_k, n_vocab)) : k;
     const float* l = logits + (size_t) t * n_vocab;
     const int warp = (int) (threadIdx.x >> 5), lane = (int) (threadIdx.x & 31);
     const int blo = (int) blockIdx.x * kSplitBlockSpan;
@@ -745,7 +749,7 @@ sampler_split_part_kernel(const float* __restrict__ logits, int n_vocab, const i
     float prev_v = __int_as_float(0x7f800000);   // +inf and id -1: round 0 takes every logit
     int prev_i = -1;
     int i = 0;
-    for (; i < k; ++i) {
+    for (; i < kr; ++i) {
         // two chains (even and odd j), each walked in ascending id with a strict `>`, so each keeps its first in
         // the order; `take_first` then orders the two
         float b0 = __int_as_float(0xff800000), b1 = __int_as_float(0xff800000);
@@ -764,11 +768,11 @@ sampler_split_part_kernel(const float* __restrict__ logits, int n_vocab, const i
         prev_v = b0;
         prev_i = i0;
     }
-    for (int r = i + lane; r < k; r += 32) wl[warp][r] = make_int2(n_vocab, (int) 0xff800000u);   // sentinels
+    for (int r = i + lane; r < kr; r += 32) wl[warp][r] = make_int2(n_vocab, (int) 0xff800000u);   // sentinels
     __syncthreads();
     if (warp == 0) {
         int2* dst = cand + ((size_t) t * n_blocks + blockIdx.x) * k;
-        warp_merge_lists(&wl[0][0], kSplitWarps, kSelMax, k, n_vocab, [&](int r, float v, int id) {
+        warp_merge_lists(&wl[0][0], kSplitWarps, kSelMax, kr, n_vocab, [&](int r, float v, int id) {
             if (lane == 0) dst[r] = make_int2(id, __float_as_int(v));
         });
     }
@@ -848,10 +852,11 @@ __global__ void __launch_bounds__(32)
 coupled_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, int kpart,
                      const SamplerParams* __restrict__ dp, const int* __restrict__ step_rec,
                      const int* __restrict__ sub_to_id, int* __restrict__ ring, int cap, int j, int* __restrict__ out_id,
-                     float* __restrict__ out_prob) {
+                     float* __restrict__ out_prob, int gate_top1, float tscale) {
     const int lane = (int) threadIdx.x;
     SamplerParams p = *dp;
     p.counter = strata::core::coupled_draft_counter((int64_t) step_rec[0]);
+    p.temperature *= tscale;   // STRATA_COUPLED_DT: the draft head's temperature relative to the request's (1: the same)
     const int k = sampled_k(p.top_k, nv);    // <= kpart: the first k of a union lie in the first k of each list
     __shared__ int2 lists[kSplitMaxBlocks * kSelMax];
     __shared__ int sel_ids[kSelMax];
@@ -869,6 +874,10 @@ coupled_merge_kernel(const int2* __restrict__ cand, int n_blocks, int nv, int kp
         if (lane == 0) { pick[0] = sel_ids[0]; prob[0] = 1.0f; }
     } else {
         sampled_tail_warp<true>(sel_ids, sel_logit, k, p, 0, pick, ex, prob, sub_to_id);
+        // STRATA_COUPLED_GATE=top1: report q's top probability (how sure the draft head is) instead of the pick's
+        // own - a Gumbel pick below the top is still likely the target's when q is close to p
+        __syncwarp();
+        if (gate_top1 && lane == 0) prob[0] = (float) ex[0];
     }
     __syncwarp();
     if (lane == 0) {
@@ -1335,11 +1344,22 @@ void coupled_draft_sample(float* logits, int nv, const int32_t* sub_to_id, const
     coupled_check("coupled_penalize");
     // the selection of the split sampler, unchanged: every 4,096-logit block's first `kpart` (the widest list,
     // since the request's top_k is only known on the device), penalties already applied above
+    // STRATA_COUPLED_KDEV=1: the blocks' rounds bounded by the request's top_k on the device (bitwise the same pick)
+    static const bool kdev = [] { const char* e = std::getenv("STRATA_COUPLED_KDEV"); return e != nullptr && std::atoi(e) != 0; }();
     sampler_split_part_kernel<<<dim3((unsigned) n_blocks, 1u), kSplitWarps * 32, 0, s>>>(
-        logits, nv, nullptr, 0, SamplerParams{}, kpart, n_blocks, (int2*) scratch);
+        logits, nv, nullptr, 0, SamplerParams{}, kpart, n_blocks, (int2*) scratch, kdev ? params : nullptr);
     coupled_check("coupled_draft split part");
+    static const int gate_top1 = [] {
+        const char* e = std::getenv("STRATA_COUPLED_GATE");
+        return e != nullptr && std::strcmp(e, "top1") == 0 ? 1 : 0;
+    }();
+    static const float tscale = [] {
+        const char* e = std::getenv("STRATA_COUPLED_DT");
+        const float v = e != nullptr ? (float) std::atof(e) : 1.0f;
+        return v > 0.0f ? v : 1.0f;
+    }();
     coupled_merge_kernel<<<1, 32, 0, s>>>((const int2*) scratch, n_blocks, nv, kpart, params, step_rec, sub_to_id, ring,
-                                          cap, j, out_id, out_prob);
+                                          cap, j, out_id, out_prob, gate_top1, tscale);
     coupled_check("coupled_draft merge");
 }
 
