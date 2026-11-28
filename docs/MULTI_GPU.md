@@ -408,8 +408,18 @@ and the asynchronous tier stay two-stage. In the config:
   matches it exactly).
 - **Off, with one line in the log saying why**, with `--batch` slots, `--peer-device`, the helper caches
   (`--expert-cache-device1..3`, which `--remote-expert-opt` builds on), a split onto one GPU (`--split-device 0`), or no
-  draft layer; on three or more stages also `--pipeline-windows 1` and `--adapt-async 1`. A request with repetition penalties (`penalty_last_n`) or coupled
-  draft sampling decodes serially.
+  draft layer; on three or more stages also `--pipeline-windows 1` and `--adapt-async 1`. Coupled sampled drafting
+  requires `STRATA_PIPELINE_COUPLED=1` for pw2. History-bearing requests normally decode serially; the PP4
+  opt-in below preserves their penalties.
+- **`STRATA_PENALTY_PW2=1`** (off by default): allow history penalties for single text requests on four stages,
+  `--pipeline-windows 2`, MTP width two, greedy target or coupled sampling. Requests with a logit bias, images,
+  suffix/lookup drafting or probabilistic acceptance keep their previous path. On the head card each row uses
+  the committed inputs followed by its own window inputs, including that row's input. A rejected branch cannot
+  supply the next window's history. The draft retains its sampled ID for agreement, but counts the token actually
+  fed after teacher forcing. No change to the target sampler, absolute-position draws, or conversation format.
+  On B3 Q4_0 / 4×16 GiB gfx906, eight fixed-placement sampled instruct HTTP turns with inherited presence 1.5
+  produced the same 631 tokens: 61.99→76.02 tok/s decode and 26.13→24.17 s client wall against V5. SSE p95
+  **increased** from 27.79 to 29.43 ms. This comparison does not measure a gain on requests already using pw2.
 - **With the resident RAM mode's asynchronous swaps** (`--adapt-async 1`, [DETAILS.md](DETAILS.md)) a round's steps
   advance between the verified windows. Each card's copies are queued by the decode loop itself while that card has
   no window in flight, after every window that may still read what they overwrite has finished; the moves into RAM

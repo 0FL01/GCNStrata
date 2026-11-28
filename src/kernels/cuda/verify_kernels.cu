@@ -701,9 +701,12 @@ __global__ void dense_steps_kernel(const int32_t* __restrict__ cells, int n, int
 }
 
 // --pipeline-windows: the drafter's chain, teacher forced (see force_token)
-__global__ void force_token_kernel(int32_t* tok, const int32_t* force, int j) {
+__global__ void force_token_kernel(int32_t* tok, const int32_t* force, int j, int32_t* history_slot) {
     const int32_t f = ((const volatile int32_t*) force)[j];
-    if (f >= 0) *tok = f;
+    if (f >= 0) {
+        *tok = f;
+        if (history_slot != nullptr) *history_slot = f;
+    }
 }
 
 }  // namespace
@@ -763,8 +766,8 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
     check("mtp_select");
 }
 
-void force_token(int32_t* tok, const int32_t* force, int j, void* stream) {
-    force_token_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(tok, force, j);
+void force_token(int32_t* tok, const int32_t* force, int j, void* stream, int32_t* history_slot) {
+    force_token_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(tok, force, j, history_slot);
     check("force_token");
 }
 

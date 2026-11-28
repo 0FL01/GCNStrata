@@ -1470,7 +1470,8 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     g_mp.base = -1;
     // chain_launch: step 1's input (coupled graphs too: a pipelined sampled request's chain is coupled under
     // STRATA_PIPELINE_COUPLED=1; draft() clears the table first, so its own launches are unaffected)
-    if (ok && force_on_) force_token(tok_, m_force_, 0, cs_);
+    // The coupled ring records the fed token; mtp_select has already published the sampled pick.
+    if (ok && force_on_) force_token(tok_, m_force_, 0, cs_, coupled ? cring_ + kCoupledHistCap : nullptr);
     return finish_capture(cs_, ok, exec, coupled ? "round (coupled)" : "round", err);
 }
 
@@ -1500,7 +1501,9 @@ bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
     if (ok) mtp_select(R_, HCN, out_ids_, row_ + 1, Rin_, tok_, m_out_, j, cs_, probs_, m_prob_);
     if (ok) g_mp.stamp(16, cs_);
     g_mp.base = -1;
-    if (ok && force_on_) force_token(tok_, m_force_, j, cs_);   // chain_launch: step j+1's input
+    // chain_launch: step j+1's input and the matching history entry
+    if (ok && force_on_)
+        force_token(tok_, m_force_, j, cs_, coupled ? cring_ + kCoupledHistCap + j : nullptr);
     return finish_capture(cs_, ok, exec, coupled ? "step (coupled)" : "step", err);
 }
 

@@ -14807,8 +14807,16 @@ int main(int argc, char** argv) {
                 const char* e = std::getenv("STRATA_PIPELINE_COUPLED");
                 return e != nullptr && std::atoi(e) != 0;
             }();
+            static const bool pl_penalty_ok = [] {
+                const char* e = std::getenv("STRATA_PENALTY_PW2");
+                return e != nullptr && std::atoi(e) != 0;
+            }();
+            // Only the single-request, exact-match PP4 MTP path has a branch-local history contract.
+            const bool penalty_shape = n_stages == 4 && use_mtp && S_mtp == 2 && !geni && o.batch == 0 &&
+                                       !sfx_on && !mtp.prob() && !req_bias_present && (req_sp.greedy || mtp.coupled());
             const char* pl_serial = !pl_want ? nullptr
-                                  : hist_n > 0 ? "repetition penalties (penalty_last_n)"
+                                  : hist_n > 0 && !pl_penalty_ok ? "penalties (STRATA_PENALTY_PW2 disabled)"
+                                  : hist_n > 0 && !penalty_shape ? "penalties outside text PP4/T2 exact-match MTP"
                                   : mtp.coupled() && !pl_coupled_ok ? "coupled draft sampling" : nullptr;
             if (pl_serial != nullptr) {   // said once per reason
                 static std::set<std::string> said;
@@ -15118,6 +15126,17 @@ int main(int argc, char** argv) {
                         strata::core::Verifier& v = V1(A);
                         if (v.service(&drive_pool_split, SDf(A), err) < 0) return die(err);
                         if (v.done(err)) {
+                            // Only A reaches the head. Rebuild even on a parity-reusing retry: consumed
+                            // excludes A.tok[0] (the last emitted pick) and any doomed front-stage inputs.
+                            // pl_finish samples and syncs this stream before either staging buffer is reused.
+                            if (hist_n > 0) {
+                                strata::kernels::penalty_rows(consumed.data(), (int64_t) consumed.size(), A.tok, A.T,
+                                                              hist_n, hist_stage.data());
+                                const strata::core::OnDevice on_h(hist_dev);
+                                if (cudaMemcpyAsync(d_hist, hist_stage.data(), (size_t) A.T * hist_n * sizeof(int32_t),
+                                                    cudaMemcpyHostToDevice, v.stream()) != cudaSuccess)
+                                    return die("the target penalty history upload failed");
+                            }
                             if (!v.pl_finish(outp.data(), err)) return die(err);
                             A.s1_done = true;
                             tre("F1", A.seq, A.T);
@@ -15357,6 +15376,10 @@ int main(int argc, char** argv) {
                     p = A.p + kept_rows;
                     pcie_auto_step(req_pcie_frac);   // 0.1.44: the measured share in the pipelined loop too (STRATA_PCIE_AUTO_SPLIT=1 on a split)
                     if (!last && !ajob && !pl_adapt()) return die("an adaptive refill failed");
+                    // The previous chain is idle. Seed both fresh and forced chains from the actual
+                    // verdict, not the guessed bonus: kept inputs are in consumed, x is still pending.
+                    if (!last && hist_n > 0 && mtp.coupled())
+                        mtp.set_draft_history(consumed.data(), (int64_t) consumed.size(), x);
                     if (on && !last) {
                         ++pl_on;
                         // the chain over A, forced through B's drafts: B's bonus guess and the next window's drafts

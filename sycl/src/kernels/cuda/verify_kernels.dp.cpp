@@ -1006,9 +1006,12 @@ __dpct_inline__ void dense_steps_kernel(const int32_t *__restrict__ cells,
 
 // --pipeline-windows: the drafter's chain, teacher forced (see force_token)
 __dpct_inline__ void force_token_kernel(int32_t *tok, const int32_t *force,
-                                        int j) {
+                                        int j, int32_t *history_slot) {
     const int32_t f = ((const volatile int32_t*) force)[j];
-    if (f >= 0) *tok = f;
+    if (f >= 0) {
+        *tok = f;
+        if (history_slot != nullptr) *history_slot = f;
+    }
 }
 
 }  // namespace
@@ -1156,7 +1159,7 @@ void mtp_select(const float* R_src, int64_t R_stride, const int32_t* ids, const 
     check("mtp_select");
 }
 
-void force_token(int32_t* tok, const int32_t* force, int j, void* stream) {
+void force_token(int32_t* tok, const int32_t* force, int j, void* stream, int32_t* history_slot) {
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
@@ -1165,7 +1168,7 @@ void force_token(int32_t* tok, const int32_t* force, int j, void* stream) {
             ->parallel_for<dpct_kernel_name<class force_token_kernel_a9fa72>>(
                 sycl::nd_range<3>(sycl::range(1, 1, 1), sycl::range(1, 1, 1)),
                 exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    force_token_kernel(tok, force, j);
+                    force_token_kernel(tok, force, j, history_slot);
                 });
     }
     check("force_token");
