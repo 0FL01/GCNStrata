@@ -4,6 +4,10 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 
 namespace strata::core {
@@ -100,6 +104,55 @@ bool metadata_bytes(const ConversationCheckpoint& c, size_t& total) {
         !product(images, {c.imgs.size(), sizeof(ConversationImageKey)})) return false;
     for (size_t n : {ids, images, c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(), c.block_pos.size()})
         if (!add(total, n)) return false;
+    return true;
+}
+
+using Clock = std::chrono::steady_clock;
+
+bool split_snapshot_diagnostic(const char* setting, const SessionState& ss, const ModelGeometry& g) {
+    return setting && std::strcmp(setting, "1") == 0 && g.n_layers == 48 && g.qsa_interval == 4 &&
+           (ss.layer_lo != 0 || ss.layer_hi != g.n_layers);
+}
+
+void trace_snapshot(const char* op, const SavedConversation& image, size_t layers, double setup_ms,
+                    double checkpoint_ms, double running_ms, double kv_ms) {
+    size_t kv = 0, pooled = 0, draft = 0;
+    for (size_t j = 0; j < image.kv.size(); ++j) {
+        const auto& layer = image.kv[j];
+        const size_t bytes = layer.k.size() + layer.v.size() + layer.k_scale.size() + layer.v_scale.size();
+        if (j < layers) { kv += bytes; pooled += layer.pooled.size(); }
+        else draft += bytes;
+    }
+    const auto& c = image.live;
+    std::fprintf(stderr, "strata trace: snapshot %s layers=%lld:%lld tokens=%zu checkpoints=%zu "
+                 "setup_ms=%.3f checkpoint_copy_ms=%.3f running_ms=%.3f kv_ms=%.3f "
+                 "gdn=%zu ple=%zu idx_tail=%zu idx_dead=%zu idx_pos=%zu main_kv=%zu pooled=%zu draft_kv=%zu\n",
+                 op, (long long) image.layer_lo, (long long) image.layer_hi, c.ids.size(), image.checkpoints.size(),
+                 setup_ms, checkpoint_ms, running_ms, kv_ms, c.gdn.size(), c.ple.size(), c.tails.size(), c.dead.size(),
+                 c.block_pos.size(), kv, pooled, draft);
+}
+
+bool verify_restored_state(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
+                           std::string& error) {
+    const auto& c = image.live;
+    ConversationCheckpoint readback;
+    readback.ids = c.ids;
+    if (!conversation_checkpoint_save(readback, ss, g, error)) return false;
+    if (c.gdn != readback.gdn || c.ple != readback.ple || c.tails != readback.tails ||
+        c.dead != readback.dead || c.block_pos != readback.block_pos ||
+        ss.ple_prev[0] != (c.ids.size() >= 2 ? c.ids[c.ids.size() - 2] : -1) || ss.ple_prev[1] != c.ids.back())
+        return fail(error, "restored running state differs from the snapshot");
+
+    // A rejected verifier row may have written the pooled spare before parking. Mount reconstructs it
+    // from dead, not from those uncommitted bytes. Compare against that canonical value after mount.
+    const size_t row = c.ids.size() / strata::kernels::qsa_real_shapes().idx_block;
+    std::vector<float> spare(g.idx_key_dim);
+    for (size_t j = 0; j < owned_qsa(ss); ++j) {
+        const size_t bytes = spare.size() * sizeof(float);
+        if (!copy(spare.data(), owned(ss, j).idx_pooled + row * g.idx_key_dim, bytes, error)) return false;
+        if (std::memcmp(spare.data(), c.dead.data() + j * bytes, bytes) != 0)
+            return fail(error, "reconstructed indexer spare differs from the checkpoint dead key");
+    }
     return true;
 }
 } // namespace
@@ -302,19 +355,32 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const SessionState& ss, const ModelGeometry& g,
                                 const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse, size_t* reused_bytes) {
+    static const char* trace_setting = std::getenv("STRATA_PP4_SNAPSHOT_TRACE");
+    const bool trace = split_snapshot_diagnostic(trace_setting, ss, g);
+    auto lap_start = trace ? Clock::now() : Clock::time_point{};
+    auto lap_ms = [&] {
+        if (!trace) return 0.0;
+        const auto now = Clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - lap_start).count();
+        lap_start = now;
+        return ms;
+    };
     size_t estimate = 0;
     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
+    const double setup_ms = lap_ms();
     // Build into a new object so a failure cannot publish a partial snapshot.
     SavedConversation captured;
     captured.geometry = geometry_key(g);
     captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
     captured.live.ids = view.ids; captured.live.imgs = view.images;
     captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints);
+    const double checkpoint_ms = lap_ms();
     const int64_t unchanged = reuse.kv.empty() ? 0 : reuse.unchanged_tokens;
     captured.kv = std::move(reuse.kv);
     const size_t layers = owned_qsa(ss);
     captured.kv.resize(layers + (draft ? 1 : 0));
     if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
+    const double running_ms = lap_ms();
     const int64_t upto = (int64_t) view.ids.size();
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
@@ -323,6 +389,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     // reached. Refresh that page even when the main prefix continued unchanged.
     if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
                                        std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
+    if (trace) trace_snapshot("park", captured, layers, setup_ms, checkpoint_ms, running_ms, lap_ms());
     image = std::move(captured);
     return true;
 }
@@ -425,15 +492,46 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 }
 
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
-                                                   const ModelGeometry& g, const QsaState* draft, std::string& error) {
+                                                    const ModelGeometry& g, const QsaState* draft, std::string& error) {
+    static const char* trace_setting = std::getenv("STRATA_PP4_SNAPSHOT_TRACE");
+    const bool trace = split_snapshot_diagnostic(trace_setting, ss, g);
+    const auto start = trace ? Clock::now() : Clock::time_point{};
     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
     if (!sync(error)) return ConversationRestore::transfer_failed;
+    const auto setup_done = trace ? Clock::now() : Clock::time_point{};
     const int64_t upto = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < owned_qsa(ss); ++j)
         if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error))
             return ConversationRestore::transfer_failed;
-    if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
-        !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
+    if (draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error))
+        return ConversationRestore::transfer_failed;
+    static const char* verify_setting = std::getenv("STRATA_PP4_SNAPSHOT_VERIFY");
+    const bool verify = split_snapshot_diagnostic(verify_setting, ss, g);
+    if (verify) {
+        // Check transfer bytes (including streamed/ring residency) before running-state restore
+        // reconstructs the moving indexer spare. Diagnostics never supply inputs to the restore.
+        uint64_t fingerprint = 0;
+        if (!sync(error)) return ConversationRestore::transfer_failed;
+        for (size_t j = 0; j < owned_qsa(ss); ++j)
+            if (!conversation_kv_verify(image.kv[j], owned(ss, j), g, upto, true, fingerprint, error))
+                return ConversationRestore::transfer_failed;
+        if (draft && !conversation_kv_verify(image.kv.back(), *draft, g, upto, false, fingerprint, error))
+            return ConversationRestore::transfer_failed;
+    }
+    const auto kv_done = trace ? Clock::now() : Clock::time_point{};
+    // The checkpoint's leading sync also fences the K/V residency reset queued on the legacy stream.
+    if (!conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
+    if (trace) {
+        const auto end = Clock::now();
+        auto ms = [](auto duration) { return std::chrono::duration<double, std::milli>(duration).count(); };
+        trace_snapshot("restore", image, owned_qsa(ss), ms(setup_done - start), 0.0,
+                       ms(end - kv_done), ms(kv_done - setup_done));
+    }
+    if (verify) {
+        if (!verify_restored_state(image, ss, g, error)) return ConversationRestore::transfer_failed;
+        std::fprintf(stderr, "strata serve: PP4_SNAPSHOT_VERIFY layers=%lld:%lld tokens=%zu readback=ok draft=%d\n",
+                     (long long) image.layer_lo, (long long) image.layer_hi, image.live.ids.size(), draft != nullptr);
+    }
     return ConversationRestore::restored;
 }
 

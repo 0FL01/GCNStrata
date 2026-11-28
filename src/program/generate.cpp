@@ -9211,6 +9211,71 @@ int main(int argc, char** argv) {
         strata::core::ConversationCache conversations(
             o.prompt_cache > 0 ? (size_t) o.conversation_cache_mib * 1024 * 1024 : 0,
             (size_t) o.conversation_cache_slots, o.conversation_cache_min_tokens);
+        // PP4 snapshots run between requests, on the same owners as the serial path. Keep their workers (and
+        // thread-local transfer streams) for the life of the serving loop.
+        const bool pp4_snapshot =
+#if defined(STRATA_HIP_GFX906)
+            conversations.enabled() && pipe && n_stages == 4 && o.batch == 0 &&
+            g.n_layers == 48 && g.qsa_interval == 4;
+#else
+            false;
+#endif
+        auto snapshot_flag = [&](const char* name) {
+            const char* setting = pp4_snapshot ? std::getenv(name) : nullptr;
+            return setting && std::strcmp(setting, "1") == 0;
+        };
+        const bool pp4_snapshot_threads = snapshot_flag("STRATA_PP4_SNAPSHOT_THREADS");
+        const bool pp4_snapshot_move = snapshot_flag("STRATA_PP4_SNAPSHOT_MOVE");
+        const bool pp4_snapshot_trace = snapshot_flag("STRATA_PP4_SNAPSHOT_TRACE");
+        StageThreads snapshot_threads;
+        auto run_pp4_snapshot = [&](const char* operation, const auto& transfer) -> bool {
+            struct Result {
+                std::string error;
+                std::exception_ptr thrown;
+                bool ok = false;
+                double ms = 0.0;
+            };
+            std::array<Result, 4> results;
+            auto device = [&](size_t k) { return k == 0 ? primary_device : stages[k - 1]->dev; };
+            const auto start = pp4_snapshot_trace ? Clock::now() : Clock::time_point{};
+            const std::function<void(size_t)> job = [&](size_t k) {
+                auto& r = results[k];
+                try {
+                    const auto t0 = pp4_snapshot_trace ? Clock::now() : Clock::time_point{};
+                    const int dev = device(k);
+                    const strata::core::OnDevice on(dev);
+                    int current = -1;
+                    if (cudaGetDevice(&current) != cudaSuccess || current != dev)
+                        r.error = "could not select the snapshot owner device";
+                    else
+                        r.ok = transfer(k, r.error);
+                    if (pp4_snapshot_trace)
+                        r.ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
+                } catch (...) {
+                    r.thrown = std::current_exception();
+                }
+            };
+            if (pp4_snapshot_threads) {
+                snapshot_threads.run(results.size(), job);
+            } else {
+                for (size_t k = 0; k < results.size(); ++k) {
+                    job(k);
+                    if (!results[k].ok) break;
+                }
+            }
+            if (pp4_snapshot_trace)
+                std::fprintf(stderr, "strata trace: pp4 snapshot %s parallel=%d wall_ms=%.3f stage_ms=%.3f,%.3f,%.3f,%.3f\n",
+                             operation, pp4_snapshot_threads, std::chrono::duration<double, std::milli>(Clock::now() - start).count(),
+                             results[0].ms, results[1].ms, results[2].ms, results[3].ms);
+            for (size_t k = 0; k < results.size(); ++k) {
+                if (results[k].thrown) std::rethrow_exception(results[k].thrown);
+                if (!results[k].ok) {
+                    err = std::string(operation) + " stage CUDA" + std::to_string(device(k)) + ": " + results[k].error;
+                    return false;
+                }
+            }
+            return true;
+        };
         // Disk sessions: what a session file is bound to.  The model fingerprint samples every model input this
         // engine loaded, by role (conversation_file.hpp), once; the config fingerprint covers the RESOLVED settings
         // that change what the saved bytes mean - the rope (K is cached post-RoPE), the loaded control vector, the
@@ -9287,7 +9352,7 @@ int main(int argc, char** argv) {
         };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
-        auto park_current_body = [&](size_t held, bool cold_payload_move) -> bool {
+        auto park_current_body = [&](size_t held, bool cold_switch, bool replacing_chain) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
             // #2049: parking copies the outgoing conversation's running checkpoints and K/V into host memory, which
             // is a silent stretch of the "request" stage; when the OS has paged that memory out it takes minutes.
@@ -9315,7 +9380,7 @@ int main(int argc, char** argv) {
             // A layer split parks one image per stage: the first stage's (with the draft layer's K/V) and one per
             // later stage (without it - the draft ring is saved once).  The checkpoints are MOVED apart into their
             // stage parts for the capture and put back together whichever way this ends (no running state copied).
-            const bool move_payloads = cold_payload_move && ckpt_park_payload_move_env() &&
+            const bool legacy_move = cold_switch && ckpt_park_payload_move_env() &&
                 stages.size() == 1 && ss.layer_lo == 0 && [&]() {
                     const auto& child = stages[0]->ss;
                     // Preserve the donor's legacy carve; fixed26 is a separate, bounded admission.
@@ -9339,7 +9404,8 @@ int main(int argc, char** argv) {
                         !b.loan_active && b.lent.empty() && b.lent_chunk == 0;
                 }() &&
                 o.batch == 0 && !ckpt_pool.on() && !ckpt_threads_env() && !slot_ckpt_move_env() &&
-                strata::prefill::Prefill::pipe_setting() == 0.0 &&
+                strata::prefill::Prefill::pipe_setting() == 0.0;
+            const bool move_payloads = (legacy_move || (pp4_snapshot_move && replacing_chain)) &&
                 std::all_of(checks.begin(), checks.end(), strata::core::conversation_checkpoint_payload_compact);
             const size_t n_st = stages.size();
             // the draft layer's K/V lives on the last stage's GPU (the drafter is loaded there): with a split it is
@@ -9353,6 +9419,16 @@ int main(int argc, char** argv) {
                 ~MergeBack() { if (on && !strata::core::conversation_checkpoints_merge(std::move(cs), checks)) checks.clear(); }
             } merge_back{cs, checks, n_st > 0};
             const strata::core::ConversationView view{live, live_imgs, n_st > 0 ? cs.stage0 : checks, cvec_cached};
+            size_t checkpoint_payload_bytes = 0;
+            if (move_payloads || pp4_snapshot_trace) {
+                auto count = [&](const auto& checkpoints) {
+                    for (const auto& c : checkpoints)
+                        checkpoint_payload_bytes += c.gdn.size() + c.ple.size() + c.tails.size() +
+                                                    c.dead.size() + c.block_pos.size();
+                };
+                count(view.checkpoints);
+                for (const auto& parts : cs.parts) count(parts);
+            }
             auto reuse = conversations.take_reuse();
             std::vector<strata::core::ConversationKvReuse> stage_reuse = std::move(reuse.stages);
             stage_reuse.resize(n_st);
@@ -9411,7 +9487,9 @@ int main(int argc, char** argv) {
             const auto t0 = Clock::now();
             try {
                 const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
-                const size_t retained = reuse.bytes() + stage_retained;
+                // Moved vectors already occupy RAM, but the parked budget must still charge their full bytes.
+                const size_t retained = reuse.bytes() + stage_retained +
+                    (move_payloads && pp4_snapshot_move ? checkpoint_payload_bytes : 0);
                 const size_t additional = estimate > retained ? estimate - retained : 0;
                 // The physical-RAM gate: the incoming snapshot has to fit beside the floor.  make_room()
                 // above only balanced the cache's own budget, so a full cache leaves this one short even
@@ -9450,17 +9528,34 @@ int main(int argc, char** argv) {
                         const strata::core::SessionState&, const strata::core::ModelGeometry&,
                         const strata::core::QsaState*, std::string&, strata::core::ConversationKvReuse, size_t*)>(
                             strata::core::conversation_snapshot_save);
-                if (!capture(image, view, ss, g, draft0, err, std::move(reuse), &reused_bytes)) return false;
-                for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
-                    auto& st = stages[k];
-                    const strata::core::OnDevice on(st->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
-                    const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
-                    strata::core::SavedConversation part;
-                    if (!capture(part, view_k, st->ss, g, draft_of(k), err,
-                            std::move(stage_reuse[k]), &reused_bytes))
-                        return false;
-                    image.stage_images.push_back(std::move(part));
+                if (pp4_snapshot_threads || pp4_snapshot_trace) {
+                    // Separate outputs, including the reuse counters. The vector is published only after all
+                    // owners complete; capture of stage 0 assigns its entire output, so it cannot own the vector yet.
+                    std::vector<strata::core::SavedConversation> parts(n_st);
+                    std::array<size_t, 4> reused{};
+                    if (!run_pp4_snapshot("park", [&](size_t k, std::string& e) {
+                        if (k == 0) return capture(image, view, ss, g, draft0, e, std::move(reuse), &reused[0]);
+                        const size_t i = k - 1;
+                        if (cudaDeviceSynchronize() != cudaSuccess) { e = "stage sync failed"; return false; }
+                        const strata::core::ConversationView part_view{live, live_imgs, cs.parts[i], cvec_cached};
+                        return capture(parts[i], part_view, stages[i]->ss, g, draft_of(i), e,
+                                       std::move(stage_reuse[i]), &reused[k]);
+                    })) return false;
+                    image.stage_images = std::move(parts);
+                    for (size_t n : reused) reused_bytes += n;
+                } else {
+                    if (!capture(image, view, ss, g, draft0, err, std::move(reuse), &reused_bytes)) return false;
+                    for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
+                        auto& st = stages[k];
+                        const strata::core::OnDevice on(st->dev);
+                        if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+                        const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
+                        strata::core::SavedConversation part;
+                        if (!capture(part, view_k, st->ss, g, draft_of(k), err,
+                                std::move(stage_reuse[k]), &reused_bytes))
+                            return false;
+                        image.stage_images.push_back(std::move(part));
+                    }
                 }
                 // All captures AND stage-image allocations succeeded. Only these five payloads move;
                 // retained source headers/capacities make immediate MergeBack allocation-free.
@@ -9479,17 +9574,7 @@ int main(int argc, char** argv) {
                     }
                     ~PayloadRollback() { if (on) swap(); }
                 } payload_rollback{image, n_st > 0 ? cs.stage0 : checks, cs.parts, move_payloads};
-                size_t moved_payload_bytes = 0;
-                if (move_payloads) {
-                    payload_rollback.swap();
-                    auto count = [&](const auto& checkpoints) {
-                        for (const auto& c : checkpoints)
-                            moved_payload_bytes += c.gdn.size() + c.ple.size() + c.tails.size() +
-                                                   c.dead.size() + c.block_pos.size();
-                    };
-                    count(image.checkpoints);
-                    for (const auto& part : image.stage_images) count(part.checkpoints);
-                }
+                if (move_payloads) payload_rollback.swap();
                 const auto mem_after = strata::core::sample_host_memory();
                 if (!strata::core::conversation_memory_admit(
                         mem_after ? std::optional<uint64_t>(mem_after->available) : std::nullopt, 0, floor)) {
@@ -9499,10 +9584,16 @@ int main(int argc, char** argv) {
                 }
                 const size_t snapshot_bytes = image.bytes();
                 const bool stored = conversations.put(std::move(image), held);
-                if (stored) payload_rollback.on = false;   // no throwing gap after ownership is published
+                if (stored) {
+                    payload_rollback.on = false;   // no throwing gap after ownership is published
+                    if (move_payloads && pp4_snapshot_move) merge_back.on = false;   // this request replaces the chain
+                }
                 if (stored && move_payloads)
                     std::fprintf(stderr, "strata serve: checkpoint payload move: stages=%zu checkpoints=%zu bytes=%zu\n",
-                                 n_st + 1, view.checkpoints.size(), moved_payload_bytes);
+                                 n_st + 1, view.checkpoints.size(), checkpoint_payload_bytes);
+                if (pp4_snapshot_trace)
+                    std::fprintf(stderr, "strata trace: pp4 snapshot park admission bytes=%zu additional=%zu checkpoint_payload=%zu moved=%d\n",
+                                 estimate, additional, checkpoint_payload_bytes, move_payloads);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count(),
@@ -9516,8 +9607,8 @@ int main(int argc, char** argv) {
         };
         // #752: the whole park (the checkpoint split included) is under one try, so a host OOM skips parking instead of
         // ending the server
-        auto park_current = [&](size_t held, bool cold_payload_move = false) -> bool {
-            try { return park_current_body(held, cold_payload_move); }
+        auto park_current = [&](size_t held, bool cold_switch = false, bool replacing_chain = false) -> bool {
+            try { return park_current_body(held, cold_switch, replacing_chain); }
             catch (const std::bad_alloc&) {
                 std::fprintf(stderr, "strata serve: conversation cache: allocation failed; skip parking\n");
                 return true;
@@ -12886,6 +12977,19 @@ int main(int argc, char** argv) {
             // start of this prompt wins as before)
             bool borrow = stages.empty() && parked.tokens > std::max(resume, slot_tokens) &&
                           conversations.borrows(parked);
+            if (pp4_snapshot_trace && req_imgs.empty()) {
+                // Token LCP of a committed tip, not of the previous HTTP input. This is a replay
+                // opportunity, not permission to resume GDN at an arbitrary matching position.
+                auto token_lcp = [&](const auto& tip) {
+                    return std::mismatch(ids.begin(), ids.end(), tip.begin(), tip.end()).first - ids.begin();
+                };
+                const auto* donor = parked.tokens > 0 ? conversations.find(parked.serial) : nullptr;
+                std::fprintf(stderr, "strata trace: pp4 prefix prompt=%lld live_lcp=%lld matched_park_lcp=%lld "
+                             "active_resume=%lld parked_resume=%lld\n", (long long)n,
+                             (long long)(live_ok && want_cvec == cvec_cached && live_imgs.empty() ? token_lcp(live) : -1),
+                             (long long)(donor && donor->live.imgs.empty() ? token_lcp(donor->live.ids) : -1),
+                             (long long)resume, (long long)parked.tokens);
+            }
             if (parked.tokens > std::max(resume, slot_tokens) && !borrow)
                 incoming.emplace(conversations.take(parked.index));
             if (incoming || borrow) slot_source = -1;
@@ -12943,6 +13047,7 @@ int main(int argc, char** argv) {
                                          : 0;
             const bool park_worth = o.conversation_cache_park_gain <= 0 || park_held == 0 ||
                                     (int64_t) live.size() >= (int64_t) park_held + o.conversation_cache_park_gain;
+            const bool cold_switch = resume == 0 && !from_live && !incoming && !borrow && slot_source < 0;
             if (borrow && !pin_sibling && park_worth) {
                 conversations.guard(parked.serial);   // parking the outgoing conversation must not evict the donor
                 const bool parked_ok = park_current(0);
@@ -12966,8 +13071,8 @@ int main(int argc, char** argv) {
                     }
                 }
             } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
-                       !park_current(incoming ? incoming->bytes() : 0,
-                           resume == 0 && !from_live && !incoming && !borrow && slot_source < 0)) {
+                        !park_current(incoming ? incoming->bytes() : 0, cold_switch,
+                                      cold_switch || incoming.has_value())) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -13059,24 +13164,44 @@ int main(int argc, char** argv) {
             }
             if (incoming) {
                 const auto t0 = Clock::now();
-                if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
-                        use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
-                    strata::core::ConversationRestore::restored) {
-                    // Already prevalidated above: a failure here is fatal, never
-                    // permission to decode from a partially restored session.
-                    std::printf("ERR restoring parked conversation: %s\n", err.c_str());
-                    return 1;
-                }
-                for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
-                    const strata::core::OnDevice on(stages[i]->dev);
-                    if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
-                            use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
-                        strata::core::ConversationRestore::restored) {
-                        std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
-                                    err.c_str());
+                if (pp4_snapshot_threads || pp4_snapshot_trace) {
+                    const bool restored = run_pp4_snapshot("restore", [&](size_t k, std::string& e) {
+                        if (k == 0)
+                            return strata::core::conversation_snapshot_restore(*incoming, ss, g,
+                                use_mtp && mtp_first ? &mtp.kv_state() : nullptr, e) ==
+                                strata::core::ConversationRestore::restored;
+                        const size_t i = k - 1;
+                        if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
+                                use_mtp && !mtp_first && k == stages.size() ? &mtp.kv_state() : nullptr, e) !=
+                            strata::core::ConversationRestore::restored) return false;
+                        if (cudaDeviceSynchronize() != cudaSuccess) { e = "stage sync failed"; return false; }
+                        return true;
+                    });
+                    if (!restored) {
+                        // All owners have returned. A partial restore is fatal, as in the serial path.
+                        std::printf("ERR restoring parked conversation: %s\n", err.c_str());
                         return 1;
                     }
-                    if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
+                } else {
+                    if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
+                        use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err) !=
+                        strata::core::ConversationRestore::restored) {
+                        // Already prevalidated above: a failure here is fatal, never
+                        // permission to decode from a partially restored session.
+                        std::printf("ERR restoring parked conversation: %s\n", err.c_str());
+                        return 1;
+                    }
+                    for (size_t i = 0; i < stages.size(); ++i) {   // the later stages' parts
+                        const strata::core::OnDevice on(stages[i]->dev);
+                        if (strata::core::conversation_snapshot_restore(incoming->stage_images[i], stages[i]->ss, g,
+                                use_mtp && !mtp_first && i + 1 == stages.size() ? &mtp.kv_state() : nullptr, err) !=
+                            strata::core::ConversationRestore::restored) {
+                            std::printf("ERR restoring parked conversation (stage CUDA%d): %s\n", stages[i]->dev,
+                                        err.c_str());
+                            return 1;
+                        }
+                        if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
+                    }
                 }
                 if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
                     uint64_t draft_hash = 0;

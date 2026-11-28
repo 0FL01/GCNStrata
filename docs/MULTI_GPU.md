@@ -460,6 +460,21 @@ noted (reported by adambenhassen, #1447; not repeated on our boxes):
 The last row keeps most of the asynchronous tier's decode gain and the pipeline's +28% prefill; no stalls in any arm.
 These are opt-in settings on one rig, not defaults.
 
+### Qwen Flash-Next: parking a conversation on four gfx906 cards
+
+With the RAM conversation cache enabled, the 48-layer non-batched four-stage pipeline can use two independent engine environment settings:
+
+- `STRATA_PP4_SNAPSHOT_THREADS=1`: park and restore each stage on its own GPU concurrently. The existing MTP owner also handles the draft KV. A request does not start decoding until all stages finish; a failed restore is not a cache miss that permits using partially restored state.
+- `STRATA_PP4_SNAPSHOT_MOVE=1`: when a cold switch or a validated incoming parked branch will replace the outgoing checkpoint chain, transfer ownership of its compact recurrent/indexer payloads instead of copying them in host memory. Same-session rewinds that still need the old chain take the copy path. Failed publication restores ownership. The cache budget charges the full image; the free-RAM check charges only newly required storage.
+
+Neither setting changes weights, expert placement, selection of matching prefixes, or the sampler. Both default off. `STRATA_CKPT_THREADS` controls ordinary checkpoint creation, not this full-conversation transfer. Diagnostics only: `STRATA_PP4_SNAPSHOT_TRACE=1` prints component sizes/times and committed-tip token LCP for text requests; `STRATA_PP4_SNAPSHOT_VERIFY=1` rereads state on restore, including KV residency and the reconstructed QSA spare. Leave both diagnostics unset for timings.
+
+Against `90115af2` with cache **on**, B3 Q4_0, four 16 GiB gfx906 GPUs and fixed learned placement, two eight-request client trajectories took 26.73→26.30 s (instruct) and 24.92→24.25 s (sampled, penalty-free pw2). Summed non-cold TTFT was 6.23→5.44 and 5.92→5.28 s. The 16 responses, reuse and draft counts matched. This accelerates switches and rollback; it is not a faster decode kernel.
+
+With production-like `--adapt-every 4`, a single client alternating among three histories completed 12 matched steps in 34.25→32.83 s (revisit TTFT sum 5.39→4.10 s). The two-token status replies themselves took **584→657 ms of decode in total**: the measured adaptive wait accounted for the difference; verify stayed near 22–23 ms/window. The seven longer fixed-placement reasoning/code requests measured 81.88→81.90 tok/s with identical outputs. An eight-turn adaptive sampled comparison had divergent tool-result text, so its whole-task time is not a paired speed result.
+
+Qualification on the same four GPUs: all 26 static greedy fixtures through 64K matched the R1 token ID arrays. A forced-miss pw2 replay reached 135 undo events; three parked tips passed running-state and KV byte readback on all four owners, including the draft ring. Prefill/decode disconnects were exercised separately. No changes to target kernels, draft distribution or expert budget.
+
 ## Several conversations at once
 
 With a layer split, `--batch N --batch-groups G --trim-stage-weights` decodes several conversations together and
