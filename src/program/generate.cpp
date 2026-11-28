@@ -13426,6 +13426,96 @@ int main(int argc, char** argv) {
                                  pl_theta, pl_force_miss, (long long) req_short_read);
                 }
             }
+            bool known_fatal = false;   // a simultaneous STOP must not hide a device or pool error
+            // Four gfx906 owners, two handoffs per edge. Sequence numbers, not parity bits, name the windows:
+            // done[st] counts finished verifier graphs whose commits were SUBMITTED on the owner's ordered stream.
+            // This publishes the outgoing handoff; it does not yet make a checkpoint or free the final R for reuse.
+            auto read_credit4 = [&](int64_t a, int64_t b, std::string& e) -> bool {
+                const int nwin = (int)((b - a + S - 1) / S);
+                std::array<int, 4> launched{}, done{};
+                int limit = nwin, peak = 0;
+                int32_t ids[strata::kernels::kVerifyMaxT];
+                auto fail = [&](std::string why) {
+                    known_fatal = true;
+                    pl_drain();
+                    e = why.empty() ? "known PP4 window failed" : why;
+                    return false;
+                };
+                while (true) {
+                    if (stop_req.load() && limit > launched[0]) {
+                        limit = launched[0];   // no more admissions; converge on that exact boundary
+                        std::fprintf(stderr, "strata known PP4 cut: admitted=%d finished=%d outstanding=%d\n",
+                                     limit, done[3], limit - done[3]);
+                    }
+                    for (int st = 3; st >= 0; --st) {
+                        const int j = done[st];
+                        if (j == launched[st]) continue;
+                        auto& v = stage_ver_p(st, j & 1);
+                        if (v.service(&drive_pool_split, PSD[j & 1], e) < 0 || drive.d.failed)
+                            return fail(drive.d.failed && drive.d.fail ? drive.d.fail : e);
+                        if (!v.done(e)) {
+                            if (!e.empty()) return fail(e);
+                            continue;
+                        }
+                        if (!v.pl_finish(nullptr, e)) return fail(e);
+                        ++done[st];
+                        if (nf_hit || (st == 3 && nonfinite_hit(v, "prompt"))) continue;
+                        const int64_t q = a + j * S;
+                        const int T = (int)std::min<int64_t>(S, b - q);
+                        if (!v.pl_commit_async(T, e)) return fail(e);
+                        if (st == 3) {
+                            for (int t = 0; t < T; ++t) ids[t] = (int32_t)cur[q + t + 1];
+                            if (!mtp.prefill(v.final_R(0), ids, T, q, e, false)) return fail(e);
+                            const strata::core::OnDevice on(mtp.device());
+                            if (cudaEventRecord(pl_mtp_ev[j & 1], mtp.stream()) != cudaSuccess)
+                                return fail("known PP4: recording final-residual consumption failed");
+                        }
+                    }
+                    // On NF, service only graphs already launched (including peer head doorbells); never publish state.
+                    if (nf_hit ? done == launched : done[3] == limit) break;
+                    if (nf_hit) continue;
+                    for (int st = 3; st >= 0; --st) {
+                        const int j = launched[st];
+                        if (j == limit || j != done[st]) continue;   // one active plan/graph per owner
+                        if (st == 0 ? j >= done[3] + 4 : j >= done[st - 1]) continue;
+                        if (st < 3 && j >= done[st + 1] + 2) continue;   // consumer of handoff j-2 still live
+                        auto& v = stage_ver_p(st, j & 1);
+                        if (st == 3 && j >= 2) {
+                            const strata::core::OnDevice on(v.device());
+                            if (cudaStreamWaitEvent(v.stream(), pl_mtp_ev[j & 1], 0) != cudaSuccess)
+                                return fail("known PP4: waiting for final-residual consumption failed");
+                        }
+                        const int64_t q = a + j * S;
+                        const int T = (int)std::min<int64_t>(S, b - q);
+                        for (int t = 0; t < T; ++t) ids[t] = (int32_t)cur[q + t];
+                        if (!v.pl_launch(T, ids, q, e)) return fail(e);
+                        ++launched[st];
+                    }
+                    peak = std::max(peak, launched[0] - done[3]);
+                }
+                // Only at the segment/STOP boundary, after all host callbacks have been served. The final commits
+                // advance GDN/PLE/QSA; the draft ring has its own stream. A partial/NF drain is not a checkpoint.
+                for (int st = 0; st < 4; ++st) {
+                    const strata::core::OnDevice on(stage_ver_p(st, 0).device());
+                    if (cudaStreamSynchronize(pl_stream[st]) != cudaSuccess) return fail("known PP4: commit drain failed");
+                }
+                {
+                    const strata::core::OnDevice on(mtp.device());
+                    if (cudaStreamSynchronize(mtp.stream()) != cudaSuccess) return fail("known PP4: draft drain failed");
+                }
+                if (nf_hit) { e = "non-finite logits (#879)"; return false; }
+                pp_reached = std::min<int64_t>(b, a + done[3] * S);
+                const bool stop = stop_req.load();
+                // All owners agree on P, but draft cell P-1 was made with cur[P]. The ordinary live key only
+                // matches [0,P); an edited retry need not supply that same next token. Keep earlier checkpoints,
+                // not a new partially ingested live tip. With no admissions the mounted state is unchanged.
+                pp_exact = !stop || done[3] == 0;
+                if (trace || stop || std::getenv("STRATA_DECODE_TIMING") != nullptr)
+                    std::fprintf(stderr, "strata known PP4: [%lld,%lld) width=%d peak=%d reached=%lld stop=%d\n",
+                                 (long long)a, (long long)b, S, peak, (long long)pp_reached, (int)stop);
+                if (stop) { e = "cancelled"; return false; }
+                return true;
+            };
             // --pipeline-windows: tokens [a, b) through the windows with the stages overlapped.  The tokens are known,
             // so every window commits whole: stage 0 queues window K, its commit and window K+1 back to back (each
             // parity's verifier keeps its own window), and stage 1 runs window K once stage 0 is done with it.  Every
@@ -13451,12 +13541,24 @@ int main(int argc, char** argv) {
                     strata::core::Verifier* v[2];
                     ~Restore() { v[0]->set_head_sampling(true); v[1]->set_head_sampling(true); }
                 } restore{{PV[0][0], PV[0][1]}};
-                const size_t N = wins.size();
-                std::vector<int32_t> w0((size_t) S), w1((size_t) S), nx((size_t) S);
-                size_t l0 = 0, f0 = 0, l1 = 0, f1 = 0;   // stage 0 launched / finished, stage 1 launched / finished
+                auto report_read = [&] {
+                    const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
+                    std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
+                                ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
+                    strata::core::progress_beat();
+                    std::fflush(stdout);
+                };
                 drive.d.layers = 0;
                 drive.d.experts = 0;
                 drive.d.failed = false;
+                if (n_stages == 4) {
+                    if (!read_credit4(a, b, e)) return false;
+                    report_read();
+                    return true;
+                }
+                const size_t N = wins.size();
+                std::vector<int32_t> w0((size_t) S), w1((size_t) S), nx((size_t) S);
+                size_t l0 = 0, f0 = 0, l1 = 0, f1 = 0;   // stage 0 launched / finished, stage 1 launched / finished
                 auto fail = [&](std::string why) -> bool {
                     pl_drain();
                     e = why.empty() ? std::string("a pipelined prompt window failed") : why;
@@ -13512,19 +13614,27 @@ int main(int argc, char** argv) {
                     }
                     if (drive.d.failed) return fail(drive.d.fail ? drive.d.fail : "the expert pool failed");
                 }
-                pl_drain();   // nothing in flight: both stages' commits and the drafter's rows have landed
+                pl_drain();   // both stages' commits and the drafter's rows have landed
                 pl_mtp_live[0] = pl_mtp_live[1] = false;
-                const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
-                std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
-                            ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
-                strata::core::progress_beat();
-                std::fflush(stdout);
+                report_read();
                 return true;
             };
             // tokens [a, b) through the windows: commit all of them, then give the draft layer their residuals
             auto read_windows = [&](int64_t a, int64_t b, std::string& e) -> bool {
                 // (STRATA_LOGPOS reads every window's logits: the serial loop)
-                // the pipelined prompt read stays two-stage (three or more stages read serially; only the decode overlaps)
+                // Do not change bulk arithmetic or MM/cache matching. Short single-window reads cannot overlap.
+#if defined(STRATA_HIP_GFX906)
+                static const bool credit4 = [] {
+                    const char* p = std::getenv("STRATA_KNOWN_PP4");
+                    return p && std::strcmp(p, "1") == 0;
+                }();
+                if (credit4 && pipe && n_stages == 4 && pl_pw == 2 && use_mtp && !mtp_first && o.batch == 0 &&
+                    S == 6 && S_mtp == 2 && b - a > S && b - a <= 64 && !geni && req_imgs.empty() &&
+                    g.n_layers == 48 && !kvg.on && !o.prefill_head_alias && !peer.valid() && !remote_opt &&
+                    !remote_caches && !fs_swap && pending.empty() && astate == AState::Idle &&
+                    !all_experts_resident && !drive.d.evict_sync && !res_checking &&
+                    std::getenv("STRATA_LOGPOS") == nullptr) return read_windows_pl(a, b, e);
+#endif
                 if (pipe && n_stages == 2 && pl_pw >= 1 && std::getenv("STRATA_LOGPOS") == nullptr) return read_windows_pl(a, b, e);
                 strata::core::progress_at("reading the prompt (verify windows), from token", a);   // #217: not "batched"
                 // every token is committed and the picks are discarded: no head sampling (see set_head_sampling)
@@ -14613,7 +14723,7 @@ int main(int argc, char** argv) {
                                      (long long) (n - merge_at));
                     std::fflush(stderr);
                 }
-                if (!sp_ok && nf_hit) {   // #879: DONE nonfinite (the lent slots are refilled below)
+                if (!sp_ok && nf_hit && !known_fatal) {   // #879: DONE nonfinite (the lent slots are refilled below)
                     cancelled = true;
                     break;
                 }
@@ -14624,7 +14734,7 @@ int main(int argc, char** argv) {
                     std::fflush(stdout);
                 }
                 if (!sp_ok) {
-                    if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
+                    if (yielded_at < 0 && (known_fatal || batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
                         std::printf("ERR %s\n", err.c_str());
                         // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and

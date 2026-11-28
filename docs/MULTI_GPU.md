@@ -420,6 +420,15 @@ and the asynchronous tier stay two-stage. In the config:
   On B3 Q4_0 / 4×16 GiB gfx906, eight fixed-placement sampled instruct HTTP turns with inherited presence 1.5
   produced the same 631 tokens: 61.99→76.02 tok/s decode and 26.13→24.17 s client wall against V5. SSE p95
   **increased** from 27.79 to 29.43 ms. This comparison does not measure a gain on requests already using pw2.
+- **`STRATA_KNOWN_PP4=1`** (gfx906, off by default): overlap known text prompt rows on the four owners of a
+  48-layer target with `--pipeline-windows 2 --spec 6 --mtp-max-t 2` and the drafter on the last card. Applies
+  per segment, only to 7–64 already admitted `--short-read` rows. Larger segments still use their original
+  route; it does not convert a bulk read into narrow verifier math. Each owner keeps at most one graph active
+  and reuses its parity handoff only when the next card has consumed that generation. All rows commit; the
+  last card still computes the stock vocabulary/NF guard and MTP catches up from the canonical residuals.
+  No additional verifier copies. At STOP, close admission and drain all owners and MTP; don't advertise a new
+  partial live tip whose draft cell depends on a next token not covered by the cache key. Image, batch,
+  elastic/remote cache and `STRATA_LOGPOS` paths are unchanged. Decode, including penalty-aware pw2, is separate.
 - **With the resident RAM mode's asynchronous swaps** (`--adapt-async 1`, [DETAILS.md](DETAILS.md)) a round's steps
   advance between the verified windows. Each card's copies are queued by the decode loop itself while that card has
   no window in flight, after every window that may still read what they overwrite has finished; the moves into RAM
